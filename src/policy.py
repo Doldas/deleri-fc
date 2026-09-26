@@ -607,7 +607,7 @@ class PolicyController:
         best_score = -1e9
         for t in teammates:
             plan = self._safe_pass_plan(inp, gk, t)
-            land_x, land_y = plan[0], plan[1]
+            land_x, land_y = t.x, t.y
             open_d = min(
                 (geom.distance(land_x, land_y, o.x, o.y) for o in state.outfield_them()),
                 default=go_20(),
@@ -663,19 +663,9 @@ class PolicyController:
         # from the front. Try both flanks and keep whichever the opponents are
         # furthest from, rather than always playing down the middle. Same idea
         # as the hoof in opponents/counter-elite's `_gk_plan`.
-        side = 1.0 if ball.y >= GOAL_CENTER_Y else -1.0
-        best_hoof = None
-        for s in (side, -side):
-            ty = geom.clamp(GOAL_CENTER_Y + s * 9.0, 3.0, PITCH_WIDTH - 3.0)
-            tx = geom.clamp(ball.x + 26.0, 5.0, PITCH_LENGTH - 5.0)
-            room = min(
-                (geom.distance(tx, ty, o.x, o.y) for o in state.outfield_them()),
-                default=go_20(),
-            )
-            if best_hoof is None or room > best_hoof[0]:
-                best_hoof = (room, tx, ty)
-        _, tx, ty = best_hoof
-        intent = PlayerIntent(gk.id, tx, ty, 0.5, OPP_GOAL_X, ty, "pass", (tx, ty), 0.85)
+        ty = 8.0 if ball.y >= 20.0 else 32.0
+        tx = 4.0
+        intent = PlayerIntent(gk.id, tx, ty, 0.5, OPP_GOAL_X, 20.0, "pass", (tx, ty), 0.3)
         return self._veto_own_goal(inp, gk, intent)
 
     def _veto_own_goal(self, inp: PolicyInput, p: Player, intent: PlayerIntent) -> PlayerIntent:
