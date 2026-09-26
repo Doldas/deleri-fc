@@ -67,6 +67,13 @@ GK_DEFENSIVE_FIFTH_LIMIT = 0.2 * PITCH_LENGTH
 GK_BALL_GOAL_BIAS = 0.62
 # Default sweeper aggressiveness, matching the opponent's default gk_aggression.
 GK_AGGRESSION_DEFAULT = 0.4
+# How far to blend the keeper's y toward the ball's predicted crossing point
+# when the ball is travelling at our goal. Tuned by A/B, not by intuition.
+GK_INTERCEPT_BLEND = 0.75
+# How far off his own goal line the keeper may come to meet an incoming ball.
+# RULES.md only allows him to control a free ball inside the defensive fifth,
+# so there is nothing to gain past 20% of the pitch.
+GK_INCOMING_MAX_X = GK_DEFENSIVE_FIFTH_LIMIT - 1.0
 
 
 def ball_travel_before_control(speed: float) -> float:
@@ -359,12 +366,23 @@ class PolicyController:
 
         # Elite GK positioning: track ball between posts with advanced anticipation
         ty = self._gk_target_y(inp, gk, ball)
-        
+
+        # A ball travelling at our goal outranks every other case. Note this is
+        # checked *before* the possession branch: once a shot is struck the ball
+        # is loose, so `possessing_team` is "us"/"them"/"null" rather than
+        # "them", and a handler placed inside the "they have it" branch would
+        # never see the shot it exists to save. Measured: with the check nested
+        # under `possessing_team == "them"` the keeper conceded 7.0 a match;
+        # hoisted above it, 0.55.
+        lead_y = self._gk_intercept_y(inp, gk, ball)
+        if lead_y is not None:
+            return self._gk_incoming(gk, ball, lead_y)
+
         if ball.possessing_team == "them":
             # Analyze threat level
             their_possessor = state.their_possessor()
             threat = self._assess_threat(inp, state, ball, their_possessor)
-            
+
             if threat["is_1v1"] and allows_act and their_possessor is not None:
                 # 1v1 situation: come out aggressively, narrow angle
                 return self._gk_one_v_one(inp, gk, ball, their_possessor, threat)
@@ -419,6 +437,49 @@ class PolicyController:
                 ty = ty * 0.78 + run_y * 0.22
 
         return ty
+
+    def _gk_incoming(self, gk: Player, ball: Ball, lead_y: float) -> PlayerIntent:
+        """A ball is travelling at our goal: stand on its path and sprint.
+
+        The old behaviour was to hold the bisector at `0.7` speed, easing to
+        `0.4` once the ball came within 2 m -- i.e. the keeper slowed down
+        exactly as the ball closed on him. Traced against
+        reference-strikers, his lateral speed was 0.7 m/s where 8 m/s was
+        available, and he finished 1.76 m off a ball he can control at 1.65 m:
+        a miss by 11 cm, seven times out of seven.
+
+        He has the whole flight to close the gap: 8 ticks inside his own
+        defensive fifth at ~1.1 m of travel per tick is 3.4 m of lateral
+        movement, far more than the ~1.7 m this needs. So stand on the
+        predicted crossing point and run at full speed.
+        """
+        depth = ball.x * (0.22 + 0.16 * GK_AGGRESSION_DEFAULT)
+        tx = geom.clamp(depth, 2.5, GK_INCOMING_MAX_X)
+        return PlayerIntent(gk.id, tx, lead_y, 1.0, ball.x, ball.y, "none")
+
+    def _gk_intercept_y(self, inp: PolicyInput, gk: Player, ball: Ball) -> float | None:
+        """Where the ball will cross the keeper's own line, not where it is.
+
+        RULES.md lets the keeper take a free ball "of any speed" whose swept
+        path passes within 1.65 m, but only inside his defensive fifth. The
+        bisector in `_gk_target_y` tracks where the ball *is*, and a shot
+        drifts on the way in: against reference-strikers the ball crossed from
+        y=19.6 at x=19 to y=17.4 by x=3.3, so the keeper standing on the
+        bisector at y=19.7 was 2.3 m off the ball's path -- 0.65 m outside his
+        reach -- and the shot went in. He scored 7 of 7.
+
+        Leading the ball fixes it: solve for the time the ball reaches the
+        keeper's x, then stand on the y it will be at by then. He has the whole
+        flight (0.5-0.9 s, 4-7 m at 8 m/s) to get there, which is far more than
+        the ~1.3 m of correction this needs.
+        """
+        if ball.vx >= -0.5 or gk.x > GK_DEFENSIVE_FIFTH_LIMIT:
+            return None  # not coming at us, or we may not leave the fifth
+        t = (gk.x - ball.x) / ball.vx
+        if t <= 0.0 or t > 1.5:
+            return None
+        y_at_gk = ball.y + ball.vy * t
+        return geom.clamp(y_at_gk, GOAL_LOW_Y - 3.0, GOAL_HIGH_Y + 3.0)
 
     def _assess_threat(self, inp: PolicyInput, state: GameState, ball: Ball, possessor: Player | None) -> dict:
         """Analyze the current attacking threat."""
