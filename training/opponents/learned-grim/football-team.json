@@ -1,0 +1,6 @@
+{
+  "id": "learned-grim",
+  "name": "Tabula RL (grim)",
+  "language": "python",
+  "image": "football-team-learned-grim:dev"
+}

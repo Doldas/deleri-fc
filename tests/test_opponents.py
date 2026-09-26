@@ -35,7 +35,7 @@ from src.opponents.registry import (  # noqa: E402
 from src.opponents.spec import make_spec  # noqa: E402
 from src.opponents.zoo import make_tunable  # noqa: E402,F401
 
-from engine_probe import build_module, make_controller, mirror  # noqa: E402
+from training.scripts.engine_probe import build_module, make_controller, mirror  # noqa: E402
 
 
 def _moves_toward(brain, bx: float, by: float) -> bool:
@@ -494,7 +494,7 @@ Clean sheets: 50.0 %  Possession: 58.9%  Shots: 18  Missed decisions: 0
 """
 
     def test_parses_the_discriminating_metric(self):
-        from run_authoritative import RESULT_RE
+        from training.scripts.run_authoritative import RESULT_RE
 
         found = RESULT_RE.search(self.SAMPLE)
         self.assertIsNotNone(found)
@@ -505,7 +505,7 @@ Clean sheets: 50.0 %  Possession: 58.9%  Shots: 18  Missed decisions: 0
     def test_detects_the_degenerate_scoreline_distribution(self):
         """Every 60 s match against a solid side is 1-0 or 0-1. A 6-game run
         therefore measures nothing, which is why the runner defaults to 24."""
-        from run_authoritative import GAME_RE
+        from training.scripts.run_authoritative import GAME_RE
 
         scorelines = [f"{a}-{b}" for a, b, _ in GAME_RE.findall(self.SAMPLE)]
         self.assertEqual(len(scorelines), 6)
@@ -513,7 +513,7 @@ Clean sheets: 50.0 %  Possession: 58.9%  Shots: 18  Missed decisions: 0
         self.assertNotIn("0-0", scorelines, "a draw would be a real signal")
 
     def test_a_short_run_cannot_rank_and_six_is_not_enough(self):
-        from run_authoritative import GAME_RE
+        from training.scripts.run_authoritative import GAME_RE
 
         scorelines = [f"{a}-{b}" for a, b, _ in GAME_RE.findall(self.SAMPLE)]
         self.assertEqual(len(scorelines), 6)
@@ -535,7 +535,7 @@ class OfflinePlayabilityTests(unittest.TestCase):
     """Every generated parameter set must actually play a full match."""
 
     def test_generated_params_play(self):
-        from build_opponent_teams import build_targets
+        from training.scripts.build_opponent_teams import build_targets
 
         for team_id, _name, params in build_targets()[:6]:
             with self.subTest(opponent=team_id):

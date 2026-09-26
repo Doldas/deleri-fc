@@ -20,9 +20,9 @@ import unittest
 
 ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tools" / "lab"))
+sys.path.insert(0, str(ROOT / "training" / "lab"))
 
-STATIC = ROOT / "tools" / "lab" / "static"
+STATIC = ROOT / "training" / "lab" / "static"
 JS = STATIC / "lab.js"
 HTML = STATIC / "index.html"
 CSS = STATIC / "lab.css"
@@ -81,7 +81,7 @@ class DropdownBehaviour(unittest.TestCase):
     def setUpClass(cls):
         import tempfile
 
-        import lab_server
+        import training.lab.lab_server as lab_server
 
         payload = {"opponents": lab_server.scan_opponents()}
         cls.expected_ids = {o["id"] for o in payload["opponents"]}
@@ -188,7 +188,7 @@ class KitColours(unittest.TestCase):
     def setUpClass(cls):
         import tempfile
 
-        import lab_server
+        import training.lab.lab_server as lab_server
 
         opponents = lab_server.scan_opponents()
         cls.payload = tempfile.NamedTemporaryFile("w", suffix=".json",
@@ -285,8 +285,8 @@ class StaticSource(unittest.TestCase):
         self.assertIn('href="/README.md"', html)
 
     def test_frontend_has_no_direct_stdlib_name_clash(self):
-        self.assertTrue((ROOT / "tools" / "lab" / "lab_server.py").exists())
-        self.assertFalse((ROOT / "tools" / "lab" / "server.py").exists(),
+        self.assertTrue((ROOT / "training" / "lab" / "lab_server.py").exists())
+        self.assertFalse((ROOT / "training" / "lab" / "server.py").exists(),
                          "server.py shadows the stdlib `server` module")
 
 

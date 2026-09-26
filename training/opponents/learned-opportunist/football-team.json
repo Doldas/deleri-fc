@@ -1,0 +1,6 @@
+{
+  "id": "learned-opportunist",
+  "name": "Tabula RL (opportunist)",
+  "language": "python",
+  "image": "football-team-learned-opportunist:dev"
+}

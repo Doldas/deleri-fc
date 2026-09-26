@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools" / "lab"))
 
-import lab_server as lab  # noqa: E402
+import training.lab.lab_server as lab  # noqa: E402
 
 
 def snapshot(index, score_a=0, score_b=0, owner="team-a"):

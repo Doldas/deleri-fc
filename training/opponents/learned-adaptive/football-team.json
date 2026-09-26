@@ -1,0 +1,6 @@
+{
+  "id": "learned-adaptive",
+  "name": "Tabula RL (adaptive)",
+  "language": "python",
+  "image": "football-team-learned-adaptive:dev"
+}

@@ -1,0 +1,6 @@
+{
+  "id": "tika-solid",
+  "name": "Pinball FC (solid)",
+  "language": "python",
+  "image": "football-team-tika-solid:dev"
+}

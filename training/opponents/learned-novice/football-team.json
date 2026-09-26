@@ -1,0 +1,6 @@
+{
+  "id": "learned-novice",
+  "name": "Tabula RL (novice)",
+  "language": "python",
+  "image": "football-team-learned-novice:dev"
+}
