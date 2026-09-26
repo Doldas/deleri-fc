@@ -830,7 +830,8 @@ class PolicyController:
         return intent
 
     # ------------------------------------------------------------------ #
-    # Possessor
+    # Possessor - Goal-First Decision Tree
+    # Priority: Shoot → Cross → Cutback → Through → Wall → Switch → Pullback → OneTwo → ThirdMan → GKBypass → Carry → SafePass
     # ------------------------------------------------------------------ #
     def _decide_possessor(self, inp: PolicyInput, p: Player) -> PlayerIntent:
         state = inp.state
@@ -844,7 +845,7 @@ class PolicyController:
             tx, ty, speed = self._dribble_target(inp, p)
             return PlayerIntent(p.id, tx, ty, speed, tx, ty)
 
-        # -- Shooting ---------------------------------------------------
+        # -- 1. SHOOT ---------------------------------------------------
         shot = self._shot_choice(inp, p)
         if shot is not None:
             tx, ty = shot[0], shot[1]
@@ -854,11 +855,10 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (tx, ty), shot[2])
             return self._veto_own_goal(inp, p, intent)
 
-        # -- Cross from wing ------------------------------------------------------
-        # When winger near byline (x > 48), cross to striker in box
+        # -- 2. CROSS FROM WING -----------------------------------------
+        # Winger near byline (x > 48), cross to striker in box
         role = inp.roles.get(p.id, ROLE_DEFENDER)
         if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 48.0:
-            # Find striker in the box
             striker = None
             for t in state.outfield_us():
                 if inp.roles.get(t.id) == ROLE_STRIKER:
@@ -876,7 +876,29 @@ class PolicyController:
                     intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), plan.power)
                     return self._veto_own_goal(inp, p, intent)
 
-        # -- Wall pass ----------------------------------------------------
+        # -- 3. CUTBACK FROM BYLINE -------------------------------------
+        # Winger at byline, no clear forward path -> pull back to edge of box
+        cutback = self._cutback_choice(inp, p)
+        if cutback is not None:
+            tx, ty, power = cutback
+            log_entry["action"] = "pass"
+            log_entry["reason"] = "cutback"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- 4. THROUGH BALL --------------------------------------------
+        # Striker/winger making run behind high line -> weighted pass to space
+        through = self._through_ball_choice(inp, p)
+        if through is not None:
+            tx, ty, power = through
+            log_entry["action"] = "pass"
+            log_entry["reason"] = "through_ball"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- 5. WALL PASS -----------------------------------------------
         wall = self._wall_pass_choice(inp, p)
         if wall is not None:
             tx, ty, power = wall
@@ -886,43 +908,60 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             return self._veto_own_goal(inp, p, intent)
 
-        # -- Low Block Breaking: Cross, Cutback, Switch Play ---------------
-        # These patterns exploit low blocks (deep, compact defenses) by using
-        # width, crosses to the box, cutbacks from the byline, and quick switches.
-        low_block_attack = self._low_block_attack(inp, p)
-        if low_block_attack is not None:
-            # Veto backward passes when we have a clear path forward
-            target_x = low_block_attack[0]
-            if target_x > p.x - 2.0:  # Allow small backward passes for combinations
-                log_entry["action"] = low_block_attack[3]
-                log_entry["reason"] = low_block_attack[4]
-                self.log.record(log_entry)
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, low_block_attack[0], low_block_attack[1], "pass", (low_block_attack[0], low_block_attack[1]), low_block_attack[2])
-                return self._veto_own_goal(inp, p, intent)
-
-        # -- High Press Resistance: Quick One-Twos, Third Man, Bypass ------
-        high_press_escape = self._high_press_escape(inp, p)
-        if high_press_escape is not None:
-            # Veto backward passes when we have a clear path forward
-            target_x = high_press_escape[0]
-            if target_x > p.x - 2.0:  # Allow small backward passes for combinations
-                log_entry["action"] = high_press_escape[3]
-                log_entry["reason"] = high_press_escape[4]
-                self.log.record(log_entry)
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, high_press_escape[0], high_press_escape[1], "pass", (high_press_escape[0], high_press_escape[1]), high_press_escape[2])
-                return self._veto_own_goal(inp, p, intent)
-
-        # -- Direct pass ---------------------------------------------------
-        choice = self._collectable_pass(inp, p)
-        if choice is not None:
-            best, tx, ty, power = choice
+        # -- 6. SWITCH PLAY ---------------------------------------------
+        # Ball one flank, opposite winger free -> long diagonal
+        switch = self._switch_play_choice(inp, p)
+        if switch is not None:
+            tx, ty, power = switch
             log_entry["action"] = "pass"
-            log_entry["reason"] = f"pass_to_{best}"
+            log_entry["reason"] = "switch_play"
             self.log.record(log_entry)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             return self._veto_own_goal(inp, p, intent)
 
-        # -- Carry the ball forward ------------------------------------------
+        # -- 7. PULL BACK -----------------------------------------------
+        # Striker at edge of box, winger arriving -> lay off for shot
+        pullback = self._pullback_choice(inp, p)
+        if pullback is not None:
+            tx, ty, power = pullback
+            log_entry["action"] = "pass"
+            log_entry["reason"] = "pullback"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- 8. ONE-TWO (High Press Escape) -----------------------------
+        onetwo = self._onetwo_choice(inp, p)
+        if onetwo is not None:
+            tx, ty, power = onetwo
+            log_entry["action"] = "pass"
+            log_entry["reason"] = "high_press_onetwo"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- 9. THIRD MAN RUN -------------------------------------------
+        third = self._third_man_choice(inp, p)
+        if third is not None:
+            tx, ty, power = third
+            log_entry["action"] = "pass"
+            log_entry["reason"] = "high_press_third_man"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- 10. GK BYPASS (High Press) ---------------------------------
+        if role == "goalkeeper":
+            bypass = self._gk_bypass_choice(inp, p)
+            if bypass is not None:
+                tx, ty, power = bypass
+                log_entry["action"] = "pass"
+                log_entry["reason"] = "high_press_gk_bypass"
+                self.log.record(log_entry)
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+                return self._veto_own_goal(inp, p, intent)
+
+        # -- 11. CARRY --------------------------------------------------
         # Default action with possession. A carried ball stays glued to the
         # carrier at 6.4 m/s, so dribbling is the only movement that reliably
         # keeps the ball and walks it into shooting range.
@@ -931,6 +970,241 @@ class PolicyController:
         log_entry["reason"] = "carry_forward"
         self.log.record(log_entry)
         return PlayerIntent(p.id, tx, ty, speed, tx, ty)
+
+    # ===================================================================
+    # New helper methods for goal-first decision tree
+    # ===================================================================
+
+    # -- 3. CUTBACK FROM BYLINE ---------------------------------------
+    def _cutback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Cutback from byline when no clear forward path exists."""
+        state = inp.state
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+        if role not in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) or p.x < 46.0:
+            return None
+        
+        # Check if we have a clear forward path (shot, cross, or dribble)
+        if self._shot_choice(inp, p) is not None:
+            return None
+        
+        striker = None
+        for t in state.outfield_us():
+            if inp.roles.get(t.id) == ROLE_STRIKER:
+                striker = t
+                break
+        if striker and striker.x > 38.0:
+            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+            if pass_lane_clear(p.x, p.y, striker.x, striker.y, opp_pos, margin=0.12):
+                return None
+        
+        # Check dribble path
+        dribble_target = self._dribble_target(inp, p)
+        if dribble_target[0] > p.x + 3.0:
+            opp_pos = state.outfield_them()
+            lane_clear = True
+            for o in opp_pos:
+                if geom.seg_point_distance_sq(o.x, o.y, p.x, p.y, dribble_target[0], dribble_target[1]) < 2.0 * 2.0:
+                    lane_clear = False
+                    break
+            if lane_clear:
+                return None
+        
+        # No clear forward path -> cutback to edge of box
+        for t in state.outfield_us():
+            r = inp.roles.get(t.id, ROLE_DEFENDER)
+            if r in (ROLE_DEFENDER, ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and t.x > 30.0 and t.x < 42.0:
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.12):
+                    plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.2)
+                    if plan.target_x > 0:
+                        collect_x, collect_y, power, _ = pass_collection_point(
+                            p.x, p.y, plan.target_x, plan.target_y, 0.0
+                        )
+                        miss = geom.distance(collect_x, collect_y, t.x, t.y)
+                        if miss < 7.0 and pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.12):
+                            return (collect_x, collect_y, power)
+        return None
+
+    # -- 4. THROUGH BALL -----------------------------------------------
+    def _through_ball_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Through ball to runner behind high defensive line."""
+        state = inp.state
+        ball = state.ball
+        
+        # Only attempt when opponent has high line
+        their_deepest = min((q.x for q in state.outfield_them()), default=60.0)
+        their_highest = max((q.x for q in state.outfield_them()), default=0.0)
+        high_line = their_highest > 35.0
+        if not high_line or ball.x < 30.0:
+            return None
+        
+        # Find runner making run behind defence
+        for t in state.outfield_us():
+            r = inp.roles.get(t.id, ROLE_DEFENDER)
+            if r not in (ROLE_STRIKER, ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+                continue
+            if t.x < their_highest + 2.0:  # Not yet behind line
+                continue
+            
+            # Check if pass lane is clear to the space ahead of runner
+            target_x = min(t.x + 5.0, 58.0)
+            target_y = t.y
+            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+            if pass_lane_clear(p.x, p.y, target_x, target_y, opp_pos, margin=0.15):
+                plan = plan_lead_pass(p.x, p.y, target_x, target_y, t.vx, t.vy, velocity_weight=0.25)
+                if plan.target_x > 0:
+                    collect_x, collect_y, power, _ = pass_collection_point(
+                        p.x, p.y, plan.target_x, plan.target_y, 0.0
+                    )
+                    miss = geom.distance(collect_x, collect_y, t.x, t.y)
+                    if miss < 7.0 and pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.15):
+                        return (collect_x, collect_y, power)
+        return None
+
+    # -- 6. SWITCH PLAY ------------------------------------------------
+    def _switch_play_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Quick switch to opposite flank when ball is on one side."""
+        state = inp.state
+        ball = state.ball
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+        
+        # Only attempt in attacking half with ball on flank
+        if ball.x < 35.0:
+            return None
+        
+        # Find opposite winger
+        target_role = ROLE_WIDE_RIGHT if role == ROLE_WIDE_LEFT else ROLE_WIDE_LEFT
+        if role not in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+            # Central player - switch to weaker flank
+            lb_info = _detect_low_block(state)
+            target_role = ROLE_WIDE_LEFT if lb_info.get("weak_flank") == "left" else ROLE_WIDE_RIGHT
+        
+        for t in state.outfield_us():
+            if inp.roles.get(t.id) == target_role and t.x > 25.0:
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.15):
+                    plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.25)
+                    if plan.target_x > 0:
+                        collect_x, collect_y, power, _ = pass_collection_point(
+                            p.x, p.y, plan.target_x, plan.target_y, 0.0
+                        )
+                        travel = geom.distance(p.x, p.y, collect_x, collect_y)
+                        if travel > 12.0:  # Must be collectable distance
+                            miss = geom.distance(collect_x, collect_y, t.x, t.y)
+                            if miss < 7.0:
+                                return (collect_x, collect_y, power)
+        return None
+
+    # -- 7. PULL BACK --------------------------------------------------
+    def _pullback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Striker pulls back to edge of box for arriving winger/midfielder."""
+        state = inp.state
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+        if role != ROLE_STRIKER or p.x < 38.0 or p.x > 46.0:
+            return None
+        
+        # Check if we have a clear shot
+        if self._shot_choice(inp, p) is not None:
+            return None
+        
+        # Check dribble path
+        dribble_target = self._dribble_target(inp, p)
+        has_dribble_path = dribble_target[0] > p.x + 3.0
+        if has_dribble_path:
+            opp_pos = state.outfield_them()
+            lane_clear = True
+            for o in opp_pos:
+                if geom.seg_point_distance_sq(o.x, o.y, p.x, p.y, dribble_target[0], dribble_target[1]) < 2.0 * 2.0:
+                    lane_clear = False
+                    break
+            if lane_clear:
+                return None  # Dribble forward instead
+        
+        for t in state.outfield_us():
+            r = inp.roles.get(t.id, ROLE_DEFENDER)
+            if r in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and t.x > 35.0 and t.x < 44.0:
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.1):
+                    plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.15)
+                    if plan.target_x > 0:
+                        collect_x, collect_y, power, _ = pass_collection_point(
+                            p.x, p.y, plan.target_x, plan.target_y, 0.0
+                        )
+                        miss = geom.distance(collect_x, collect_y, t.x, t.y)
+                        if miss < 7.0:
+                            return (collect_x, collect_y, power)
+        return None
+
+    # -- 8. ONE-TWO (High Press Escape) --------------------------------
+    def _onetwo_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Quick one-two with nearby teammate under high press."""
+        state = inp.state
+        if not _is_high_press(state) or inp.world.pressure_on_ball < 0.4:
+            return None
+        
+        nearby = []
+        for t in state.outfield_us():
+            if t.id != p.id:
+                dist = geom.distance(p.x, p.y, t.x, t.y)
+                if dist < 8.0 and t.can_act and t.x > p.x - 5.0:
+                    nearby.append((dist, t))
+        
+        if nearby:
+            nearby.sort(key=lambda x: x[0])
+            t = nearby[0][1]
+            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+            if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.1):
+                plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.4)
+                if plan.target_x > 0:
+                    dist = geom.distance(p.x, p.y, plan.target_x, plan.target_y)
+                    power = min(1.0, max(0.0, dist / 33.3))
+                    return (plan.target_x, plan.target_y, power)
+        return None
+
+    # -- 9. THIRD MAN RUN ----------------------------------------------
+    def _third_man_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Third man run - pass to player with space ahead."""
+        state = inp.state
+        if not _is_high_press(state) or inp.world.pressure_on_ball < 0.4:
+            return None
+        
+        for t in state.outfield_us():
+            if t.id == p.id:
+                continue
+            # Check if this teammate has space ahead
+            space_ahead = True
+            for o in state.outfield_them():
+                if o.x > t.x and o.x - t.x < 6.0 and abs(o.y - t.y) < 5.0:
+                    space_ahead = False
+                    break
+            if space_ahead and t.x > p.x and t.x < 40.0:
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.12):
+                    plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.3)
+                    if plan.target_x > 0:
+                        dist = geom.distance(p.x, p.y, plan.target_x, plan.target_y)
+                        power = min(1.0, max(0.0, dist / 33.3))
+                        return (plan.target_x, plan.target_y, power)
+        return None
+
+    # -- 10. GK BYPASS (High Press) ------------------------------------
+    def _gk_bypass_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """GK distribution bypass under high press."""
+        state = inp.state
+        if not _is_high_press(state):
+            return None
+        
+        for t in state.outfield_us():
+            r = inp.roles.get(t.id, ROLE_DEFENDER)
+            if r in (ROLE_STRIKER, ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and t.x > 30.0:
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.12):
+                    plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.2)
+                    if plan.target_x > 0:
+                        dist = geom.distance(p.x, p.y, plan.target_x, plan.target_y)
+                        power = min(1.0, max(0.0, dist / 33.3))
+                        return (plan.target_x, plan.target_y, power)
+        return None
 
     def _collectable_pass(
         self, inp: PolicyInput, p: Player
@@ -1637,17 +1911,17 @@ class PolicyController:
         support = self._cfg(inp, "support_distance", 7.0)
 
         base = self._role_base(role)
+        
+        # ===============================================================
+        # STRIKER MOVEMENT - Goal-first patterns
+        # ===============================================================
         if role == ROLE_STRIKER:
-            # ELITE STRIKER MOVEMENT - Multiple patterns based on game state
             their_deepest = min((q.x for q in state.outfield_them()), default=60.0)
             their_highest = max((q.x for q in state.outfield_them()), default=0.0)
             defensive_line = their_highest  # Their last defender line
             
-            # Check if we're playing against a high line (space behind)
             high_line = defensive_line > 35.0
             low_block = defensive_line < 25.0 and their_deepest > 40.0
-            
-            # Detect opponent style for adaptive runs
             is_pressing_team = inp.opp is not None and inp.opp.press_intensity() > 0.7
             
             if ball.x < 25.0:
@@ -1664,18 +1938,19 @@ class PolicyController:
                     tx = geom.clamp(defensive_line + 3.0, 42.0, 56.0)
                     # Time the run: stay onside until ball is played
                     if possessor and possessor.can_act:
-                        # Hold run until passer is ready
+                        # Hold run until passer is ready - delay slightly
                         pass
                 elif low_block:
-                    # Drop into pockets between midfield and defense
+                    # Drop into pockets between midfield and defense (half-spaces)
+                    # Find the gap between their midfield and defensive line
                     tx = geom.clamp(ball.x + 8.0, 30.0, 40.0)
+                    ty = self._pick_striker_channel(inp, ball, tx)
                 else:
                     tx = geom.clamp(ball.x + 12.0 * depth + 6.0, 35.0, 54.0)
             else:
                 # Ball in final third: Make dangerous runs
                 if low_block:
                     # Against low block: find pockets, drag defenders out
-                    # Check if wingers are wide - if so, attack the box
                     winger_wide = False
                     for t in state.outfield_us():
                         r = inp.roles.get(t.id, ROLE_DEFENDER)
@@ -1691,8 +1966,10 @@ class PolicyController:
                             ty = 30.0  # Near post (right side)
                         tx = geom.clamp(possessor.x + 2.0, 44.0, 54.0)
                     else:
-                        # No width: drop deep to create overload, then spin
+                        # No width: drop deep to create overload in pocket, then spin
                         tx = geom.clamp(ball.x + 3.0, 38.0, 48.0)
+                        # Run channel between CB and FB
+                        ty = self._pick_striker_channel(inp, ball, tx)
                 elif high_line:
                     # High line: run in behind on through ball trigger
                     if possessor and possessor.x > 30.0 and possessor.can_act:
@@ -1705,7 +1982,7 @@ class PolicyController:
                     # Standard: push up with play
                     tx = geom.clamp(ball.x + 15.0 * depth + 8.0, 42.0, 54.0)
             
-            # Channel selection: run between CB and FB
+            # Channel selection: run between CB and FB (half-space)
             ty = self._pick_striker_channel(inp, ball, tx)
             
             # Fine-tune: if making run behind, bend run to stay onside
@@ -1714,8 +1991,10 @@ class PolicyController:
                 if ball.x < possessor.x if possessor else True:
                     pass  # Hold width until pass is played
         
+        # ===============================================================
+        # WINGER MOVEMENT - Pin, stretch, attack box
+        # ===============================================================
         elif role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
-            # ELITE WINGER MOVEMENT
             lane = 2.0 if role == ROLE_WIDE_LEFT else 38.0
             is_left = role == ROLE_WIDE_LEFT
             
@@ -1749,6 +2028,9 @@ class PolicyController:
                             # No target: cut inside for shot/combination
                             ty = geom.clamp(lane + 10.0, 12.0, 28.0)
                             tx = geom.clamp(tx - 3.0, 45.0, 50.0)
+                        else:
+                            # Striker in box - stay wide for cross
+                            ty = geom.clamp(lane, 1.0, 6.0) if is_left else geom.clamp(lane, 34.0, 39.0)
                 elif high_line:
                     # High line: run in behind fullback
                     tx = geom.clamp(their_highest + 5.0, 42.0, 54.0)
@@ -1768,13 +2050,32 @@ class PolicyController:
                 # If ball on opposite side, tuck in for overload
                 if (is_left and ball.y > 25.0) or (not is_left and ball.y < 15.0):
                     ty = geom.clamp(ty + (5.0 if is_left else -5.0), 10.0, 30.0)
+                
+                # Overload support: if we have overload, push higher
+                if overload and ball.x > 20.0:
+                    tx = geom.clamp(tx + 5.0, 25.0, 40.0)
         
+        # ===============================================================
+        # DEFENDER (Rest Defence) - Split, cover, intercept
+        # ===============================================================
         else:  # defender = rest defence
+            # Standard rest defence position
             tx = geom.clamp(ball.x * 0.4 + 6.0, 8.0, 22.0)
-            # Split across the centre line instead of both sitting on it. Two
-            # centre-backs stacked at y=20.0 give the team no defensive width
-            # and hand the far winger a free lane every time.
+            # Split across the centre line instead of both sitting on it
             ty = 15.0 if p.y <= 20.0 else 25.0
+            
+            # Adaptive rest defence based on opponent
+            if inp.opp is not None:
+                archetype = inp.opp.detect_archetype()
+                if archetype == "counter":
+                    # Deeper against counter teams
+                    tx = min(tx, 18.0)
+                elif archetype == "high_press":
+                    # Higher to support build-up
+                    tx = max(tx, 12.0)
+                elif archetype == "low_block":
+                    # Push up to stretch
+                    tx = max(tx, 20.0)
 
         # Support triangle: when the possessor is tightly pressed, offer a short,
         # open, early exit instead of the role anchor.

@@ -110,22 +110,35 @@ GENOME_RANGES: dict[str, tuple[float, float]] = {
 
 def default_genome() -> dict[str, float]:
     return {
-        "press_intensity": 0.55,
-        "press_trigger_threshold": 0.4,
-        "width": 0.7,
-        "depth": 0.6,
-        "verticality": 0.55,
-        "risk": 0.45,
-        "counterpress_intensity": 0.5,
-        "compactness": 0.65,
-        "passing_risk": 0.4,
-        "shooting_threshold": 0.5,
-        "wall_usage": 0.5,
-        "wall_pass_threshold": 0.45,
-        "wall_shot_threshold": 0.6,
-        "transition_speed": 0.6,
+        # Pressing: High intensity, low threshold = aggressive coordinated press
+        "press_intensity": 0.75,
+        "press_trigger_threshold": 0.25,  # Lower = press more readily
+        # Width: Maximum width to stretch play, especially against low blocks
+        "width": 1.0,
+        # Depth: Push high up the pitch
+        "depth": 0.8,
+        # Verticality: High = direct, forward play
+        "verticality": 0.7,
+        # Risk: Moderate - calculated risks for high reward
+        "risk": 0.55,
+        # Counter-press: Very aggressive on turnover
+        "counterpress_intensity": 0.85,
+        # Compactness: Moderate - maintain shape but allow width
+        "compactness": 0.55,
+        # Passing risk: Lower = safer passes, but we have specific patterns for risk
+        "passing_risk": 0.3,
+        # Shooting threshold: Lower = shoot more often, especially in box
+        "shooting_threshold": 0.4,
+        # Wall usage: High = exploit walls aggressively
+        "wall_usage": 0.8,
+        "wall_pass_threshold": 0.35,  # Lower = more willing to use wall passes
+        "wall_shot_threshold": 0.5,   # Willing to take wall shots
+        # Transition speed: Fast transitions
+        "transition_speed": 0.8,
+        # Support distance: Medium - close enough for combinations, far enough for width
         "support_distance": 7.0,
-        "defensive_line": 24.0,
+        # Defensive line: Adaptive, but base higher for high press
+        "defensive_line": 26.0,
     }
 
 

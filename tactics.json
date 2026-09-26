@@ -38,11 +38,11 @@
     ]
   },
   "style": {
-    "pressing": 55,
-    "defensiveDepth": 45,
-    "directness": 55,
-    "shootingDistanceMeters": 16,
-    "challengeAggression": 60,
-    "slapPreference": 15
+    "pressing": 75,
+    "defensiveDepth": 30,
+    "directness": 70,
+    "shootingDistanceMeters": 14,
+    "challengeAggression": 70,
+    "slapPreference": 10
   }
 }

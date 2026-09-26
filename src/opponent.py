@@ -47,6 +47,14 @@ class OpponentModel:
     total_obs_ticks: int = 0
     last_possession_change: int = 0    # Track possession changes
     prev_possessing_team: str | None = None
+    
+    # --- Additional tracking for refined archetypes ---
+    slap_ticks: int = 0                # Ticks they use slap aggressively
+    tackle_aggression_ticks: int = 0   # Ticks they tackle aggressively
+    physical_ticks: int = 0            # Ticks they play physically
+    compact_width_accum: float = 0.0   # Accumulated y-spread when defending
+    compact_samples: int = 0           # Samples for compactness
+    deep_players_accum: int = 0        # Accumulated count of deep players
 
     def update(self, state: GameState) -> None:
         ball = state.ball
@@ -76,6 +84,10 @@ class OpponentModel:
                     if p.vx > 4.0:
                         self.counter_attack_ticks += 1
                 
+                # Track shooting distance
+                if self.shot_dist is None or ball.x < self.shot_dist:
+                    self.shot_dist = ball.x
+        
         elif ball.possessing_team == "us":
             opp = state.outfield_them()
             if opp:
@@ -94,10 +106,26 @@ class OpponentModel:
                 # Detect low block: deep defensive line
                 if cx > 40.0:
                     self.low_block_ticks += 1
+                
+                # Track compactness and deep players
+                ys = [q.y for q in opp]
+                if ys:
+                    self.compact_width_accum += (max(ys) - min(ys))
+                    self.compact_samples += 1
+                deep_players = sum(1 for q in opp if q.x > 40.0)
+                self.deep_players_accum += deep_players
+                
+                # Track physical play
+                for q in opp:
+                    if q.vx < -2.0 and q.x > 30.0:  # Aggressive forward movement
+                        self.physical_ticks += 1
         
         # Track possession style when they have ball
         if ball.possessing_team == "them":
             self.possession_ticks += 1
+            # Track slaps - detect from events would be ideal, approximate via press intensity
+            if self.press_intensity() > 0.7:
+                self.slap_ticks += 1
 
     # -- derived queries ------------------------------------------------------
     def prefer_side(self) -> float:
@@ -134,7 +162,7 @@ class OpponentModel:
         """Detect the opponent's tactical archetype.
         
         Returns one of: 'high_press', 'low_block', 'counter', 'direct', 
-        'possession', 'wall', 'chaos', 'balanced'
+        'possession', 'wall', 'physical', 'balanced', 'unknown'
         """
         if self.total_obs_ticks < 20:
             return "unknown"
@@ -145,30 +173,40 @@ class OpponentModel:
         counter_ratio = self.counter_attack_ticks / max(1, self.total_obs_ticks)
         direct_ratio = self.direct_play_ticks / max(1, self.samples)
         possession_ratio = self.possession_ticks / max(1, self.samples)
+        wall_ratio = self.wall_usage()
+        slap_ratio = self.slap_ticks / total if total > 0 else 0
+        physical_ratio = self.physical_ticks / total if total > 0 else 0
+        
+        avg_compact_width = self.compact_width_accum / max(1, self.compact_samples)
+        avg_deep_players = self.deep_players_accum / max(1, total)
         
         # High press: sustained pressure in our half
-        if high_press_ratio > 0.4:
+        if high_press_ratio > 0.35:
             return "high_press"
         
-        # Low block: sitting deep consistently
-        if low_block_ratio > 0.5:
+        # Low block: sitting deep consistently, compact, 3+ deep players
+        if low_block_ratio > 0.45 and avg_deep_players >= 2.5 and avg_compact_width < 22.0:
             return "low_block"
         
         # Counter-attack: frequent fast breaks
-        if counter_ratio > 0.15:
+        if counter_ratio > 0.12:
             return "counter"
         
         # Direct play: long balls from deep
-        if direct_ratio > 0.25:
+        if direct_ratio > 0.22:
             return "direct"
         
         # Possession: keep ball, build slowly
-        if possession_ratio > 0.6 and self.press_intensity() < 0.4:
+        if possession_ratio > 0.55 and self.press_intensity() < 0.45:
             return "possession"
         
         # Wall play: frequent wall usage
-        if self.wall_usage() > 0.3:
+        if wall_ratio > 0.25:
             return "wall"
+        
+        # Physical: aggressive slaps and tackles
+        if slap_ratio > 0.2 or physical_ratio > 0.15:
+            return "physical"
         
         return "balanced"
 
@@ -180,88 +218,95 @@ class OpponentModel:
             "high_press": {
                 "description": "Play through the press, quick one-twos, exploit space behind",
                 "press_trigger_threshold": 0.6,   # Don't press high ourselves
-                "passing_risk": 0.3,              # Safe, short passes
-                "verticality": 0.4,               # Play through, not over
+                "passing_risk": 0.25,             # Safe, short passes
+                "verticality": 0.35,              # Play through, not over
                 "width": 1.0,                     # Use full width to stretch
                 "support_distance": 5.0,          # Close support for combinations
-                "counterpress_intensity": 0.7,    # Counter-press when we win it
-                "transition_speed": 0.8,          # Fast transitions
+                "counterpress_intensity": 0.75,   # Counter-press when we win it
+                "transition_speed": 0.85,         # Fast transitions
+                "defensive_line": 28.0,           # Deeper rest defence
             },
             "low_block": {
-                "description": "Patient build-up, width to stretch, crosses, cut-backs",
-                "press_trigger_threshold": 0.3,   # Don't press high
-                "passing_risk": 0.5,              # Mix of safe and risky
+                "description": "Patient build-up, width to stretch, crosses, cut-backs, switches",
+                "press_trigger_threshold": 0.25,  # Don't press high
+                "passing_risk": 0.45,             # Mix of safe and risky
                 "verticality": 0.7,               # Push forward
                 "width": 1.0,                     # Maximum width
                 "support_distance": 8.0,          # Support in pockets
-                "counterpress_intensity": 0.3,    # Don't overcommit
-                "transition_speed": 0.4,          # Patient
+                "counterpress_intensity": 0.25,   # Don't overcommit
+                "transition_speed": 0.35,         # Patient
+                "defensive_line": 18.0,           # High line to stretch them
             },
             "counter": {
                 "description": "Rest defense, control transitions, don't overcommit",
                 "press_trigger_threshold": 0.5,
-                "passing_risk": 0.4,
-                "verticality": 0.6,
+                "passing_risk": 0.35,
+                "verticality": 0.55,
                 "width": 0.8,
                 "support_distance": 7.0,
-                "counterpress_intensity": 0.4,
+                "counterpress_intensity": 0.35,
                 "defensive_line": 22.0,           # Deeper rest defense
-                "transition_speed": 0.5,
+                "transition_speed": 0.45,
             },
             "direct": {
                 "description": "Win first contact, control second balls, press high",
-                "press_trigger_threshold": 0.35,
-                "passing_risk": 0.3,
+                "press_trigger_threshold": 0.3,
+                "passing_risk": 0.25,
                 "verticality": 0.5,
                 "width": 0.9,
                 "support_distance": 6.0,
-                "counterpress_intensity": 0.8,
+                "counterpress_intensity": 0.85,
                 "defensive_line": 24.0,
             },
             "possession": {
                 "description": "Press to disrupt rhythm, force errors, counter",
-                "press_trigger_threshold": 0.3,
-                "passing_risk": 0.3,
+                "press_trigger_threshold": 0.25,
+                "passing_risk": 0.25,
                 "verticality": 0.5,
                 "width": 0.9,
                 "support_distance": 6.0,
-                "counterpress_intensity": 0.7,
+                "counterpress_intensity": 0.75,
+                "defensive_line": 26.0,
             },
             "wall": {
                 "description": "Block wall lanes, force central, press wide",
-                "press_trigger_threshold": 0.4,
-                "passing_risk": 0.4,
-                "verticality": 0.6,
+                "press_trigger_threshold": 0.35,
+                "passing_risk": 0.35,
+                "verticality": 0.55,
                 "width": 0.8,
                 "support_distance": 7.0,
                 "counterpress_intensity": 0.5,
+                "defensive_line": 24.0,
             },
-            "chaos": {
-                "description": "Stay compact, minimize risk, punish mistakes",
-                "press_trigger_threshold": 0.5,
+            "physical": {
+                "description": "Quick release, body positioning, avoid 50-50s",
+                "press_trigger_threshold": 0.45,
                 "passing_risk": 0.2,
-                "verticality": 0.4,
-                "width": 0.7,
-                "support_distance": 6.0,
+                "verticality": 0.45,
+                "width": 0.75,
+                "support_distance": 5.5,
                 "counterpress_intensity": 0.3,
+                "defensive_line": 26.0,
             },
             "balanced": {
                 "description": "Standard adaptive approach",
                 "press_trigger_threshold": 0.4,
-                "passing_risk": 0.4,
+                "passing_risk": 0.35,
                 "verticality": 0.55,
-                "width": 0.7,
+                "width": 0.8,
                 "support_distance": 7.0,
-                "counterpress_intensity": 0.5,
+                "counterpress_intensity": 0.55,
+                "defensive_line": 24.0,
             },
             "unknown": {
                 "description": "Default balanced approach",
                 "press_trigger_threshold": 0.4,
-                "passing_risk": 0.4,
+                "passing_risk": 0.35,
                 "verticality": 0.55,
-                "width": 0.7,
+                "width": 0.8,
                 "support_distance": 7.0,
-                "counterpress_intensity": 0.5,
+                "counterpress_intensity": 0.55,
+                "defensive_line": 24.0,
             },
         }
         return counters.get(archetype, counters["balanced"])
