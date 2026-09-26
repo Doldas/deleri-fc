@@ -99,6 +99,40 @@ class DepthTests(unittest.TestCase):
         self.assertLessEqual(it.tx, DEFENSIVE_FIFTH - 1.0 + 1e-6)
 
 
+class DistributionSafetyTests(unittest.TestCase):
+    """Invariant guard, not a regression test.
+
+    Aiming the keeper's distribution at the ball's collection point was
+    measured and reverted: against the reference side it collapsed our attack
+    from 7.0 to 2.5 goals per match (280-0 -> 101-0 over 40 matches) while
+    adding only 3.4 points of win rate against Vanguard.
+
+    Note what is *not* here: a unit test pinning the distribution target. The
+    keeper's chosen target is byte-identical between the reverted and current
+    code across every single-tick scenario in tests/test_policy.py, because the
+    difference only shows up as accumulated possession over a whole match. A
+    test written against it would pass on both versions and give false
+    confidence -- the same mistake the three tests in test_vanguard_fixes.py
+    were making. The guard for this is scripts/practice_gate.sh, which runs the
+    real reference and Vanguard matches and checks goals-per-match.
+    """
+
+    def test_distribution_never_targets_our_own_goal(self):
+        observation = obs((3.0, 20.0), "us", our_st_x=12, them_x=45)
+        observation["ball"]["possessedBy"] = "gk"
+        it = PolicyController().decide(make_inp(observation))["gk"]
+        if it.action_target is not None:
+            self.assertGreater(it.action_target[0], 0.0)
+
+    def test_distribution_target_is_finite(self):
+        observation = obs((3.0, 20.0), "us", our_st_x=12, them_x=45)
+        observation["ball"]["possessedBy"] = "gk"
+        it = PolicyController().decide(make_inp(observation))["gk"]
+        if it.action_target is not None:
+            for v in it.action_target:
+                self.assertTrue(-1e6 < v < 1e6)
+
+
 class SafetyTests(unittest.TestCase):
     def test_never_asks_to_tackle(self):
         # RULES.md:20 a goalkeeper cannot use `tackle`.

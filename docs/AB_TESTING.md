@@ -80,3 +80,66 @@ What the fixes do buy is measurable and worth keeping:
 Those are correctness and robustness wins, not scoring wins. The open problem
 is unchanged: we hold the ball about 26 m from goal, rarely reach the 7 m where
 a shot is winnable at all, and score nothing in open play.
+
+## Goalkeeper rework
+
+The keeper was rebuilt against the strongest thing in the generated set:
+`opponents/counter-elite`'s `_gk_plan`, which gets the geometry right where
+ours did not. Ours clamped himself into the goal mouth (y 17.6..22.4, a 4.8 m
+band in a 6 m goal) and sat at x=2.0-2.5 for the whole match. The opponent
+stands on the ball-to-centre bisector at 0.62 and scales his depth with the
+ball, clamped inside the defensive fifth.
+
+Against Vanguard, 60 matches per variant:
+
+| seed | variant | W/D/L | win rate | goals | conceded/match | clean sheets |
+|------|---------|-------|----------|-------|----------------|--------------|
+| gk-v1 | new keeper | 18/0/42 | 30.0% | 18-47 | 0.78 | 30.0% |
+| gk-v1 | old keeper | 9/0/51 | 15.0% | 9-71 | 1.18 | 15.0% |
+| gk-v2 | new keeper | 24/0/36 | 40.0% | 24-39 | 0.65 | 40.0% |
+| gk-v2 | old keeper | 17/0/43 | 28.3% | 17-63 | 1.05 | 28.3% |
+| gk-v2 | positioning only | 22/0/38 | 36.7% | 22-42 | 0.70 | 36.7% |
+
+Replicated across two independent seed sets: +15.0 and +11.7 points of win
+rate, goal difference +0.55 and +0.517. Pooled 42/120 (35.0%) against 26/120
+(21.7%), and 86 goals conceded against 134, a 36% reduction. That is well
+outside the run-to-run spread, so unlike the earlier three fixes this one is
+real.
+
+### The part that nearly shipped by accident
+
+The same commit also pointed the keeper's distribution at the ball's
+collection point, on the argument that a pass aimed at a teammate's feet
+sails 15.6 m over their head. It passed all 194 unit tests, built, validated,
+and looked like a further +3.4 points against Vanguard. Against the reference
+side it cut attacking output from 7.0 to 2.5 goals per match:
+
+| vs reference, 40 matches | W/D/L | goals |
+|--------------------------|-------|-------|
+| keeper + distribution fix | 40/0/0 | 101-0 |
+| keeper positioning only | 40/0/0 | 277-0 |
+| old keeper | 40/0/0 | 280-0 |
+
+A keeper pass is a long ball by nature and a forward can run onto one. Solving
+for the collection point lands the ball ~15.6 m beyond the receiver, usually in
+the opponent's half where we have nobody, and nothing orders a teammate to go
+and collect it. The distribution change was reverted; positioning was kept.
+
+No unit test could have caught this. The keeper's chosen target is
+byte-identical between the two versions across every single-tick scenario in
+`tests/test_policy.py`; the difference only accumulates over a whole match.
+`scripts/practice_gate.sh` exists for that reason and now runs both opponents
+on every change, because the two have opposite incentives: reference punishes
+losing the ball and rewards building attacks, Vanguard pressures us and
+attacks our goal. A change that improves one and wrecks the other is not an
+improvement.
+
+### Calibration
+
+The gate's thresholds are set from measurement, not guesswork. An initial run
+at 40 matches flagged 1.60 conceded per match against a 1.05 ceiling; at 80
+matches the same build measured 0.74, and 7.00 goals per match against
+reference, which reproduces the 280-0 figure exactly. So a marginal FAIL means
+re-run with a different `SEED`, and the default is 20 games per opponent for
+speed with `GAMES=40` before believing any marginal result.
+

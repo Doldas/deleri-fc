@@ -595,14 +595,23 @@ class PolicyController:
         
         # Standard distribution: find best open teammate.
         #
-        # Scored on the space at the ball's *landing* point, not at the
-        # teammate's current position. A pass leaves at 12 m/s and cannot be
-        # touched again until 5 m/s, so it always rolls MIN_PASS_TRAVEL
-        # (~15.6 m); "open" at the receiver's feet says nothing about whether
-        # the ball arrives in space. This is the same collection-point
-        # correction already applied to outfield passing in _collectable_pass,
-        # and the keeper needed it just as much: he was aiming at where a
-        # teammate stood, not where the ball would actually stop.
+        # Deliberately scored on the space around the teammate's *current*
+        # position, not on the ball's landing point. The outfield version in
+        # _collectable_pass has to aim at the collection point, because a pass
+        # aimed at someone's feet sails 15.6 m over their head. The keeper is
+        # the opposite case, and aiming at the collection point was measured
+        # and reverted: against the reference side it collapsed our attack
+        # from 7.0 to 2.5 goals per match (280-0 -> 101-0 over 40 matches)
+        # while adding only 3.4 points of win rate against Vanguard.
+        #
+        # A keeper pass is a long ball by nature and a forward can run onto
+        # one. Solving for the collection point instead lands the ball ~15.6 m
+        # beyond the receiver, usually in the opponent's half where we have
+        # nobody, so we trade a chance to build an attack for a ball we lose.
+        # Nothing orders a teammate to go and collect it (the receiver
+        # meet-order gap in docs/SCORING.md), so it is simply lost. The
+        # sideways hoof below is left as it was for the same reason: it is
+        # ugly, but it is not the thing that broke the attack.
         best = None
         best_score = -1e9
         for t in teammates:
