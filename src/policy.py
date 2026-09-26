@@ -74,6 +74,15 @@ GK_INTERCEPT_BLEND = 0.75
 # RULES.md only allows him to control a free ball inside the defensive fifth,
 # so there is nothing to gain past 20% of the pitch.
 GK_INCOMING_MAX_X = GK_DEFENSIVE_FIFTH_LIMIT - 1.0
+# Headings the carrier may probe, in degrees off straight at their goal.
+# 0 is straight on; the rest fan out to both flanks so a wall across the
+# middle can be walked around instead of into.
+DRIBBLE_PROBE_ANGLES = (-70.0, -50.0, -34.0, -20.0, -9.0, 0.0, 9.0, 20.0, 34.0, 50.0, 70.0)
+# How close an opponent has to be to a probe line to count as blocking it.
+DRIBBLE_LANE_RADIUS = 3.5
+# Metres of forward ground given up per unit of blockage. High enough that a
+# genuinely open goal is never traded for a wide detour.
+DRIBBLE_BLOCKED_PENALTY = 7.0
 
 
 def ball_travel_before_control(speed: float) -> float:
@@ -1133,18 +1142,60 @@ class PolicyController:
         into it. A carry has to be a short, re-aimable step: advance, keep the
         ball on the far side from the nearest marker, and steer around anyone
         standing in the lane.
+
+        Stepping 9 m straight ahead is only correct against a defence that
+        happens to be standing somewhere else. Measured against wall-elite,
+        which parks a wall across halfway, the carrier walked into it every
+        time: our ball never passed x=33.3, we took no shots and lost 0-5 --
+        while the wall's own outfielders never once entered y<10. The lane was
+        wide open on the left for the entire match and we never looked for it,
+        because steering only considered the single nearest marker.
+
+        So probe. Score a fan of headings by how much forward ground they win
+        and how many opponents stand in the way, and take the best. Against an
+        open defence this still returns "straight at goal", because that is
+        what wins the most forward ground with nobody in the lane.
         """
         state = inp.state
         bx, by = p.x, p.y
 
         step = 9.0
-        tx, ty = bx + step, by
 
         # In the final third, line up the open side of the goal.
         if bx > 36.0:
-            tx = bx + 7.0
-            ty = self._open_goal_y(state, bx, by)
+            return (
+                geom.clamp(bx + 7.0, 1.5, OPP_GOAL_X - 1.5),
+                geom.clamp(self._open_goal_y(state, bx, by), 2.0, PITCH_WIDTH - 2.0),
+                1.0,
+            )
 
+        best_score = -1e9
+        best = (bx + step, by)
+        for deg in DRIBBLE_PROBE_ANGLES:
+            rad = math.radians(deg)
+            dx, dy = math.cos(rad), math.sin(rad)
+            px_, py_ = bx + dx * step, by + dy * step
+            if not (1.5 <= px_ <= OPP_GOAL_X - 1.5) or not (2.0 <= py_ <= PITCH_WIDTH - 2.0):
+                continue
+            # Forward ground won, less whatever is standing in the lane.
+            blocked = 0.0
+            for o in state.outfield_them():
+                # Distance from the opponent to the probe segment.
+                vx, vy = px_ - bx, py_ - by
+                seg = vx * vx + vy * vy
+                t = 0.0 if seg <= 1e-9 else max(0.0, min(1.0, ((o.x - bx) * vx + (o.y - by) * vy) / seg))
+                cx_, cy_ = bx + vx * t, by + vy * t
+                d = math.hypot(o.x - cx_, o.y - cy_)
+                if d < DRIBBLE_LANE_RADIUS:
+                    blocked += (DRIBBLE_LANE_RADIUS - d) / DRIBBLE_LANE_RADIUS
+            score = dx * step - blocked * DRIBBLE_BLOCKED_PENALTY
+            if score > best_score:
+                best_score, best = score, (px_, py_)
+
+        tx, ty = best
+
+        # Keep the ball on the far side from a marker tight on the carrier, and
+        # slide wide if one is standing in the immediate lane.
         opp = state.nearest_opponent(bx, by)
         if opp is not None:
             gap = geom.distance(bx, by, opp.x, opp.y)
@@ -1152,11 +1203,8 @@ class PolicyController:
             norm = math.hypot(ax, ay)
             if norm > 1e-6:
                 if gap < 7.0:
-                    # Carry around the marker, keeping the forward drive.
                     tx += ax / norm * 4.0
                     ty += ay / norm * 4.0
-                # If he is standing in the lane ahead, slide wide instead of
-                # running straight into him.
                 ahead = (opp.x - bx) * step / max(step, 1.0)
                 if 0.0 < ahead < 5.0 and abs(opp.y - by) < 3.0:
                     side = 1.0 if by >= opp.y else -1.0
