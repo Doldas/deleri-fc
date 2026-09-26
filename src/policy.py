@@ -922,10 +922,17 @@ class PolicyController:
             # receiver standing closer than that sails over their head and
             # straight into the press.
             #
-            # Vetoing those passes outright measured better than merely pricing
-            # them in (3-0-9 and 3-11 goals, against 2-0-10 and 2-12 for the
-            # priced version, which also dropped a decision), so the pass is
-            # only offered when the ball can actually be collected by someone.
+            # The pass is only offered when the ball can actually be collected by
+            # someone.
+            #
+            # The veto is justified by the geometry, not by a win rate. An
+            # earlier comment here cited 3-0-9 and 3-11 goals against 2-0-10 and
+            # 2-12 for a priced variant; those were 12-match runs, and the
+            # 60-match A/B in docs/AB_TESTING.md shows the engine is not
+            # deterministic, so that gap was noise and has been removed as
+            # evidence. What does reproduce is the behaviour: on a 42 m
+            # centre-back hold the pre-fix policy chose `pass` where this one
+            # chooses `none`.
             plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.35)
             collect_x, collect_y, power, _ = pass_collection_point(
                 p.x, p.y, plan.target_x, plan.target_y, 0.0
