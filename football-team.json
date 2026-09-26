@@ -1,8 +1,8 @@
 {
-  "id": "my-team-fc",
-  "name": "My Team FC",
+  "id": "deleri-fc",
+  "name": "Deleri FC",
   "language": "basic",
   "authoringMode": "basic",
   "tacticsSchemaVersion": "1.0",
-  "image": "football-team-my-team-fc:dev"
+  "image": "football-team-deleri-fc:dev"
 }

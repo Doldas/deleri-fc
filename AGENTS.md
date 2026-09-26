@@ -1,4 +1,4 @@
-# AGENTS.md — Football Babylon AI (My Team FC)
+# AGENTS.md — Football Babylon AI (Deleri FC)
 
 This file pins the operating rules for any agent (human or AI) working on this
 team. It derives from `docs/AISTRATEGI.md` and the authoritative engine rules in
@@ -19,10 +19,10 @@ engine behavior.
 
 ## 1. Scope boundary (hard constraint)
 
-- **Only modify files inside `My Teams/my-team-fc/`.** Never edit files outside
+- **Only modify files inside `My Teams/deleri-fc/`.** Never edit files outside
   that folder (engine, worker, tooling, docs, protocol schemas, viewer, other
   teams).
-- The tournament artifact is the built image `football-team-my-team-fc:dev`.
+- The tournament artifact is the built image `football-team-deleri-fc:dev`.
 - `team.json`, `tactics.json`, `models.py`, `custom_strategy.py` are the builder
   contract. Prefer editing `src/`, `strategy.py`, `server.py`, `tests/`.
 
