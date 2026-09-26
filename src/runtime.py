@@ -80,6 +80,7 @@ class MatchContext:
     rng: random.Random = field(default_factory=lambda: random.Random())
     explanations: list[dict] = field(default_factory=list)
     mcts_planner: MCTSPlanner | None = None
+    match_duration: float = 60.0  # Match duration in seconds (default 60s)
 
     def assign_slots(self, state: GameState) -> None:
         if not self.roles and state.us:
@@ -119,6 +120,8 @@ class RuntimeManager:
         seed_str = str(body.get("randomSeed", ""))
         seed = seed_int(seed_str, game_id) if seed_str else 0
         config = self.runtime_config
+        # Capture match duration from initial timeRemainingSeconds or duration field
+        match_duration = float(body.get("duration", body.get("timeRemainingSeconds", 60.0)))
         with self._lock:
             ctx = MatchContext(
                 game_id=game_id,
@@ -126,6 +129,7 @@ class RuntimeManager:
                 genome=dict(self.genome_base),
                 slots=list(self.configs.get("formation", {}).get("slots", [])),
                 config=config,
+                match_duration=match_duration,
             )
             ctx.rng = random.Random(seed ^ int(body.get("seriesId", "")[:8].encode("utf-8").hex() or "0", 16))
             if config.enable_mcts:
@@ -178,6 +182,17 @@ class RuntimeManager:
                 # Blend 70% base, 30% counter-tactic for smooth adaptation
                 adapted_genome[key] = adapted_genome[key] * 0.7 + value * 0.3
 
+# Genome hash logging for debugging
+        import hashlib
+        def _genome_hash(g):
+            raw = ",".join(f"{k}:{g.get(k,0):.6f}" for k in sorted(g.keys()))
+            return hashlib.sha1(raw.encode()).hexdigest()[:8]
+        
+        base_hash = _genome_hash(genome)
+        adapted_hash = _genome_hash(adapted_genome)
+        # Policy will use adapted_genome; MCTS will be updated below
+        mcts_hash = "none"
+        
         # §32 context-sensitive press planning: chase harder when trailing late,
         # sit calmer when leading late.
         ctx_str = match_context(state.time_remaining, state.score_us, state.score_them)
@@ -209,13 +224,8 @@ class RuntimeManager:
         inp = PolicyInput(
             state=state,
             world=world,
-            # The untuned base genome on purpose. Wiring the archetype-adapted
-            # `press_genome` in here was measured and rejected: the counter-
-            # tactics it carries have never been validated end to end, and
-            # turning them on cost 1-0-11 and 1-13 goals against Vanguard FC
-            # (elite). Adaptation stays confined to `plan_press`, where it is
-            # exercised, until the whole-policy version proves itself.
-            config=RuntimeConfig(genome=genome),
+            # Use adapted genome (with archetype counters + context mods) for full policy
+            config=RuntimeConfig(genome=adapted_genome),
             tactical_state=tactical_state,
             press_plan=press_plan,
             roles=ctx.roles,
@@ -225,6 +235,7 @@ class RuntimeManager:
             score_us=state.score_us,
             score_them=state.score_them,
             counter_press_active=ctx.counter_press_active,
+            match_duration=ctx.match_duration,
         )
 
         intents = ctx.policy.decide(inp)
@@ -234,8 +245,11 @@ class RuntimeManager:
             ctx.counter_press_active = False
 
         # Optional limited MCTS override on possession build-up/progression.
+        # Use adapted genome for MCTS too.
         mcts_note = None
         if ctx.mcts_planner is not None and state.has_control() and world.ball_zone in ("own", "mid"):
+            # Update MCTS planner with current adapted genome
+            ctx.mcts_planner.genome = adapted_genome
             best = ctx.mcts_planner.choose(inp, intents)
             if best is not None:
                 intents = best

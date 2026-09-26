@@ -33,6 +33,35 @@ from .geom import GOAL_CENTER_Y, GOAL_HIGH_Y, GOAL_LOW_Y, OPP_GOAL_X, PITCH_LENG
 
 
 # Default distance for nearest opponent fallback (20m = center of pitch width)
+
+def _natural_role(player_id: str) -> str:
+    """Determine a player's natural role from their ID.
+    
+    This is used for shooting decisions to prevent defenders who move up
+    from being treated as strikers just because they're in attacking positions.
+    """
+    if player_id.startswith("gk"):
+        return "goalkeeper"
+    if player_id.startswith("cd") or player_id.startswith("cb") or player_id.startswith("df") or player_id.startswith("db") or player_id.startswith("dm"):
+        return "defender"
+    if player_id.startswith("st") or player_id.startswith("cf") or player_id.startswith("fw"):
+        return "striker"
+    if player_id.startswith("am") or player_id.startswith("cm") or player_id.startswith("lm") or player_id.startswith("rm") or player_id.startswith("wm") or player_id.startswith("mm"):
+        return "midfielder"
+    if player_id.startswith("wb") or player_id.startswith("lw") or player_id.startswith("rw"):
+        return "winger"
+    # Default to defender for unknown IDs
+    return "defender"
+
+
+def _is_natural_striker(inp, p) -> bool:
+    """Check if player is a natural striker (by ID), not just current dynamic role."""
+    natural_role = _natural_role(p.id)
+    dynamic_role = inp.roles.get(p.id, "defender")
+    # Consider striker if natural role is striker, or dynamic role is striker and in attacking position
+    return natural_role == "striker" or (dynamic_role == "striker" and p.x > 30.0)
+
+
 def go_20() -> float:
     return 20.0
 
@@ -209,6 +238,7 @@ class PolicyInput:
     score_us: int | None = None
     score_them: int | None = None
     counter_press_active: bool = False  # trigger immediate high press after winning ball
+    match_duration: float = 60.0  # total match duration in seconds
 
     def their_possession_protected(self) -> bool:
         return self.their_possession_ticks < 3  # 0.25 s protection ≈ 2-3 decisions
@@ -232,7 +262,12 @@ class PolicyInput:
         return self.state.score_them
 
     def late(self) -> bool:
-        return self.tr <= 120.0  # last 2 minutes considered late (§32)
+        # Late = last 20% of match duration. Track initial time to infer match duration.
+        # If we don't have initial time, fall back to absolute 120s.
+        match_duration = getattr(self, '_match_duration', None)
+        if match_duration is None:
+            return self.tr <= 120.0
+        return self.tr <= match_duration * 0.2
 
     def context(self) -> str:
         return match_context(self.tr, self.su, self.st_th)
@@ -833,149 +868,294 @@ class PolicyController:
     # Possessor - Goal-First Decision Tree
     # Priority: Shoot → Cross → Cutback → Through → Wall → Switch → Pullback → OneTwo → ThirdMan → GKBypass → Carry → SafePass
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Possessor - Action-Value Decision
+    # ===================================================================
+    # Evaluates all attack options by expected value and picks the best.
+    # Replaces the sequential if-else chain with decision-theoretic approach.
+    # ===================================================================
     def _decide_possessor(self, inp: PolicyInput, p: Player) -> PlayerIntent:
-        state = inp.state
-        world = inp.world
-        config = inp.config
-        ball = state.ball
-        log_entry: dict = {"state": str(inp.tactical_state), "player": p.id}
-
         if not p.can_act:
             # Dribble-forward intent still applies.
             tx, ty, speed = self._dribble_target(inp, p)
             return PlayerIntent(p.id, tx, ty, speed, tx, ty)
 
-        # -- 1. SHOOT ---------------------------------------------------
-        shot = self._shot_choice(inp, p)
-        if shot is not None:
-            tx, ty = shot[0], shot[1]
-            log_entry["action"] = "shoot"
-            log_entry["reason"] = "open_goal"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (tx, ty), shot[2])
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 2. CROSS FROM WING -----------------------------------------
-        # Winger near byline (x > 48), cross to striker in box
+        # Use action-value evaluation for all attack decisions
+        return self._evaluate_attack_actions(inp, p)
+    def _evaluate_attack_actions(self, inp: PolicyInput, p: Player) -> PlayerIntent:
+        """Evaluate all attack options and return the best one by expected value."""
+        state = inp.state
+        world = inp.world
+        ball = state.ball
         role = inp.roles.get(p.id, ROLE_DEFENDER)
-        if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 48.0:
-            striker = None
-            for t in state.outfield_us():
-                if inp.roles.get(t.id) == ROLE_STRIKER:
-                    striker = t
-                    break
-            if striker and striker.x > 40.0:
-                # Cross to striker - target between penalty spot and 6-yard box
-                tx = geom.clamp(striker.x + 2.0, 46.0, 54.0)
-                ty = striker.y
-                plan = plan_lead_pass(p.x, p.y, tx, ty, striker.vx, striker.vy, velocity_weight=0.2)
-                if plan.target_x > 0:
-                    log_entry["action"] = "pass"
-                    log_entry["reason"] = "cross"
-                    self.log.record(log_entry)
-                    intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), plan.power)
-                    return self._veto_own_goal(inp, p, intent)
-
-        # -- 3. CUTBACK FROM BYLINE -------------------------------------
-        # Winger at byline, no clear forward path -> pull back to edge of box
+        
+        # Get opponent GK position once for all evaluations
+        gk = state.goalkeeper_them()
+        gkx = gk.x if gk else -1.0
+        gky = gk.y if gk else 20.0
+        
+        candidates: list[tuple[float, PlayerIntent, str]] = []  # (value, intent, reason)
+        
+# ---- 1. SHOOT ----
+        # Compute shot directly using pick_shot_target (bypasses _shot_choice GK HELL blocking)
+        gk = state.goalkeeper_them()
+        gkx = gk.x if gk else -1.0
+        gky = gk.y if gk else 20.0
+        dist_goal = OPP_GOAL_X - p.x
+        max_dist = shooting_distance(self._cfg(inp, "shooting_threshold", 0.5))
+        
+        # Use natural striker check (based on player ID) to prevent defenders from shooting
+        is_nat_striker = _is_natural_striker(inp, p)
+        
+        if dist_goal <= max_dist:
+            target = pick_shot_target(p.x, p.y, gkx, gky)
+            beats = shot_beats_keeper(p.x, p.y, gkx, gky, target.y, dist_goal, target.power)
+            # Only shoot if: (1) beats keeper, OR (2) natural striker inside box
+            is_finisher = _is_natural_striker(inp, p)
+            inside_box = dist_goal <= 11.0
+            is_finisher = _is_natural_striker(inp, p)
+            if not beats and not (is_finisher and inside_box):
+                shoot_value = 0.0  # Don't shoot
+            else:
+                # Base value: higher if beats keeper
+                base_value = 0.8 if beats else 0.15
+                # Minimum floor for natural strikers inside box
+                min_shoot_value = 10.0 if (_is_natural_striker(inp, p) and inside_box) else 0.0
+                shoot_value = max(0.0, base_value * 100.0 - dist_goal * 0.4)
+                if shoot_value > 0:
+                    intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (target.x, target.y), target.power)
+                    candidates.append((shoot_value, intent, "shoot"))
+        
+        # ---- 1b. TEST THE KEEPER (long shot to pull keeper out / create rebound) ----
+        # Only strikers inside the box should test the keeper from distance
+        inside_box = dist_goal <= 11.0
+        is_finisher = _is_natural_striker(inp, p)
+        if _is_natural_striker(inp, p) and dist_goal <= max_dist * 1.5 and dist_goal > 15.0:
+            # Long shot to test keeper / create rebound (strikers only, and only if inside box or beats keeper)
+            test_target = pick_shot_target(p.x, p.y, gkx, gky)
+            test_beats = shot_beats_keeper(p.x, p.y, gkx, gky, test_target.y, dist_goal, test_target.power)
+            if test_beats or inside_box:
+                test_value = 12.0  # Higher value for testing keeper
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (test_target.x, test_target.y), test_target.power)
+                candidates.append((12.0, intent, "test_keeper"))
+        
+        # ---- 1b. REBOUND SETUP ----
+        # Shoot at keeper's body to create rebound (strikers only)
+        gk = state.goalkeeper_them()
+        if _is_natural_striker(inp, p) and gk is not None and dist_goal < 20.0 and p.can_act:
+            gkx, gky = gk.x, gk.y
+            # Aim at keeper's body (center of goal)
+            tx, ty = OPP_GOAL_X, GOAL_CENTER_Y
+            power = 0.85
+            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+            if pass_lane_clear(p.x, p.y, tx, ty, opp_pos, margin=0.15):
+                rebound_value = 45.0
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "shoot", (tx, ty), power)
+                candidates.append((rebound_value, intent, "rebound_setup"))
+        
+        # ---- 1b. SECOND BALL ANTICIPATION ----
+        # If ball is loose in dangerous area, anticipate where it goes
+        ball = state.ball
+        if ball.possessing_team is None and ball.x > 40.0:
+            mx, my, secs = loose_ball_meeting_point(ball.x, ball.y, ball.vx, ball.vy)
+            mx = geom.clamp(mx, 0.5, PITCH_LENGTH - 0.5)
+            my = geom.clamp(my, 0.5, PITCH_WIDTH - 0.5)
+            dist = geom.distance(p.x, p.y, mx, my)
+            reach_time = dist / (MAX_RUN_SPEED * 0.9)
+            if reach_time < secs - 0.2:
+                second_ball_value = 35.0
+                intent = PlayerIntent(p.id, mx, my, 1.0, mx, my, "none")
+                candidates.append((second_ball_value, intent, "second_ball"))
+        
+        # ---- 2. CROSS FROM WING ----
+        if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 45.0:
+            cross = self._cross_choice(inp, p)
+            if cross is not None:
+                tx, ty, power = cross
+                # Cross value depends on striker position and box occupancy
+                cross_value = 25.0  # Base value for creating chance
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, cross[0], cross[1], "pass", (cross[0], cross[1]), cross[2])
+                candidates.append((cross_value, intent, "cross"))
+        
+        # ---- 3. CUTBACK FROM BYLINE ----
         cutback = self._cutback_choice(inp, p)
         if cutback is not None:
-            tx, ty, power = cutback
-            log_entry["action"] = "pass"
-            log_entry["reason"] = "cutback"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 4. THROUGH BALL --------------------------------------------
-        # Striker/winger making run behind high line -> weighted pass to space
+            # Cutback creates high-quality chance at edge of box
+            cutback_value = 35.0
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, cutback[0], cutback[1], "pass", (cutback[0], cutback[1]), cutback[2])
+            candidates.append((cutback_value, intent, "cutback"))
+        
+        # ---- 4. THROUGH BALL ----
         through = self._through_ball_choice(inp, p)
         if through is not None:
-            tx, ty, power = through
-            log_entry["action"] = "pass"
-            log_entry["reason"] = "through_ball"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 5. WALL PASS -----------------------------------------------
+            through_value = 40.0  # High value - breaks defensive line
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, through[0], through[1], "pass", (through[0], through[1]), through[2])
+            candidates.append((through_value, intent, "through_ball"))
+        
+        # ---- 5. WALL PASS ----
         wall = self._wall_pass_choice(inp, p)
         if wall is not None:
-            tx, ty, power = wall
-            log_entry["action"] = "wall_pass"
-            log_entry["reason"] = "wall_lane_open"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 6. SWITCH PLAY ---------------------------------------------
-        # Ball one flank, opposite winger free -> long diagonal
+            wall_value = 30.0  # Good for breaking lines
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, wall[0], wall[1], "pass", (wall[0], wall[1]), wall[2])
+            candidates.append((wall_value, intent, "wall_pass"))
+        
+        # ---- 6. SWITCH PLAY ----
         switch = self._switch_play_choice(inp, p)
         if switch is not None:
-            tx, ty, power = switch
-            log_entry["action"] = "pass"
-            log_entry["reason"] = "switch_play"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 7. PULL BACK -----------------------------------------------
-        # Striker at edge of box, winger arriving -> lay off for shot
+            switch_value = 20.0  # Opens up weak side
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, switch[0], switch[1], "pass", (switch[0], switch[1]), switch[2])
+            candidates.append((switch_value, intent, "switch_play"))
+        
+        # ---- 7. PULL BACK ----
         pullback = self._pullback_choice(inp, p)
         if pullback is not None:
-            tx, ty, power = pullback
-            log_entry["action"] = "pass"
-            log_entry["reason"] = "pullback"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 8. ONE-TWO (High Press Escape) -----------------------------
+            pullback_value = 28.0  # Creates shot from edge of box
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, pullback[0], pullback[1], "pass", (pullback[0], pullback[1]), pullback[2])
+            candidates.append((pullback_value, intent, "pullback"))
+        
+        # ---- 8. ONE-TWO (High Press Escape) ----
         onetwo = self._onetwo_choice(inp, p)
         if onetwo is not None:
-            tx, ty, power = onetwo
-            log_entry["action"] = "pass"
-            log_entry["reason"] = "high_press_onetwo"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 9. THIRD MAN RUN -------------------------------------------
+            onetwo_value = 22.0  # Escapes press, maintains possession
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, onetwo[0], onetwo[1], "pass", (onetwo[0], onetwo[1]), onetwo[2])
+            candidates.append((onetwo_value, intent, "high_press_onetwo"))
+        
+        # ---- 9. THIRD MAN RUN ----
         third = self._third_man_choice(inp, p)
         if third is not None:
-            tx, ty, power = third
-            log_entry["action"] = "pass"
-            log_entry["reason"] = "high_press_third_man"
-            self.log.record(log_entry)
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-            return self._veto_own_goal(inp, p, intent)
-
-        # -- 10. GK BYPASS (High Press) ---------------------------------
-        if role == "goalkeeper":
+            third_value = 25.0  # Breaks press with forward run
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, third[0], third[1], "pass", (third[0], third[1]), third[2])
+            candidates.append((third_value, intent, "high_press_third_man"))
+        
+        # ---- 10. GK BYPASS (High Press) ----
+        if inp.roles.get(p.id) == "goalkeeper":
             bypass = self._gk_bypass_choice(inp, p)
             if bypass is not None:
-                tx, ty, power = bypass
-                log_entry["action"] = "pass"
-                log_entry["reason"] = "high_press_gk_bypass"
-                self.log.record(log_entry)
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
-                return self._veto_own_goal(inp, p, intent)
-
-        # -- 11. CARRY --------------------------------------------------
-        # Default action with possession. A carried ball stays glued to the
-        # carrier at 6.4 m/s, so dribbling is the only movement that reliably
-        # keeps the ball and walks it into shooting range.
+                bypass_value = 30.0  # Direct counter-attack
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, bypass[0], bypass[1], "pass", (bypass[0], bypass[1]), bypass[2])
+                candidates.append((bypass_value, intent, "high_press_gk_bypass"))
+        
+        # ---- 11. REBOUND SETUP ----
+        rebound = self._rebound_setup_choice(inp, p)
+        if rebound is not None:
+            rebound_value = 45.0  # Very high value - creates chaos in box
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, rebound[0], rebound[1], "shoot", (rebound[0], rebound[1]), rebound[2])
+            candidates.append((rebound_value, intent, "rebound_setup"))
+        
+        # ---- 12. SECOND BALL / REBOUND ANTICIPATION ----
+        second_ball = self._second_ball_choice(inp, p)
+        if second_ball is not None:
+            second_ball_value = 35.0  # Anticipating loose ball in dangerous area
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, second_ball[0], second_ball[1], "pass", (second_ball[0], second_ball[1]), second_ball[2])
+            candidates.append((second_ball_value, intent, "second_ball"))
+        
+        # ---- 13. WALL SHOT ----
+        if is_near_wall(p.x, p.y, margin=6.0) and (OPP_GOAL_X - p.x) > 8.0:
+            wall_shot = wall_shot_target(p.x, p.y, gkx if 'gkx' in dir() else -1.0, gky if 'gky' in dir() else 20.0)
+            if wall_shot:
+                wx, wy, power = wall_shot
+                # Verify both legs clear
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, wx, wy, opp_pos, margin=0.12):
+                    if pass_lane_clear(wx, wy, OPP_GOAL_X, wy, opp_pos, margin=0.12):
+                        wall_shot_value = 28.0
+                        intent = PlayerIntent(p.id, p.x, p.y, 0.4, wx, wy, "shoot", (wx, wy), power)
+                        candidates.append((wall_shot_value, intent, "wall_shot"))
+        
+        # ---- 14. CARRY (Dribble) ----
         tx, ty, speed = self._dribble_target(inp, p)
-        log_entry["action"] = "dribble"
-        log_entry["reason"] = "carry_forward"
+        carry_value = max(5.0, (OPP_GOAL_X - p.x) * 0.1)  # Progress toward goal
+        carry_intent = PlayerIntent(p.id, tx, ty, speed, tx, ty)
+        candidates.append((carry_value, carry_intent, "carry_forward"))
+        
+        # ---- 15. SAFE PASS (last resort) ----
+        safe_pass = self._collectable_pass(inp, p)
+        if safe_pass is not None:
+            best, tx, ty, power = safe_pass
+            pass_value = 10.0  # Safe but low value
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            candidates.append((pass_value, intent, f"safe_pass_to_{best}"))
+        
+        # Select best candidate
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            best_value, best_intent, reason = candidates[0]
+            log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": best_intent.action_type, "reason": reason, "value": best_value}
+            self.log.record(log_entry)
+            return self._veto_own_goal(inp, p, best_intent)
+        
+        # Fallback
+        tx, ty, speed = self._dribble_target(inp, p)
+        log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": "dribble", "reason": "fallback_carry"}
         self.log.record(log_entry)
         return PlayerIntent(p.id, tx, ty, speed, tx, ty)
-
-    # ===================================================================
-    # New helper methods for goal-first decision tree
-    # ===================================================================
-
-    # -- 3. CUTBACK FROM BYLINE ---------------------------------------
+    
+    def _cross_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Cross from wing to striker in box."""
+        state = inp.state
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+        if role not in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) or p.x < 45.0:
+            return None
+        
+        striker = None
+        for t in state.outfield_us():
+            if inp.roles.get(t.id) == ROLE_STRIKER:
+                striker = t
+                break
+        if striker and striker.x > 38.0:
+            tx = geom.clamp(striker.x + 3.0, 46.0, 54.0)
+            ty = striker.y
+            plan = plan_lead_pass(p.x, p.y, tx, ty, striker.vx, striker.vy, velocity_weight=0.2)
+            if plan.target_x > 0:
+                collect_x, collect_y, power, _ = pass_collection_point(
+                    p.x, p.y, plan.target_x, plan.target_y, 0.0
+                )
+                miss = geom.distance(collect_x, collect_y, striker.x, striker.y)
+                if miss < 7.0:
+                    opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                    if pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.12):
+                        return (collect_x, collect_y, power)
+        return None
+    
+    def _rebound_setup_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Set up a rebound opportunity by shooting at keeper's hands/post."""
+        state = inp.state
+        gk = state.goalkeeper_them()
+        if gk is None:
+            return None
+        
+        # Shoot at keeper's body to create rebound
+        dist_goal = OPP_GOAL_X - p.x
+        if dist_goal < 18.0 and p.can_act:
+            gkx, gky = gk.x, gk.y
+            # Aim at keeper's body (center of goal)
+            tx, ty = OPP_GOAL_X, GOAL_CENTER_Y
+            power = 0.85
+            # Check if lane is reasonably clear
+            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+            if pass_lane_clear(p.x, p.y, tx, ty, opp_pos, margin=0.15):
+                return (tx, ty, power)
+        return None
+    
+    def _second_ball_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        """Anticipate second ball / rebound in dangerous area."""
+        state = inp.state
+        ball = state.ball
+        
+        # If ball is loose in dangerous area, anticipate where it goes
+        if ball.possessing_team is None and ball.x > 40.0:
+            # Predict where ball will be collectable
+            mx, my, secs = loose_ball_meeting_point(ball.x, ball.y, ball.vx, ball.vy)
+            mx = geom.clamp(mx, 0.5, PITCH_LENGTH - 0.5)
+            my = geom.clamp(my, 0.5, PITCH_WIDTH - 0.5)
+            
+            # If we can get there first, go for it
+            dist = geom.distance(p.x, p.y, mx, my)
+            reach_time = dist / (MAX_RUN_SPEED * 0.9)
+            if reach_time < secs - 0.2:
+                # Position to receive second ball
+                return (mx, my, 0.0)  # 0.0 power = move only
+        return None
     def _cutback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
         """Cutback from byline when no clear forward path exists."""
         state = inp.state
@@ -1297,8 +1477,8 @@ class PolicyController:
         )
         
         # GK HELL ADAPTATION: Detect elite keepers (very central, quick reactions)
-        # and adjust shooting strategy
-        is_gk_hell = gk is not None and gkx > 2.0 and gkx < 10.0 and abs(gky - 20.0) < 3.0
+        # and adjust shooting strategy. Opponent GK defends x=60, so check near x=60.
+        is_gk_hell = gk is not None and gkx > 50.0 and gkx < 58.0 and abs(gky - 20.0) < 3.0
         if is_gk_hell:
             # Against elite keepers: only shoot from very close range or extreme angles
             # Force the keeper to move by dribbling wide first

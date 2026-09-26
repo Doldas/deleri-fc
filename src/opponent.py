@@ -55,6 +55,13 @@ class OpponentModel:
     compact_width_accum: float = 0.0   # Accumulated y-spread when defending
     compact_samples: int = 0           # Samples for compactness
     deep_players_accum: int = 0        # Accumulated count of deep players
+    
+    # --- GK Quality Tracking ---
+    # Track opponent GK quality: position, saves, positioning
+    gk_position_accum: float = 0.0     # Accumulated GK x position when they have ball
+    gk_position_samples: int = 0       # Samples for GK position
+    gk_save_attempts: int = 0          # GK save attempts (approximated)
+    gk_quality_score: float = 0.0      # Computed GK quality score
 
     def update(self, state: GameState) -> None:
         ball = state.ball
@@ -126,6 +133,21 @@ class OpponentModel:
             # Track slaps - detect from events would be ideal, approximate via press intensity
             if self.press_intensity() > 0.7:
                 self.slap_ticks += 1
+            
+            # Track opponent GK quality when they have the ball
+            their_gk = state.goalkeeper_them()
+            if their_gk is not None:
+                # Track GK position when they have ball (should be near x=60)
+                self.gk_position_accum += their_gk.x
+                self.gk_position_samples += 1
+                # Approximate GK quality: elite GKs stay near their line (x > 55) and centered (y ≈ 20)
+                # Good positioning = closer to goal line and centered
+                if their_gk.x > 55.0 and abs(their_gk.y - 20.0) < 5.0:
+                    self.gk_quality_score = min(1.0, self.gk_quality_score + 0.05)
+                elif their_gk.x > 50.0:
+                    self.gk_quality_score = min(1.0, self.gk_quality_score + 0.02)
+                else:
+                    self.gk_quality_score = max(0.0, self.gk_quality_score - 0.01)
 
     # -- derived queries ------------------------------------------------------
     def prefer_side(self) -> float:
@@ -162,7 +184,7 @@ class OpponentModel:
         """Detect the opponent's tactical archetype.
         
         Returns one of: 'high_press', 'low_block', 'counter', 'direct', 
-        'possession', 'wall', 'physical', 'balanced', 'unknown'
+        'possession', 'wall', 'physical', 'elite_goalkeeper', 'balanced', 'unknown'
         """
         if self.total_obs_ticks < 20:
             return "unknown"
@@ -207,6 +229,12 @@ class OpponentModel:
         # Physical: aggressive slaps and tackles
         if slap_ratio > 0.2 or physical_ratio > 0.15:
             return "physical"
+        
+        # Elite Goalkeeper: opponent has elite GK (high quality score, GK stays near line)
+        gk_quality = getattr(self, 'gk_quality_score', 0.0)
+        avg_gk_x = self.gk_position_accum / max(1, self.gk_position_samples) if self.gk_position_samples > 0 else 0.0
+        if gk_quality > 0.5 and avg_gk_x > 55.0:
+            return "elite_goalkeeper"
         
         return "balanced"
 
@@ -307,6 +335,19 @@ class OpponentModel:
                 "support_distance": 7.0,
                 "counterpress_intensity": 0.55,
                 "defensive_line": 24.0,
+            },
+            "elite_goalkeeper": {
+                "description": "Elite GK - force wide, pull keeper out, exploit rebounds, wall shots",
+                "press_trigger_threshold": 0.3,
+                "passing_risk": 0.4,
+                "verticality": 0.5,
+                "width": 1.0,
+                "support_distance": 6.0,
+                "counterpress_intensity": 0.5,
+                "defensive_line": 24.0,
+                "shooting_threshold": 0.3,  # Shoot more aggressively
+                "wall_usage": 0.8,         # Use wall shots
+                "wall_shot_threshold": 0.4, # More willing to take wall shots
             },
         }
         return counters.get(archetype, counters["balanced"])
