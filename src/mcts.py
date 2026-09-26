@@ -172,7 +172,10 @@ class MCTSPlanner:
                 out[("them", p.pid)] = LIntent(tx=tx, ty=ty, speed=0.6)
         gk = st.gk("them")
         if gk is not None:
-            gkx = gk.x + (12.0 - gk.x) * 0.5
+            # Opponent GK defends x=60, their defensive fifth starts at x=48
+            # Move GK toward center of their defensive fifth (x=54)
+            target_gkx = 54.0
+            gkx = gk.x + (target_gkx - gk.x) * 0.5
             out[("them", gk.pid)] = LIntent(tx=gkx, ty=gk.y, speed=0.6)
         return out
 
@@ -236,7 +239,7 @@ class MCTSPlanner:
         out = dict(base)
         it = out.get(src)
         gk = inp.state.goalkeeper_them()
-        gkx = gk.x if gk else 2.0
+        gkx = gk.x if gk else 58.0
         gky = gk.y if gk else 20.0
         if it is not None:
             t = pick_shot_target(inp.state.ball.x, inp.state.ball.y, gkx, gky)

@@ -128,7 +128,7 @@ def default_genome() -> dict[str, float]:
         # Passing risk: Lower = safer passes, but we have specific patterns for risk
         "passing_risk": 0.3,
         # Shooting threshold: Lower = shoot more often, especially in box
-        "shooting_threshold": 0.4,
+        "shooting_threshold": 0.6,
         # Wall usage: High = exploit walls aggressively
         "wall_usage": 0.8,
         "wall_pass_threshold": 0.35,  # Lower = more willing to use wall passes

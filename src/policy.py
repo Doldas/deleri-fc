@@ -926,6 +926,35 @@ class PolicyController:
                     intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (target.x, target.y), target.power)
                     candidates.append((shoot_value, intent, "shoot"))
         
+        # ---- Shoot-on-sight in box: if we're in the box with any opening, shoot! ----
+        # Low blocks leave small windows - don't wait for perfect lane.
+        if dist_goal <= max_dist:
+            inside_box = dist_goal <= 11.0
+            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+            open_angle = shot_open_angle(p.x, p.y, opp_pos)
+            if is_near_wall(p.x, p.y, margin=4.0):
+                angle_limit = 0.10 if inside_box else 0.22
+                if shot_open_angle(p.x, p.y, opp_pos) >= angle_limit:
+                    power = 0.92 if inside_box else 0.8
+                    shoot_value = 45.0
+                    intent = PlayerIntent(p.id, p.x, p.y, 0.4, target.x, target.y, "shoot", (target.x, target.y), power)
+                    candidates.append((shoot_value, intent, "shoot"))
+        
+        # Wall shot: only when NOT in clear 1v1 (ball close to goal) and near wall
+        # In 1v1, direct shot is better - wall shot adds unpredictability
+        if is_near_wall(p.x, p.y, margin=6.0) and dist_goal > 8.0:
+            wall_shot = wall_shot_target(p.x, p.y, gkx, gky)
+            if wall_shot:
+                wx, wy, power = wall_shot
+                # Verify wall shot lane is clear
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, wx, wy, opp_pos, margin=0.12):
+                    # Check second leg (wall to goal) is also clear
+                    if pass_lane_clear(wx, wy, OPP_GOAL_X, wy, opp_pos, margin=0.12):
+                        shoot_value = 30.0
+                        intent = PlayerIntent(p.id, p.x, p.y, 0.4, wx, wy, "shoot", (wx, wy), power)
+                        candidates.append((shoot_value, intent, "wall_shot"))
+        
         # ---- 1b. TEST THE KEEPER (long shot to pull keeper out / create rebound) ----
         # Only strikers inside the box should test the keeper from distance
         inside_box = dist_goal <= 11.0
