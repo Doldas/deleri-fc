@@ -2,8 +2,20 @@
 
 This file pins the operating rules for any agent (human or AI) working on this
 team. It derives from `docs/AISTRATEGI.md` and the authoritative engine rules in
-`RULES.md`. When a rule here conflicts with anything else, the **engine** and the
-**protocol schemas** under `protocol/` win.
+`RULES.md` and `docs/00-game-engine-rules.md`. When a rule here conflicts with
+anything else, the **engine**, the **protocol schemas** under `protocol/`, and
+`docs/00-game-engine-rules.md` win.
+
+## 0. Engine rules reference
+
+**`docs/00-game-engine-rules.md` is the complete developer-facing rules reference
+for the Football Babylon five-a-side engine.** Every agent must read and follow
+it. It covers: decision contract (10 Hz decisions, 60 Hz simulation, 20 Hz
+snapshots), movement/facing/dribbling, loose-ball control, tackling (close vs
+slide), goalkeeper handling/diving, slaps, ball actions/physics, kickoffs/goals/phases,
+kit resolution, and scope boundaries. If any strategy guide, viewer animation, or
+external summary differs from this document, this document describes the intended
+engine behavior.
 
 ## 1. Scope boundary (hard constraint)
 
@@ -16,11 +28,11 @@ team. It derives from `docs/AISTRATEGI.md` and the authoritative engine rules in
 
 ## 2. Authority ordering (from AISTRATEGI §58)
 
-1. Hard engine rules **always** win over our internal physics model.
+1. Hard engine rules (**`docs/00-game-engine-rules.md`**, `RULES.md`) **always** win over our internal physics model.
 2. Measured Babylon simulation wins over real-world football intuition.
 3. Hard engine rules win over MCTS.
 
-When in doubt, re-read `RULES.md` and `protocol/*.schema.json`.
+When in doubt, re-read `docs/00-game-engine-rules.md`, `RULES.md`, and `protocol/*.schema.json`.
 
 ## 3. Action contract
 
