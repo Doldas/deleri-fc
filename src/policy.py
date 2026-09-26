@@ -54,6 +54,21 @@ TICKS_PER_SECOND = 60.0
 CONTROL_SAFE_SPEED = BALL_CONTROL_SAFE_SPEED
 
 
+# --- Goalkeeper positioning -------------------------------------------------
+# RULES.md "Goalkeeper handling and diving": automatic handling only applies
+# inside the first 20% of the pitch from the keeper's own goal line, so there is
+# nothing to gain by going past it and a real risk of a ball running through.
+GK_DEFENSIVE_FIFTH_LIMIT = 0.2 * PITCH_LENGTH
+# How far toward goal centre the keeper stands from the ball's y, as a fraction
+# of the ball-to-centre gap. 1.0 would put him on the goal line and 0.0 would
+# leave him level with the ball; 0.62 keeps him goal-side of the midpoint so a
+# shot straight down the middle is still covered while a wide crosser's angle is
+# narrowed. opponents/counter-elite uses the same 0.62.
+GK_BALL_GOAL_BIAS = 0.62
+# Default sweeper aggressiveness, matching the opponent's default gk_aggression.
+GK_AGGRESSION_DEFAULT = 0.4
+
+
 def ball_travel_before_control(speed: float) -> float:
     """Metres a free ball rolls before it slows to a collectable speed."""
     if speed <= CONTROL_SAFE_SPEED:
@@ -373,25 +388,37 @@ class PolicyController:
         return PlayerIntent(gk.id, tx, ty, speed, ball.x, ball.y, "none")
 
     def _gk_target_y(self, inp: PolicyInput, gk: Player, ball: Ball) -> float:
-        """Calculate optimal GK y-position with anticipation."""
+        """Position the keeper on the bisector between the ball and goal centre.
+
+        The old version clamped the ball's y into the goal mouth (17.6..22.4)
+        and then nudged it by 1.5 m when the ball was wide. That confines the
+        keeper to a 4.8 m band in the middle of a 6 m goal, so any cross or
+        shot from a wide angle simply goes round him, and the anticipation term
+        only ever moved him 1.5 m when the ball was already in the corner.
+
+        Standing on the bisector instead means he always sees the shot along
+        the shortest line from the ball to the goal, and the 0.62 factor keeps
+        him goal-side of the midpoint so a fast shot down the middle is still
+        covered. For a ball at y=2 that puts him at y=8.8 rather than 17.6,
+        which is what actually narrows the angle from a wide crosser.
+
+        Modelled on the keeper positioning in opponents/counter-elite, whose
+        `_gk_plan` uses `_lerp(by, GOAL_CENTER_Y, 0.62)`.
+        """
         state = inp.state
-        # Base: track ball y between posts with slight bias
-        base_y = geom.clamp(ball.y, GOAL_LOW_Y + 0.6, GOAL_HIGH_Y - 0.6)
-        
-        # Anticipate: if ball is wide, shade toward near post
-        if ball.y < 12.0:
-            base_y = geom.clamp(base_y - 1.5, GOAL_LOW_Y + 0.5, GOAL_CENTER_Y)
-        elif ball.y > 28.0:
-            base_y = geom.clamp(base_y + 1.5, GOAL_CENTER_Y, GOAL_HIGH_Y - 0.5)
-        
-        # If their striker is making a run, track the runner
+        ty = ball.y + (GOAL_CENTER_Y - ball.y) * GK_BALL_GOAL_BIAS
+        ty = geom.clamp(ty, GOAL_LOW_Y - 6.0, GOAL_HIGH_Y + 6.0)
+
+        # Still shade toward a runner in the box: a breakaway beats a pure
+        # bisector, and 0.22 is enough to cover the near post without giving
+        # up the far one.
         if ball.possessing_team == "them":
             striker = state.their_possessor()
-            if striker and striker.x > 40.0:
+            if striker is not None and striker.x > 40.0:
                 run_y = geom.clamp(striker.y, GOAL_LOW_Y + 0.5, GOAL_HIGH_Y - 0.5)
-                base_y = base_y * 0.7 + run_y * 0.3  # Slight bias to runner
-        
-        return base_y
+                ty = ty * 0.78 + run_y * 0.22
+
+        return ty
 
     def _assess_threat(self, inp: PolicyInput, state: GameState, ball: Ball, possessor: Player | None) -> dict:
         """Analyze the current attacking threat."""
@@ -500,21 +527,52 @@ class PolicyController:
         return PlayerIntent(gk.id, tx, ty, speed, face_x, face_y, "none")
 
     def _gk_standard_position(self, inp: PolicyInput, gk: Player, ball: Ball, threat: dict, ty: float) -> PlayerIntent:
-        """Standard angle-play positioning."""
-        # X position based on ball location with sweep tendency
-        if ball.x < 14.0:
-            # Ball in our defensive third: be ready to sweep
-            tx = geom.clamp(ball.x - 1.0, 1.5, 5.0)
-        elif ball.x < 30.0:
-            # Ball in midfield: higher start position
-            tx = 2.5
-        else:
-            # Ball in their half: very high
-            tx = 2.0
-        
+        """Advance up the pitch with the ball, but never leave the defensive fifth.
+
+        The old version sat at x=2.0-2.5 for the whole match regardless of where
+        the ball was, only stepping up to 5.0 when the ball was inside our
+        defensive third. Standing on the goal line is the worst place for a
+        keeper: the further out he is, the narrower the angle an attacker has to
+        hit, and at 8 m/s he can recover the ground.
+
+        opponents/counter-elite scales his depth with the ball instead
+        (`bx * (0.22 + 0.16 * aggression)`), clamped to stay inside the
+        defensive fifth, which is the same idea. RULES.md "Goalkeeper handling
+        and diving": he can only control a free ball inside the first 20% from
+        his own goal line, so going past that buys nothing and risks a ball
+        passing him.
+        """
+        # Come off the line in proportion to how far up the pitch the ball is,
+        # so a solo run from 50 m is met well outside the six-yard box.
+        depth = ball.x * (0.22 + 0.16 * GK_AGGRESSION_DEFAULT)
+        tx = geom.clamp(depth, 1.5, GK_DEFENSIVE_FIFTH_LIMIT - 1.0)
+
+        # Beat them to a dying ball in our own area, but only if no outfielder
+        # is closer: otherwise a defender is already on it and coming out just
+        # opens a gap behind him.
+        if ball.vx < 0.0 and ball.x < GK_DEFENSIVE_FIFTH_LIMIT:
+            best_d, _ = self._nearest_competitor(inp, ball.x, ball.y)
+            mine = geom.distance(gk.x, gk.y, ball.x, ball.y)
+            if mine <= best_d:
+                tx = geom.clamp(ball.x, 1.5, GK_DEFENSIVE_FIFTH_LIMIT - 1.0)
+                ty = geom.clamp(ball.y, GOAL_LOW_Y - 6.0, GOAL_HIGH_Y + 6.0)
+
         speed = 0.7 if abs(ball.y - gk.y) > 2.0 else 0.4
-        
+
         return PlayerIntent(gk.id, tx, ty, speed, ball.x, ball.y, "none")
+
+    def _nearest_competitor(self, inp: PolicyInput, x: float, y: float) -> tuple[float, str]:
+        """Distance to the nearest outfielder who could beat us to a ball.
+
+        The keeper is excluded: he is asking whether anyone is closer than he
+        is, so counting himself would always answer yes.
+        """
+        best_d, who = float("inf"), ""
+        for q in inp.state.outfield_us():
+            d = geom.distance(q.x, q.y, x, y)
+            if d < best_d:
+                best_d, who = d, q.id
+        return best_d, who
 
     def _decide_gk_possession(self, inp: PolicyInput, gk: Player) -> PlayerIntent:
         state = inp.state
@@ -535,43 +593,54 @@ class PolicyController:
                         intent = PlayerIntent(gk.id, plan[0], plan[1], 0.5, ball.x, ball.y, "pass", (plan[0], plan[1]), plan[2])
                         return self._veto_own_goal(inp, gk, intent)
         
-        # Standard distribution: find best open teammate
+        # Standard distribution: find best open teammate.
+        #
+        # Scored on the space at the ball's *landing* point, not at the
+        # teammate's current position. A pass leaves at 12 m/s and cannot be
+        # touched again until 5 m/s, so it always rolls MIN_PASS_TRAVEL
+        # (~15.6 m); "open" at the receiver's feet says nothing about whether
+        # the ball arrives in space. This is the same collection-point
+        # correction already applied to outfield passing in _collectable_pass,
+        # and the keeper needed it just as much: he was aiming at where a
+        # teammate stood, not where the ball would actually stop.
         best = None
         best_score = -1e9
         for t in teammates:
+            plan = self._safe_pass_plan(inp, gk, t)
+            land_x, land_y = plan[0], plan[1]
             open_d = min(
-                (geom.distance(t.x, t.y, o.x, o.y) for o in state.outfield_them()),
+                (geom.distance(land_x, land_y, o.x, o.y) for o in state.outfield_them()),
                 default=go_20(),
             )
-            progress = t.x - gk.x
-            travel = geom.distance(gk.x, gk.y, t.x, t.y)
-            
+            progress = land_x - gk.x
+            travel = geom.distance(gk.x, gk.y, land_x, land_y)
+
             # Prefer forward passes, but also value wide options for switching play
-            if t.x < gk.x + 2.0:
+            if land_x < gk.x + 2.0:
                 progress *= 0.5
-            
+
             # Bonus for wingers when we want to switch play
             role = inp.roles.get(t.id, ROLE_DEFENDER)
             wide_bonus = 0.0
             if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
-                wide_bonus = 3.0 if t.x > 25.0 else 1.0
-            
-            # Penalize if teammate is marked tightly
+                wide_bonus = 3.0 if land_x > 25.0 else 1.0
+
+            # Penalize if the landing spot is marked tightly
             mark_penalty = max(0.0, 5.0 - open_d)
-            
-            # Pass lane clearance
+
+            # Pass lane clearance to the landing spot, not to the receiver.
             opponents_pos = [(o.x, o.y) for o in state.outfield_them()]
-            lane_clear = pass_lane_clear(gk.x, gk.y, t.x, t.y, opponents_pos, margin=0.12)
+            lane_clear = pass_lane_clear(gk.x, gk.y, land_x, land_y, opponents_pos, margin=0.12)
             if not lane_clear and travel > 15.0:
                 continue  # Don't force long passes through traffic
-            
+
             score = progress * 1.5 + open_d * 1.5 - travel * 0.2 + wide_bonus - mark_penalty
             if score > best_score:
                 best_score = score
-                best = t
-        
+                best = (t, plan)
+
         if best is not None and best_score > -3.0:
-            plan = self._safe_pass_plan(inp, gk, best)
+            _, plan = best
             intent = PlayerIntent(gk.id, plan[0], plan[1], 0.5, ball.x, ball.y, "pass", (plan[0], plan[1]), plan[2])
             return self._veto_own_goal(inp, gk, intent)
         
@@ -588,11 +657,25 @@ class PolicyController:
                         intent = PlayerIntent(gk.id, cx, cy, 0.5, ball.x, ball.y, "pass", (cx, cy), power)
                         return self._veto_own_goal(inp, gk, intent)
         
-        # Last resort: dribble out to side (never clear - engine bug)
-        side = 8.0 if state.ball.y >= 20.0 else 32.0
-        tx = 4.0
-        ty = side
-        intent = PlayerIntent(gk.id, tx, ty, 0.5, OPP_GOAL_X, 20.0, "pass", (tx, ty), 0.3)
+        # Last resort: hoof it long into space, away from their keeper and away
+        # from the nearest man. The old code instead nudged the ball 4 m to one
+        # side at power 0.3, which travels nowhere useful and is intercepted
+        # from the front. Try both flanks and keep whichever the opponents are
+        # furthest from, rather than always playing down the middle. Same idea
+        # as the hoof in opponents/counter-elite's `_gk_plan`.
+        side = 1.0 if ball.y >= GOAL_CENTER_Y else -1.0
+        best_hoof = None
+        for s in (side, -side):
+            ty = geom.clamp(GOAL_CENTER_Y + s * 9.0, 3.0, PITCH_WIDTH - 3.0)
+            tx = geom.clamp(ball.x + 26.0, 5.0, PITCH_LENGTH - 5.0)
+            room = min(
+                (geom.distance(tx, ty, o.x, o.y) for o in state.outfield_them()),
+                default=go_20(),
+            )
+            if best_hoof is None or room > best_hoof[0]:
+                best_hoof = (room, tx, ty)
+        _, tx, ty = best_hoof
+        intent = PlayerIntent(gk.id, tx, ty, 0.5, OPP_GOAL_X, ty, "pass", (tx, ty), 0.85)
         return self._veto_own_goal(inp, gk, intent)
 
     def _veto_own_goal(self, inp: PolicyInput, p: Player, intent: PlayerIntent) -> PlayerIntent:
