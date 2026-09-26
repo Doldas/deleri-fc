@@ -1,0 +1,13 @@
+{
+  "protocolVersion": "1.0",
+  "name": "My Team FC - R4",
+  "shortName": "MTF-R4",
+  "colors": {
+    "primary": "#2563EB",
+    "secondary": "#EFF6FF"
+  },
+  "authors": [
+    "Your team"
+  ],
+  "description": "Round 4: possession-by-carry. Root cause of the 81% loose-ball matches was that every pass leaves the ball at 12+ m/s while a free ball is only collectable below 5 m/s, so no pass could ever be collected. R4 carries the ball forward by default, only passes to a receiver already within collectable range with a clear lane, aims loose-ball chasers at the point where the ball finally slows, and drives forward from kickoff."
+}

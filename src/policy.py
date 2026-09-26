@@ -1,0 +1,1604 @@
+"""RuntimePolicy — the distilled, fast, deterministic team controller.
+
+This is the tournament runtime brain: observe → world → tactics → policy →
+role assignment → intents. It encodes the elite-football priors (width, depth,
+support, rest defence, pressing triggers, counterpress, wall usage) as
+deterministic scoring functions. No neural network, no LLM, no MCTS at this
+layer by default (MCTS is an optional override for critical states).
+
+Everything respects the engine contract (RULES.md §3): only the possessor may
+pass/shoot/clear, outfields tackle/slap, the goalkeeper never tackles, and all
+numbers are finite and ranged.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+from . import geom
+from .config import (
+    BALL_CONTROL_MAX_SPEED,
+    BALL_CONTROL_SAFE_SPEED,
+    KICK_MIN_SPEED,
+    MAX_RUN_SPEED,
+    SLAP_CLEAN,
+    SLAP_FACING_DEG,
+    TACKLE_CLOSE,
+    TACKLE_MAX,
+    RuntimeConfig,
+    shooting_distance,
+)
+from .geom import GOAL_CENTER_Y, GOAL_HIGH_Y, GOAL_LOW_Y, OPP_GOAL_X, PITCH_LENGTH, PITCH_WIDTH
+
+
+# Default distance for nearest opponent fallback (20m = center of pitch width)
+def go_20() -> float:
+    return 20.0
+
+
+# --- Loose-ball physics (RULES.md is authoritative) -------------------------
+# A free ball is only collectable while it travels at no more than 5 m/s, and
+# it loses 0.8% of its speed every 60 Hz tick. Every "pass" action leaves the
+# ball at KICK_MIN_SPEED (12 m/s) or more, and players run at 8 m/s, so a pass
+# is a ball that travels roughly 15 m before anybody is even allowed to touch
+# it. Consequences that drive the whole policy:
+#   * carrying the ball (dribble, 6.4 m/s, ball glued 0.65 m in front) is the
+#     only way to reliably keep possession;
+#   * a pass is only worth it when a teammate is already close to the landing
+#     spot, open, and moving forward;
+#   * winning a loose ball back means meeting it where it has finally slowed
+#     below the control limit, not sprinting at its current position.
+BALL_DECAY_PER_TICK = 0.992
+TICKS_PER_SECOND = 60.0
+CONTROL_SAFE_SPEED = BALL_CONTROL_SAFE_SPEED
+
+
+def ball_travel_before_control(speed: float) -> float:
+    """Metres a free ball rolls before it slows to a collectable speed."""
+    if speed <= CONTROL_SAFE_SPEED:
+        return 0.0
+    decay = BALL_DECAY_PER_TICK
+    ticks = math.log(CONTROL_SAFE_SPEED / speed) / math.log(decay)
+    return speed * (1.0 - decay ** ticks) / (1.0 - decay) / TICKS_PER_SECOND
+
+
+def loose_ball_meeting_point(
+    x: float, y: float, vx: float, vy: float
+) -> tuple[float, float, float]:
+    """Where, and after how long, a loose ball can finally be controlled.
+
+    Returns (x, y, seconds). The point is clamped to what a runner travelling
+    at MAX_RUN_SPEED can actually reach before the ball gets there, so an
+    unreachable ball yields the best interception spot instead of a wild one.
+    """
+    speed = math.hypot(vx, vy)
+    if speed <= CONTROL_SAFE_SPEED or speed < 1e-6:
+        return x, y, 0.0
+    decay = BALL_DECAY_PER_TICK
+    ticks = math.log(CONTROL_SAFE_SPEED / speed) / math.log(decay)
+    seconds = max(0.0, ticks) / TICKS_PER_SECOND
+    ux, uy = vx / speed, vy / speed
+    reachable = MAX_RUN_SPEED * seconds
+    dist = min(ball_travel_before_control(speed), reachable)
+    return x + ux * dist, y + uy * dist, seconds
+
+
+# A pass is released at KICK_MIN_SPEED, so it always rolls this far before it
+# may be touched. A receiver standing further away than this can never get it.
+MAX_COLLECTABLE_PASS = ball_travel_before_control(KICK_MIN_SPEED) + 1.0
+
+from .physics import (
+    pass_collection_point,
+    pass_lane_clear,
+    pick_shot_target,
+    plan_lead_pass,
+    shot_beats_keeper,
+    shot_lane_clear,
+    shot_open_angle,
+    wall_pass_target,
+    wall_shot_target,
+)
+from .opponent import OpponentModel
+from .state import Ball, GameState, Player, WorldModel
+from .tactics import (
+    ROLE_DEFENDER,
+    ROLE_STRIKER,
+    ROLE_WIDE_LEFT,
+    ROLE_WIDE_RIGHT,
+    PressPlan,
+    TacticalState,
+)
+from .wall import is_near_wall
+
+
+@dataclass
+class PlayerIntent:
+    pid: str
+    tx: float
+    ty: float
+    speed: float
+    face_x: float
+    face_y: float
+    action_type: str = "none"
+    action_target: tuple[float, float] | None = None
+    action_power: float | None = None
+
+    def to_wire(self) -> dict:
+        intent: dict = {
+            "playerId": self.pid,
+            "move": {"target": {"x": _fin(self.tx), "y": _fin(self.ty)}, "speed": _fin(self.speed)},
+            "face": {"x": _fin(self.face_x), "y": _fin(self.face_y)},
+            "action": {"type": self.action_type},
+        }
+        if self.action_target is not None:
+            intent["action"]["target"] = {
+                "x": _fin(self.action_target[0]),
+                "y": _fin(self.action_target[1]),
+            }
+        else:
+            intent["action"]["target"] = None
+        if self.action_power is not None:
+            intent["action"]["power"] = _fin(self.action_power)
+        else:
+            intent["action"]["power"] = None
+        return intent
+
+
+def _fin(v: float) -> float:
+    if not math.isfinite(v):
+        return 0.0
+    return v
+
+
+@dataclass
+class PolicyInput:
+    state: GameState
+    world: WorldModel
+    config: RuntimeConfig
+    tactical_state: TacticalState
+    press_plan: PressPlan
+    roles: dict[str, str]
+    their_possession_ticks: int = 0  # how many decisions they've held the ball
+    opp: OpponentModel | None = None  # online opponent profile (§38), may be absent
+    time_remaining: float | None = None  # seconds left; falls back to state if None
+    score_us: int | None = None
+    score_them: int | None = None
+    counter_press_active: bool = False  # trigger immediate high press after winning ball
+
+    def their_possession_protected(self) -> bool:
+        return self.their_possession_ticks < 3  # 0.25 s protection ≈ 2-3 decisions
+
+    @property
+    def tr(self) -> float:
+        if self.time_remaining is not None:
+            return max(0.0, self.time_remaining)
+        return max(0.0, self.state.time_remaining)
+
+    @property
+    def su(self) -> int:
+        if self.score_us is not None:
+            return self.score_us
+        return self.state.score_us
+
+    @property
+    def st_th(self) -> int:
+        if self.score_them is not None:
+            return self.score_them
+        return self.state.score_them
+
+    def late(self) -> bool:
+        return self.tr <= 120.0  # last 2 minutes considered late (§32)
+
+    def context(self) -> str:
+        return match_context(self.tr, self.su, self.st_th)
+
+
+@dataclass
+class PolicyLog:
+    possessions_decided: list[dict] = field(default_factory=list)
+
+    def record(self, entry: dict) -> None:
+        if len(self.possessions_decided) < 64:
+            self.possessions_decided.append(entry)
+
+
+def _most_advanced(state: GameState, team: str) -> Player | None:
+    members = state.outfield_us() if team == "us" else state.outfield_them()
+    if not members:
+        return None
+    return max(members, key=lambda q: q.x)
+
+
+def _is_low_block(state: GameState) -> bool:
+    """Detect if opponent is in a low block (compact defense deep in their half)."""
+    them = state.outfield_them()
+    if not them:
+        return False
+    # Low block: opponent's formation is compact and deep
+    # At least 2 players very deep (x > 40), OR all players behind midfield (x > 30)
+    deep_count = sum(1 for p in them if p.x > 40.0)
+    mid_count = sum(1 for p in them if p.x > 30.0)
+    # Also check if they're compact (small spread)
+    if len(them) >= 3:
+        xs = [p.x for p in them]
+        spread = max(xs) - min(xs)
+        compact = spread < 20.0
+        return (deep_count >= 2 or mid_count >= 4) and compact
+    return deep_count >= 2 or mid_count >= 4
+
+
+# Multiplicative parameter adjustments per match context (§32). Values > 1
+# raise the parameter, < 1 lower it. Only keys present here are affected.
+_CONTEXT_MODS: dict[str, dict[str, float]] = {
+    "leading_late": {
+        "passing_risk": 0.6,
+        "verticality": 0.8,
+        "shooting_threshold": 1.15,
+        "wall_shot_threshold": 1.1,
+        "depth": 0.9,
+        "support_distance": 1.15,
+        "width": 0.9,
+        "defensive_line": 0.9,
+    },
+    "tied_late": {
+        "passing_risk": 1.05,
+        "shooting_threshold": 0.95,
+    },
+    "trailing_late": {
+        "passing_risk": 1.3,
+        "verticality": 1.25,
+        "shooting_threshold": 0.8,
+        "wall_shot_threshold": 0.85,
+        "depth": 1.1,
+        "support_distance": 0.85,
+        "width": 1.1,
+        "defensive_line": 1.1,
+    },
+}
+
+
+def match_context(
+    time_remaining: float | None,
+    score_us: int | None,
+    score_them: int | None,
+) -> str:
+    """§32 score/time context: leading/trailing/tied, late or not. Late means
+    <= 120 s remaining."""
+    tr = max(0.0, time_remaining or 0.0)
+    su = int(score_us or 0)
+    st_th = int(score_them or 0)
+    late = tr <= 120.0
+    diff = su - st_th
+    if late:
+        if diff > 0:
+            return "leading_late"
+        if diff < 0:
+            return "trailing_late"
+        return "tied_late"
+    if diff > 0:
+        return "leading"
+    if diff < 0:
+        return "trailing"
+    return "tied"
+
+
+class PolicyController:
+    log: PolicyLog
+
+    def __init__(self) -> None:
+        self.log = PolicyLog()
+
+    def _ctx_mods(self, inp: PolicyInput) -> dict[str, float]:
+        return _CONTEXT_MODS.get(inp.context(), {})
+
+    def _cfg(self, inp: PolicyInput, key: str, default: float) -> float:
+        """Parameter read with §32 context modulation applied.
+        
+        Reads from inp.config.genome dict, not from config attributes.
+        """
+        v = inp.config.genome.get(key, default)
+        mods = self._ctx_mods(inp)
+        return v * mods.get(key, 1.0)
+
+    def decide(self, inp: PolicyInput) -> dict[str, PlayerIntent]:
+        state: GameState = inp.state
+        intents: dict[str, PlayerIntent] = {}
+        ours = state.outfield_us()
+
+        if not ours:
+            return intents
+
+        if inp.tactical_state == TacticalState.KICKOFF:
+            return self._kickoff_intents(inp)
+
+        possessor = state.our_possessor()
+        for p in ours:
+            if possessor is not None and p.id == possessor.id:
+                intent = self._decide_possessor(inp, p)
+            else:
+                intent = self._decide_off_ball(inp, p, possessor)
+            intents[p.id] = intent
+
+        gk = state.goalkeeper_us()
+        if gk is not None:
+            intents[gk.id] = self._decide_goalkeeper(inp, gk)
+
+        self._enforce_press_actions(inp, intents)
+        self._resolve_ball_carrier_conflicts(inp, intents)
+        return intents
+
+    # ------------------------------------------------------------------ #
+    # Goalkeeper - Elite Level
+    # ------------------------------------------------------------------ #
+    def _decide_goalkeeper(self, inp: PolicyInput, gk: Player) -> PlayerIntent:
+        state = inp.state
+        ball = state.ball
+        allows_act = gk.can_act
+
+        if ball.possessing_team == "us" and ball.possessing_player == gk.id:
+            if allows_act:
+                return self._decide_gk_possession(inp, gk)
+            # Hold; engine distributes automatically after 1.25 s.
+            return PlayerIntent(gk.id, gk.x, gk.y, 0.0, ball.x, ball.y, "none")
+
+        # Elite GK positioning: track ball between posts with advanced anticipation
+        ty = self._gk_target_y(inp, gk, ball)
+        
+        if ball.possessing_team == "them":
+            # Analyze threat level
+            their_possessor = state.their_possessor()
+            threat = self._assess_threat(inp, state, ball, their_possessor)
+            
+            if threat["is_1v1"] and allows_act and their_possessor is not None:
+                # 1v1 situation: come out aggressively, narrow angle
+                return self._gk_one_v_one(inp, gk, ball, their_possessor, threat)
+            elif threat["is_through_ball"] and allows_act:
+                # Through ball anticipated: sweep up
+                return self._gk_sweep(inp, gk, ball, threat)
+            elif threat["is_cross"] and allows_act:
+                # Cross coming: position for claim/punch
+                return self._gk_cross(inp, gk, ball, threat)
+            else:
+                # Standard positioning with angle play
+                return self._gk_standard_position(inp, gk, ball, threat, ty)
+        elif ball.x > 14.0:
+            # Ball in their half: high start position for sweeps
+            tx = 2.5
+            speed = 0.65 if abs(ball.y - gk.y) > 1.0 else 0.3
+        else:
+            # Ball in our half but not possessed by us
+            tx = geom.clamp(ball.x - 1.5, 1.0, 5.0)
+            speed = 0.65 if abs(ball.y - gk.y) > 1.0 else 0.3
+        return PlayerIntent(gk.id, tx, ty, speed, ball.x, ball.y, "none")
+
+    def _gk_target_y(self, inp: PolicyInput, gk: Player, ball: Ball) -> float:
+        """Calculate optimal GK y-position with anticipation."""
+        state = inp.state
+        # Base: track ball y between posts with slight bias
+        base_y = geom.clamp(ball.y, GOAL_LOW_Y + 0.6, GOAL_HIGH_Y - 0.6)
+        
+        # Anticipate: if ball is wide, shade toward near post
+        if ball.y < 12.0:
+            base_y = geom.clamp(base_y - 1.5, GOAL_LOW_Y + 0.5, GOAL_CENTER_Y)
+        elif ball.y > 28.0:
+            base_y = geom.clamp(base_y + 1.5, GOAL_CENTER_Y, GOAL_HIGH_Y - 0.5)
+        
+        # If their striker is making a run, track the runner
+        if ball.possessing_team == "them":
+            striker = state.their_possessor()
+            if striker and striker.x > 40.0:
+                run_y = geom.clamp(striker.y, GOAL_LOW_Y + 0.5, GOAL_HIGH_Y - 0.5)
+                base_y = base_y * 0.7 + run_y * 0.3  # Slight bias to runner
+        
+        return base_y
+
+    def _assess_threat(self, inp: PolicyInput, state: GameState, ball: Ball, possessor: Player | None) -> dict:
+        """Analyze the current attacking threat."""
+        threat = {
+            "is_1v1": False,
+            "is_through_ball": False,
+            "is_cross": False,
+            "is_long_shot": False,
+            "ball_x": ball.x,
+            "ball_y": ball.y,
+            "possessor": possessor,
+            "closest_defender_dist": float('inf'),
+        }
+        
+        if possessor is None:
+            return threat
+        
+        # Find closest defender to the ball
+        for q in state.outfield_us():
+            if q.id == "gk":
+                continue
+            d = geom.distance(q.x, q.y, ball.x, ball.y)
+            if d < threat["closest_defender_dist"]:
+                threat["closest_defender_dist"] = d
+        
+        # 1v1: attacker past last defender, in our half, no cover
+        if ball.x < 18.0 and threat["closest_defender_dist"] > 6.0:
+            threat["is_1v1"] = True
+        
+        # Through ball: ball played behind defense, attacker running onto it
+        if ball.vx < -2.0 and ball.x < 25.0:  # Ball moving toward our goal
+            for q in state.outfield_them():
+                if q.x > ball.x and q.x - ball.x > 5.0:
+                    threat["is_through_ball"] = True
+                    break
+        
+        # Cross: ball wide and moving toward goal line
+        if (ball.y < 8.0 or ball.y > 32.0) and ball.x > 40.0:
+            threat["is_cross"] = True
+        
+        # Long shot: attacker in shooting range with time
+        if ball.x > 30.0 and ball.x < 45.0 and threat["closest_defender_dist"] > 4.0:
+            threat["is_long_shot"] = True
+        
+        return threat
+
+    def _gk_one_v_one(self, inp: PolicyInput, gk: Player, ball: Ball, possessor: Player, threat: dict) -> PlayerIntent:
+        """Aggressive 1v1: come out, make yourself big, force shooter wide."""
+        # Optimal position: 3-4m off line, cutting angle
+        tx = max(3.0, min(6.0, ball.x - 3.0))
+        
+        # Shade toward near post to cut angle
+        if ball.y < 20.0:
+            ty = GOAL_LOW_Y + 1.5
+        else:
+            ty = GOAL_HIGH_Y - 1.5
+        
+        # Sprint out at full speed
+        speed = 1.0
+        
+        # Face the ball
+        face_x, face_y = ball.x, ball.y
+        
+        # If very close and ball not moving fast, consider dive/smother
+        dist = geom.distance(gk.x, gk.y, ball.x, ball.y)
+        if dist < 2.5 and ball.vx > -1.0:
+            # Stay tall, make body big
+            pass
+        
+        return PlayerIntent(gk.id, tx, ty, speed, face_x, face_y, "none")
+
+    def _gk_sweep(self, inp: PolicyInput, gk: Player, ball: Ball, threat: dict) -> PlayerIntent:
+        """Sweep up through balls: intercept before attacker reaches it."""
+        # Predict where ball will be collectable
+        from .policy import loose_ball_meeting_point
+        mx, my, secs = loose_ball_meeting_point(ball.x, ball.y, ball.vx, ball.vy)
+        
+        # Only sweep if we can get there before attacker
+        gk_dist = geom.distance(gk.x, gk.y, mx, my)
+        gk_time = gk_dist / (MAX_RUN_SPEED * 0.8)  # GK slower than outfield
+        
+        if secs > gk_time + 0.3:  # We have time
+            tx = geom.clamp(mx, 2.0, 12.0)
+            ty = geom.clamp(my, GOAL_LOW_Y + 1.0, GOAL_HIGH_Y - 1.0)
+            speed = 1.0
+        else:
+            # Can't get there: drop back to standard position
+            return self._gk_standard_position(inp, gk, ball, threat, self._gk_target_y(inp, gk, ball))
+        
+        return PlayerIntent(gk.id, tx, ty, speed, ball.x, ball.y, "none")
+
+    def _gk_cross(self, inp: PolicyInput, gk: Player, ball: Ball, threat: dict) -> PlayerIntent:
+        """Position for cross: central, ready to claim or punch."""
+        # Stand in the "corridor" between 6-yard box and penalty spot
+        tx = geom.clamp(6.0, 3.0, 10.0)
+        
+        # Shade to the side the cross comes from
+        if ball.y < 20.0:
+            ty = GOAL_CENTER_Y - 2.0
+        else:
+            ty = GOAL_CENTER_Y + 2.0
+        
+        speed = 0.8
+        face_x, face_y = ball.x, ball.y
+        
+        return PlayerIntent(gk.id, tx, ty, speed, face_x, face_y, "none")
+
+    def _gk_standard_position(self, inp: PolicyInput, gk: Player, ball: Ball, threat: dict, ty: float) -> PlayerIntent:
+        """Standard angle-play positioning."""
+        # X position based on ball location with sweep tendency
+        if ball.x < 14.0:
+            # Ball in our defensive third: be ready to sweep
+            tx = geom.clamp(ball.x - 1.0, 1.5, 5.0)
+        elif ball.x < 30.0:
+            # Ball in midfield: higher start position
+            tx = 2.5
+        else:
+            # Ball in their half: very high
+            tx = 2.0
+        
+        speed = 0.7 if abs(ball.y - gk.y) > 2.0 else 0.4
+        
+        return PlayerIntent(gk.id, tx, ty, speed, ball.x, ball.y, "none")
+
+    def _decide_gk_possession(self, inp: PolicyInput, gk: Player) -> PlayerIntent:
+        state = inp.state
+        ball = state.ball
+        teammates = state.outfield_us()
+        
+        # Quick counter-attack check: if opponent is pushed up and we have a fast outlet
+        their_deepest = min((q.x for q in state.outfield_them()), default=60.0)
+        if their_deepest > 35.0:  # Opponent high line
+            # Look for striker/winger making a run behind
+            for t in teammates:
+                role = inp.roles.get(t.id, ROLE_DEFENDER)
+                if role == ROLE_STRIKER and t.x > 40.0:
+                    # Check if pass lane is clear
+                    opponents_pos = [(o.x, o.y) for o in state.outfield_them()]
+                    if pass_lane_clear(gk.x, gk.y, t.x, t.y, opponents_pos, margin=0.15):
+                        plan = self._safe_pass_plan(inp, gk, t)
+                        intent = PlayerIntent(gk.id, plan[0], plan[1], 0.5, ball.x, ball.y, "pass", (plan[0], plan[1]), plan[2])
+                        return self._veto_own_goal(inp, gk, intent)
+        
+        # Standard distribution: find best open teammate
+        best = None
+        best_score = -1e9
+        for t in teammates:
+            open_d = min(
+                (geom.distance(t.x, t.y, o.x, o.y) for o in state.outfield_them()),
+                default=go_20(),
+            )
+            progress = t.x - gk.x
+            travel = geom.distance(gk.x, gk.y, t.x, t.y)
+            
+            # Prefer forward passes, but also value wide options for switching play
+            if t.x < gk.x + 2.0:
+                progress *= 0.5
+            
+            # Bonus for wingers when we want to switch play
+            role = inp.roles.get(t.id, ROLE_DEFENDER)
+            wide_bonus = 0.0
+            if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+                wide_bonus = 3.0 if t.x > 25.0 else 1.0
+            
+            # Penalize if teammate is marked tightly
+            mark_penalty = max(0.0, 5.0 - open_d)
+            
+            # Pass lane clearance
+            opponents_pos = [(o.x, o.y) for o in state.outfield_them()]
+            lane_clear = pass_lane_clear(gk.x, gk.y, t.x, t.y, opponents_pos, margin=0.12)
+            if not lane_clear and travel > 15.0:
+                continue  # Don't force long passes through traffic
+            
+            score = progress * 1.5 + open_d * 1.5 - travel * 0.2 + wide_bonus - mark_penalty
+            if score > best_score:
+                best_score = score
+                best = t
+        
+        if best is not None and best_score > -3.0:
+            plan = self._safe_pass_plan(inp, gk, best)
+            intent = PlayerIntent(gk.id, plan[0], plan[1], 0.5, ball.x, ball.y, "pass", (plan[0], plan[1]), plan[2])
+            return self._veto_own_goal(inp, gk, intent)
+        
+        # No good short pass: try wall pass for switching play
+        for t in teammates:
+            role = inp.roles.get(t.id, ROLE_DEFENDER)
+            if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and t.x > 20.0:
+                wall_pass = wall_pass_target(gk.x, gk.y, t.x, t.y)
+                if wall_pass:
+                    cx, cy, power = wall_pass
+                    # Verify wall pass lane
+                    opponents_pos = [(o.x, o.y) for o in state.outfield_them()]
+                    if pass_lane_clear(gk.x, gk.y, cx, cy, opponents_pos, margin=0.15):
+                        intent = PlayerIntent(gk.id, cx, cy, 0.5, ball.x, ball.y, "pass", (cx, cy), power)
+                        return self._veto_own_goal(inp, gk, intent)
+        
+        # Last resort: dribble out to side (never clear - engine bug)
+        side = 8.0 if state.ball.y >= 20.0 else 32.0
+        tx = 4.0
+        ty = side
+        intent = PlayerIntent(gk.id, tx, ty, 0.5, OPP_GOAL_X, 20.0, "pass", (tx, ty), 0.3)
+        return self._veto_own_goal(inp, gk, intent)
+
+    def _veto_own_goal(self, inp: PolicyInput, p: Player, intent: PlayerIntent) -> PlayerIntent:
+        """Block any action that would send the ball toward our own goal (x=0).
+
+        The engine's "clear" action and some passes can erroneously target our
+        own goal line (x=0). Veto any action_target with x < ball.x - 2 when
+        ball is in our half, or any target x < 10 (deep in our box).
+        """
+        ball = inp.state.ball
+        at = intent.action_target
+        if at is None:
+            return intent
+        target_x = at[0]
+        # If target is behind the ball and ball is in our half, or deep in our box: veto
+        if (target_x < ball.x - 2.0 and ball.x < 30.0) or target_x < 10.0:
+            # Replace with safe dribble forward
+            tx, ty, speed = self._dribble_target(inp, p)
+            return PlayerIntent(p.id, tx, ty, speed, tx, ty)
+        return intent
+
+    # ------------------------------------------------------------------ #
+    # Possessor
+    # ------------------------------------------------------------------ #
+    def _decide_possessor(self, inp: PolicyInput, p: Player) -> PlayerIntent:
+        state = inp.state
+        world = inp.world
+        config = inp.config
+        ball = state.ball
+        log_entry: dict = {"state": str(inp.tactical_state), "player": p.id}
+
+        if not p.can_act:
+            # Dribble-forward intent still applies.
+            tx, ty, speed = self._dribble_target(inp, p)
+            return PlayerIntent(p.id, tx, ty, speed, tx, ty)
+
+        # -- Shooting ---------------------------------------------------
+        shot = self._shot_choice(inp, p)
+        if shot is not None:
+            tx, ty = shot[0], shot[1]
+            log_entry["action"] = "shoot"
+            log_entry["reason"] = "open_goal"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (tx, ty), shot[2])
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- Cross from wing ------------------------------------------------------
+        # When winger near byline (x > 48), cross to striker in box
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+        if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 48.0:
+            # Find striker in the box
+            striker = None
+            for t in state.outfield_us():
+                if inp.roles.get(t.id) == ROLE_STRIKER:
+                    striker = t
+                    break
+            if striker and striker.x > 40.0:
+                # Cross to striker - target between penalty spot and 6-yard box
+                tx = geom.clamp(striker.x + 2.0, 46.0, 54.0)
+                ty = striker.y
+                plan = plan_lead_pass(p.x, p.y, tx, ty, striker.vx, striker.vy, velocity_weight=0.2)
+                if plan.target_x > 0:
+                    log_entry["action"] = "pass"
+                    log_entry["reason"] = "cross"
+                    self.log.record(log_entry)
+                    intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), plan.power)
+                    return self._veto_own_goal(inp, p, intent)
+
+        # -- Wall pass ----------------------------------------------------
+        wall = self._wall_pass_choice(inp, p)
+        if wall is not None:
+            tx, ty, power = wall
+            log_entry["action"] = "wall_pass"
+            log_entry["reason"] = "wall_lane_open"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- Direct pass ---------------------------------------------------
+        choice = self._collectable_pass(inp, p)
+        if choice is not None:
+            best, tx, ty, power = choice
+            log_entry["action"] = "pass"
+            log_entry["reason"] = f"pass_to_{best}"
+            self.log.record(log_entry)
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
+            return self._veto_own_goal(inp, p, intent)
+
+        # -- Carry the ball forward ------------------------------------------
+        # Default action with possession. A carried ball stays glued to the
+        # carrier at 6.4 m/s, so dribbling is the only movement that reliably
+        # keeps the ball and walks it into shooting range.
+        tx, ty, speed = self._dribble_target(inp, p)
+        log_entry["action"] = "dribble"
+        log_entry["reason"] = "carry_forward"
+        self.log.record(log_entry)
+        return PlayerIntent(p.id, tx, ty, speed, tx, ty)
+
+    def _collectable_pass(
+        self, inp: PolicyInput, p: Player
+    ) -> tuple[str, float, float, float] | None:
+        """Best pass whose receiver can realistically get to the ball.
+
+        RULES.md: a free ball is collectable only below 5 m/s, and every pass
+        action releases it at 12 m/s or more. The ball therefore always rolls
+        at least ~15 m before anybody may touch it, which no one can chase
+        down from rest. So a pass is only worth taking when the receiver is
+        already near the landing spot, unmarked, with a clear lane, and the
+        pass actually moves us forward. Otherwise we keep carrying the ball.
+        """
+        state = inp.state
+        best: tuple[str, float, float, float] | None = None
+        best_score = -1e9
+        for rid, tx, ty, power in self._receivers(inp, p):
+            t = next((q for q in state.outfield_us() if q.id == rid), None)
+            if t is None or not t.can_act:
+                continue
+            travel = geom.distance(p.x, p.y, t.x, t.y)
+            # The ball needs ~15 m of roll before it can be controlled, so a
+            # receiver further away than that simply never gets the ball.
+            if travel > MAX_COLLECTABLE_PASS:
+                continue
+            nearest = min(
+                (geom.distance(t.x, t.y, o.x, o.y) for o in state.outfield_them()),
+                default=go_20(),
+            )
+            if nearest < 5.0:
+                continue
+            if self._lane_risk(inp, p, t) > 0.35:
+                continue
+            progress = t.x - p.x
+            if progress < -2.0:
+                continue  # never hand the ball backwards just to be safe
+            score = progress * 2.0 + nearest * 0.8 - travel * 0.5
+            if score > best_score:
+                best_score = score
+                best = (rid, tx, ty, power)
+        return best
+
+    def _shot_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        state = inp.state
+        gk = state.goalkeeper_them()
+        dist_goal = OPP_GOAL_X - p.x
+        gkx = gk.x if gk is not None else -1.0
+        gky = gk.y if gk is not None else 20.0
+        max_dist = shooting_distance(self._cfg(inp, "shooting_threshold", 0.5))
+        if dist_goal > max_dist:
+            return None
+        
+        opponents = [q.pos for q in state.outfield_them() if q.x > p.x]
+        inside_box = dist_goal <= 11.0
+
+        # Wall shot: only when NOT in clear 1v1 (ball close to goal) and near wall
+        # In 1v1, direct shot is better - wall shot adds unpredictability
+        if is_near_wall(p.x, p.y, margin=6.0) and dist_goal > 8.0:
+            wall_shot = wall_shot_target(p.x, p.y, gkx, gky)
+            if wall_shot:
+                wx, wy, power = wall_shot
+                # Verify wall shot lane is clear
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, wx, wy, opp_pos, margin=0.12):
+                    # Check second leg (wall to goal) is also clear
+                    if pass_lane_clear(wx, wy, OPP_GOAL_X, wy, opp_pos, margin=0.12):
+                        return (wx, wy, power)
+        
+        # Primary trigger: the lane to the aimed corner is free. A single
+        # marker on the lane blocks the shot; wide markers do not (§62).
+        target = pick_shot_target(p.x, p.y, gkx, gky)
+        lane_margin = 0.08 if inside_box else 0.15
+
+        # Does this shot actually have a chance against an automatic keeper?
+        #
+        # Measured against Vanguard FC (elite): we took 35 shots from a mean
+        # 15.1 m and every single one was saved, 26 of them by the centre-backs.
+        # The engine makes this inevitable -- the goal is 6 m wide, so the widest
+        # angle available against a keeper on the centre line is 3.0 m, his dive
+        # reach is 1.65 m, and he keeps shifting across his goal at run speed
+        # while the ball flies. Beyond roughly 7 m that shift alone eats the
+        # whole angle, so a shot at a set keeper is a standing catch no matter
+        # how clean the lane looks.
+        #
+        # So a free lane is not sufficient reason to shoot. The keeper has to be
+        # genuinely beaten: dragged out of his defensive fifth, pulled well wide
+        # by the ball, or beaten by a point-blank effort.
+        beats_keeper = shot_beats_keeper(
+            p.x, p.y, gkx, gky, target.y, dist_goal, target.power
+        )
+        # The striker is the designated finisher: once he is on the ball inside
+        # the box he has nothing better to do, and a saved shot costs no more
+        # than a hopeful pass into the same congestion. Defenders and wingers
+        # are held to the real test, which is what stops the 26 centre-back
+        # efforts from range that produced nothing.
+        is_finisher = inp.roles.get(p.id) == ROLE_STRIKER
+        if not beats_keeper and not (is_finisher and inside_box):
+            return None
+
+        if shot_lane_clear(p.x, p.y, target.x, target.y, opponents, margin=lane_margin):
+            power = 0.92 if inside_box else 0.8
+            return (target.x, target.y, power)
+        
+        # Shoot-on-sight in box: if we're in the box with any opening, shoot!
+        # Low blocks leave small windows - don't wait for perfect lane.
+        open_angle = shot_open_angle(p.x, p.y, opponents)
+        if is_near_wall(p.x, p.y, margin=4.0):
+            angle_limit = 0.10 if inside_box else 0.22
+            if open_angle >= angle_limit:
+                power = 0.92 if inside_box else 0.8
+                return (target.x, target.y, power)
+        
+        # Desperation shot from distance when trailing late
+        ctx = inp.context()
+        if (
+            ctx == "trailing_late"
+            and dist_goal <= max_dist * 1.2
+            and beats_keeper
+        ):
+            # Lower standards when chasing game
+            if open_angle >= 0.05:
+                power = 0.85
+                return (target.x, target.y, power)
+        
+        return None
+
+    def _wall_pass_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+        state = inp.state
+        world = inp.world
+        if not is_near_wall(p.x, p.y, margin=6.0):
+            return None
+        
+        # EARLY CROSSES: If winger near byline (x > 48), cross to striker in box
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+        if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 48.0:
+            # Find striker in box
+            for t in state.outfield_us():
+                if inp.roles.get(t.id) == ROLE_STRIKER and t.x > 40.0:
+                    # Cross to striker - target near penalty spot
+                    tx = geom.clamp(t.x + 2.0, 45.0, 54.0)
+                    ty = geom.clamp(t.y, 15.0, 25.0)
+                    plan = plan_lead_pass(p.x, p.y, tx, ty, t.vx, t.vy, velocity_weight=0.3)
+                    if plan.target_x > 0:
+                        dist = geom.distance(p.x, p.y, tx, ty)
+                        power = _power_for_distance(dist)
+                        return (tx, ty, power)
+        
+        direct = self._receivers(inp, p, count=2)
+        best_direct = direct[0][1] if direct else 0.0
+        best_wall = None
+        best_wall_score = best_direct
+        for t in state.outfield_us():
+            if t.id == p.id:
+                continue
+            cand = world.wall.contact_for(p.x, p.y, t.x, t.y)
+            if cand is None:
+                continue
+            # Wall pass value competes against the direct pass value.
+            openness = min((geom.distance(t.x, t.y, o.x, o.y) for o in state.outfield_them()), default=go_20())
+            threat = self._cfg(inp, "wall_usage", 0.5) * (cand.progression + openness * 2.0)
+            risk = cand.risk * (1.0 - self._cfg(inp, "wall_pass_threshold", 0.5) * 0.3)
+            score = threat - risk * 40.0
+            if score > best_wall_score:
+                best_wall_score = score
+                dist = geom.distance(p.x, p.y, cand.contact_x, cand.contact_y)
+                best_wall = (cand.contact_x, cand.contact_y, _power_for_distance(dist))
+        if best_wall is not None and best_wall_score > best_direct + 1.0:
+            return best_wall
+        return None
+
+    def _receivers(self, inp: PolicyInput, p: Player, count: int = 3) -> list[tuple[str, float, float, float]]:
+        """Rank teammates as direct-pass targets: (receiver_id, tx, ty, power)."""
+        state = inp.state
+        ball = state.ball
+        vertical = self._cfg(inp, "verticality", 0.55)
+        risk_tol = self._cfg(inp, "passing_risk", 0.4)
+        width_w = self._cfg(inp, "width", 0.7)
+        results: list[tuple[float, str, float, float, float]] = []
+        for t in state.outfield_us():
+            if t.id == p.id:
+                continue
+            progress = t.x - p.x
+            travel = geom.distance(p.x, p.y, t.x, t.y)
+            nearest_opp = min((geom.distance(t.x, t.y, o.x, o.y) for o in state.outfield_them()), default=go_20())
+            lane_risk = self._lane_risk(inp, p, t)
+            near_box = p.x > 42.0
+            if progress < 0.0:
+                # Backwards passes are a last resort; inside the box they are
+                # never worth it.
+                progress *= 0.05 if near_box else 0.3
+            if near_box and t.x < p.x - 4.0:
+                continue  # never recycle across our own box for a worse line
+            # Forward progression premium: reward passes that break the halfway line.
+            # The saturated lane_risk * 60 veto is only justified when the
+            # corridor is truly occupied; an open forward lane should win over
+            # a safe backward recycle. Use a massive premium to overwhelm the
+            # saturated lane_risk veto against parked blocks (reference recovers
+            # ~5% of passes, so the turnover risk is negligible).
+            forward_premium = 0.0
+            if progress > 0.0 and t.x >= 30.0:
+                forward_premium = 500.0
+            
+            # CHIPPED THROUGH BALLS: When defense is compact (lane_risk high) 
+            # but we have space behind their line, add a chipped option
+            chip_bonus = 0.0
+            if progress > 10.0 and lane_risk > 0.6 and t.x > 30.0:
+                # Chipped pass over defensive line - bypasses lane_risk
+                chip_bonus = 600.0
+            
+            # WIDE PLAY BONUS: Force passes to wingers on the flanks when
+            # in attacking half. Low blocks leave wings open.
+            wide_bonus = 0.0
+            role = inp.roles.get(t.id, ROLE_DEFENDER)
+            if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and ball.x > 30.0:
+                # Big bonus for passing to wingers in attacking half
+                wide_bonus = 400.0
+            score = (
+                progress * (0.5 + vertical)
+                + nearest_opp * (1.0 - risk_tol) * 1.5
+                + width_w * abs(t.y - 20.0) * 0.12
+                - lane_risk * 60.0
+                - travel * 0.06
+                + forward_premium
+                + chip_bonus
+                + wide_bonus
+            )
+            # Collection geometry: a pass cannot be touched again until it has
+            # slowed to 5 m/s, and it always leaves at 12 m/s or more, so it
+            # unavoidably rolls MIN_PASS_TRAVEL (~15.6 m). A pass aimed at a
+            # receiver standing closer than that sails over their head and
+            # straight into the press.
+            #
+            # Vetoing those passes outright measured better than merely pricing
+            # them in (3-0-9 and 3-11 goals, against 2-0-10 and 2-12 for the
+            # priced version, which also dropped a decision), so the pass is
+            # only offered when the ball can actually be collected by someone.
+            plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.35)
+            collect_x, collect_y, power, _ = pass_collection_point(
+                p.x, p.y, plan.target_x, plan.target_y, 0.0
+            )
+            overshoot = geom.distance(collect_x, collect_y, plan.target_x, plan.target_y)
+            if overshoot > 2.5:
+                # Unreachable landing spot: the ball stops well beyond the
+                # receiver, so this is a turnover, not a pass.
+                continue
+            miss = geom.distance(collect_x, collect_y, t.x, t.y)
+            if miss > 7.0:
+                continue
+            score += 40.0 - miss * 3.0
+            results.append((score, t.id, collect_x, collect_y, power))
+        results.sort(key=lambda r: r[0], reverse=True)
+        return [(r[1], r[2], r[3], r[4]) for r in results[:count]]
+
+    def _lane_risk(self, inp: PolicyInput, p: Player, t: Player) -> float:
+        """0..1 interception risk along the passing lane."""
+        state = inp.state
+        if not state.them:
+            return 0.0
+        mx = (p.x + t.x) / 2.0
+        my = (p.y + t.y) / 2.0
+        touch_x = (t.x - p.x)
+        touch_y = (t.y - p.y)
+        length = math.hypot(touch_x, touch_y)
+        if length <= 1e-6:
+            return 1.0
+        risk = 0.0
+        for o in state.outfield_them():
+            d = geom.seg_point_distance_sq(o.x, o.y, p.x, p.y, t.x, t.y)
+            if d < 2.0 * 2.0:
+                risk += (2.0 - math.sqrt(d)) / 2.0
+        risk = min(1.0, risk)
+        # Long passes through the centre are intrinsically riskier.
+        return risk + (0.0 if my < 6.0 or my > 34.0 else 0.05)
+
+    def _open_goal_y(self, state: GameState, bx: float, by: float) -> float:
+        """Aim for the goal side with the bigger angle and fewer bodies on it."""
+        best_y, best_score = GOAL_CENTER_Y, -1e9
+        for cand in (GOAL_LOW_Y + 1.2, GOAL_CENTER_Y, GOAL_HIGH_Y - 1.2):
+            lane = [o for o in state.outfield_them() if geom.seg_point_distance_sq(o.x, o.y, bx, by, OPP_GOAL_X, cand) < 9.0]
+            score = -len(lane) * 10.0 + abs(cand - GOAL_CENTER_Y) * 0.5
+            if score > best_score:
+                best_score, best_y = score, cand
+        return best_y
+
+    def _dribble_target(self, inp: PolicyInput, p: Player) -> tuple[float, float, float]:
+        """Where to carry the ball: a reachable step toward the goal.
+
+        The old version aimed at "8 m behind their deepest defender", i.e. up
+        to 25 m away. move.target is an absolute destination, so that just
+        parked the carrier in a corner of the pitch while the defence walked
+        into it. A carry has to be a short, re-aimable step: advance, keep the
+        ball on the far side from the nearest marker, and steer around anyone
+        standing in the lane.
+        """
+        state = inp.state
+        bx, by = p.x, p.y
+
+        step = 9.0
+        tx, ty = bx + step, by
+
+        # In the final third, line up the open side of the goal.
+        if bx > 36.0:
+            tx = bx + 7.0
+            ty = self._open_goal_y(state, bx, by)
+
+        opp = state.nearest_opponent(bx, by)
+        if opp is not None:
+            gap = geom.distance(bx, by, opp.x, opp.y)
+            ax, ay = bx - opp.x, by - opp.y
+            norm = math.hypot(ax, ay)
+            if norm > 1e-6:
+                if gap < 7.0:
+                    # Carry around the marker, keeping the forward drive.
+                    tx += ax / norm * 4.0
+                    ty += ay / norm * 4.0
+                # If he is standing in the lane ahead, slide wide instead of
+                # running straight into him.
+                ahead = (opp.x - bx) * step / max(step, 1.0)
+                if 0.0 < ahead < 5.0 and abs(opp.y - by) < 3.0:
+                    side = 1.0 if by >= opp.y else -1.0
+                    ty += side * 7.0
+
+        # Stay off our own goal and inside the pitch.
+        tx = geom.clamp(tx, 1.5, OPP_GOAL_X - 1.5)
+        ty = geom.clamp(ty, 2.0, PITCH_WIDTH - 2.0)
+        return tx, ty, 1.0
+
+    def _decide_off_ball(self, inp: PolicyInput, p: Player, possessor: Player | None) -> PlayerIntent:
+        state = inp.state
+        world = inp.world
+        ball = state.ball
+        role = inp.roles.get(p.id, ROLE_DEFENDER)
+
+        if state.has_control() and possessor is not None:
+            return self._off_ball_attack(inp, p, possessor, role)
+
+        if ball.possessing_team == "them":
+            return self._off_ball_defend(inp, p, role)
+
+        return self._off_ball_recover(inp, p)
+
+    def _pick_striker_channel(self, inp: PolicyInput, ball: Ball, striker_x: float) -> float:
+        """Pick the y-channel for the striker with fewest opponent markers ahead.
+
+        When ball is in attacking half (x > 30), target the gaps between 
+        center-back and fullback (channels at y≈8-12 and y≈28-32) where
+        low blocks leave space. In our half, use standard channel selection.
+        """
+        state = inp.state
+        if ball.x > 30.0:
+            # Target gaps between CB and FB: left gap (8-12) or right gap (28-32)
+            bands = [(10.0, 8.0, 12.0), (30.0, 28.0, 32.0)]
+        else:
+            # Standard three bands in our half
+            bands = [(10.0, 8.0, 12.0), (20.0, 13.0, 27.0), (30.0, 28.0, 32.0)]
+        
+        best_y = 20.0
+        best_count = 100
+        for center_y, y_min, y_max in bands:
+            count = 0
+            for o in state.outfield_them():
+                if o.x > striker_x and y_min <= o.y <= y_max:
+                    count += 1
+            if count < best_count:
+                best_count = count
+                best_y = center_y
+        return geom.clamp(best_y, 8.0, 32.0)
+
+    def _off_ball_attack(self, inp: PolicyInput, p: Player, possessor: Player, role: str) -> PlayerIntent:
+        state = inp.state
+        world = inp.world
+        ball = state.ball
+        depth = self._cfg(inp, "depth", 0.6)
+        width = self._cfg(inp, "width", 0.7)
+        support = self._cfg(inp, "support_distance", 7.0)
+
+        base = self._role_base(role)
+        if role == ROLE_STRIKER:
+            # ELITE STRIKER MOVEMENT - Multiple patterns based on game state
+            their_deepest = min((q.x for q in state.outfield_them()), default=60.0)
+            their_highest = max((q.x for q in state.outfield_them()), default=0.0)
+            defensive_line = their_highest  # Their last defender line
+            
+            # Check if we're playing against a high line (space behind)
+            high_line = defensive_line > 35.0
+            low_block = defensive_line < 25.0 and their_deepest > 40.0
+            
+            # Detect opponent style for adaptive runs
+            is_pressing_team = inp.opp is not None and inp.opp.press_intensity() > 0.7
+            
+            if ball.x < 25.0:
+                # Ball in our half / midfield: Target man role
+                # Stay high to stretch defense, provide outlet for GK/defenders
+                tx = geom.clamp(45.0 + depth * 8.0, 40.0, 54.0)
+                # If they press high, drop slightly to receive and lay off
+                if is_pressing_team and ball.x < 20.0:
+                    tx = geom.clamp(tx - 8.0, 35.0, 45.0)
+            elif ball.x < 35.0:
+                # Ball in midfield/attacking third transition
+                if high_line:
+                    # Run in behind: diagonal run between CB and FB
+                    tx = geom.clamp(defensive_line + 3.0, 42.0, 56.0)
+                    # Time the run: stay onside until ball is played
+                    if possessor and possessor.can_act:
+                        # Hold run until passer is ready
+                        pass
+                elif low_block:
+                    # Drop into pockets between midfield and defense
+                    tx = geom.clamp(ball.x + 8.0, 30.0, 40.0)
+                else:
+                    tx = geom.clamp(ball.x + 12.0 * depth + 6.0, 35.0, 54.0)
+            else:
+                # Ball in final third: Make dangerous runs
+                if low_block:
+                    # Against low block: find pockets, drag defenders out
+                    # Check if wingers are wide - if so, attack the box
+                    winger_wide = False
+                    for t in state.outfield_us():
+                        r = inp.roles.get(t.id, ROLE_DEFENDER)
+                        if r in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and t.x > 45.0:
+                            winger_wide = True
+                            break
+                    
+                    if winger_wide and possessor and possessor.x > 40.0:
+                        # Winger has ball wide: attack near/far post
+                        if possessor.y < 20.0:  # Left winger
+                            ty = 10.0  # Near post
+                        else:
+                            ty = 30.0  # Near post (right side)
+                        tx = geom.clamp(possessor.x + 2.0, 44.0, 54.0)
+                    else:
+                        # No width: drop deep to create overload, then spin
+                        tx = geom.clamp(ball.x + 3.0, 38.0, 48.0)
+                elif high_line:
+                    # High line: run in behind on through ball trigger
+                    if possessor and possessor.x > 30.0 and possessor.can_act:
+                        # Passer ready to play through ball
+                        tx = geom.clamp(defensive_line + 5.0, 45.0, 56.0)
+                    else:
+                        # Hold position, threaten the run
+                        tx = geom.clamp(defensive_line + 1.0, 40.0, 52.0)
+                else:
+                    # Standard: push up with play
+                    tx = geom.clamp(ball.x + 15.0 * depth + 8.0, 42.0, 54.0)
+            
+            # Channel selection: run between CB and FB
+            ty = self._pick_striker_channel(inp, ball, tx)
+            
+            # Fine-tune: if making run behind, bend run to stay onside
+            if high_line and tx > defensive_line:
+                # Arc run: start wider, cut inside
+                if ball.x < possessor.x if possessor else True:
+                    pass  # Hold width until pass is played
+        
+        elif role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+            # ELITE WINGER MOVEMENT
+            lane = 2.0 if role == ROLE_WIDE_LEFT else 38.0
+            is_left = role == ROLE_WIDE_LEFT
+            
+            # Check game state
+            their_deepest = min((q.x for q in state.outfield_them()), default=60.0)
+            their_highest = max((q.x for q in state.outfield_them()), default=0.0)
+            high_line = their_highest > 35.0
+            low_block = their_deepest > 40.0 and their_highest < 25.0
+            
+            # Detect if we have overload on this side
+            our_players_side = sum(1 for t in state.outfield_us() 
+                                   if (is_left and t.y < 20.0) or (not is_left and t.y > 20.0))
+            their_players_side = sum(1 for q in state.outfield_them() 
+                                     if (is_left and q.y < 20.0) or (not is_left and q.y > 20.0))
+            overload = our_players_side > their_players_side
+            
+            if ball.x > 30.0:
+                # Attacking third: drive to byline, cut inside, or play early
+                if low_block:
+                    # Against low block: stay WIDE to pin fullback, stretch defense
+                    # Drive to byline for cross
+                    tx = geom.clamp(ball.x + 15.0 * width, 45.0, 52.0)
+                    ty = geom.clamp(lane, 1.0, 6.0) if is_left else geom.clamp(lane, 34.0, 39.0)
+                    
+                    # If near byline, decide: cross, cut inside, or play back
+                    if tx > 48.0:
+                        # Check if striker is in box for cross
+                        striker_in_box = any(inp.roles.get(t.id) == ROLE_STRIKER and t.x > 40.0 
+                                             for t in state.outfield_us())
+                        if not striker_in_box:
+                            # No target: cut inside for shot/combination
+                            ty = geom.clamp(lane + 10.0, 12.0, 28.0)
+                            tx = geom.clamp(tx - 3.0, 45.0, 50.0)
+                elif high_line:
+                    # High line: run in behind fullback
+                    tx = geom.clamp(their_highest + 5.0, 42.0, 54.0)
+                    ty = geom.clamp(lane + 3.0, 6.0, 34.0)  # Slightly inside for through ball
+                else:
+                    # Standard: drive forward with ball
+                    tx = geom.clamp(ball.x + 12.0 * width, 45.0, 52.0)
+                    ty = geom.clamp(lane + (ball.y - lane) * 0.1, 2.0, 38.0)
+                    
+                    if tx > 48.0:
+                        ty = geom.clamp(lane, 2.0, 38.0)
+            else:
+                # Midfield/our half: provide width, support build-up
+                tx = geom.clamp(ball.x + 5.0 * width, 15.0, 40.0)
+                ty = geom.clamp(lane + (20.0 - lane) * 0.2, 4.0, 36.0)
+                
+                # If ball on opposite side, tuck in for overload
+                if (is_left and ball.y > 25.0) or (not is_left and ball.y < 15.0):
+                    ty = geom.clamp(ty + (5.0 if is_left else -5.0), 10.0, 30.0)
+        
+        else:  # defender = rest defence
+            tx = geom.clamp(ball.x * 0.4 + 6.0, 8.0, 22.0)
+            # Split across the centre line instead of both sitting on it. Two
+            # centre-backs stacked at y=20.0 give the team no defensive width
+            # and hand the far winger a free lane every time.
+            ty = 15.0 if p.y <= 20.0 else 25.0
+
+        # Support triangle: when the possessor is tightly pressed, offer a short,
+        # open, early exit instead of the role anchor.
+        #
+        # Measured against Vanguard FC (elite): this used to fire for *every*
+        # player within reach of the possessor and aimed them all at
+        # `possessor.y ± 8.0`, a 16 m band centred on the ball, with the
+        # side chosen by comparing player *ids*. Vanguard presses at 0.95, so
+        # `pressure_on_ball` was almost always above the 0.55 threshold, and
+        # the whole team spent the match inside that band: outfield shape
+        # collapsed to 11 m of width and 59% of player-ticks sat within 12 m of
+        # the centre. A team that narrow has no passing lane, so the ball could
+        # only be cleared sideways and never progressed.
+        #
+        # The offer now goes to the single closest teammate only, and it is
+        # placed on that player's own side of the ball, so taking it can never
+        # narrow the shape. Everyone else keeps their role anchor and the width.
+        if (
+            world.pressure_on_ball > 0.55
+            and possessor is not None
+            and p.id != possessor.id
+            and geom.distance(p.x, p.y, possessor.x, possessor.y) < support + 2.0
+        ):
+            my_gap = geom.distance(p.x, p.y, possessor.x, possessor.y)
+            nearest_gap = min(
+                (
+                    geom.distance(q.x, q.y, possessor.x, possessor.y)
+                    for q in state.outfield_us()
+                    if q.id not in (possessor.id, p.id)
+                ),
+                default=None,
+            )
+            if nearest_gap is not None and nearest_gap < my_gap:
+                return PlayerIntent(p.id, tx, ty, 0.7, ball.x, ball.y)
+            # Stay on our own side and keep a real gap, so the escape pass has
+            # room and the shape is not pulled into the ball.
+            side = 1.0 if p.y >= possessor.y else -1.0
+            off_x = geom.clamp(possessor.x - 2.0, 2.0, OPP_GOAL_X - 2.0)
+            off_y = geom.clamp(possessor.y + side * 10.0, 3.0, PITCH_WIDTH - 3.0)
+            return PlayerIntent(p.id, off_x, off_y, 0.85, ball.x, ball.y)
+        return PlayerIntent(p.id, tx, ty, 0.7, ball.x, ball.y)
+
+    def _off_ball_defend(self, inp: PolicyInput, p: Player, role: str) -> PlayerIntent:
+        state = inp.state
+        world = inp.world
+        ball = state.ball
+        plan: PressPlan = inp.press_plan
+        r = plan.role_for(p.id)
+
+        # ELITE DEFENDING: Man-to-man assignments with zonal cover
+        # Build assignment map: each defender gets a specific attacker to track
+        assignments = self._build_defensive_assignments(inp, state)
+        my_assignment = assignments.get(p.id)
+        
+        # Man-mark their most advanced forward on deep transitions: two deepest
+        # teammates split the deepest two attackers goal-side.
+        danger = _most_advanced(state, "them")
+        if danger is not None and danger.x > 28.0:
+            deepest = sorted(
+                state.outfield_us(),
+                key=lambda q: (q.x, q.id),
+            )[:2]
+            if p in deepest:
+                mark_y = danger.y
+                if inp.opp is not None:
+                    mark_y = geom.clamp(mark_y + inp.opp.prefer_side() * 3.0, 3.0, PITCH_WIDTH - 3.0)
+                tx = geom.clamp((danger.x + 5.0) * 0.5, 6.0, ball.x)
+                ty = geom.clamp(mark_y, 3.0, PITCH_WIDTH - 3.0)
+                return PlayerIntent(p.id, tx, ty, 1.0, ball.x, ball.y, "none")
+
+        if r == "PRESS":
+            tx, ty = ball.x, ball.y
+            speed = 1.0
+            # Close the space, stay goal-side.
+            return PlayerIntent(p.id, tx, ty, speed, ball.x, ball.y, "none")
+        if r == "PRESS_SUPPORT":
+            # Two-point support: between the presser and the ball's near escape.
+            tx, ty = self._support_press_point(inp, p)
+            return PlayerIntent(p.id, tx, ty, 0.9, ball.x, ball.y)
+        if r == "COVER":
+            tx, ty = self._cover_point(inp, p)
+            return PlayerIntent(p.id, tx, ty, 0.85, ball.x, ball.y)
+        
+        # ASSIGNED MAN-TO-MAN: If we have an assignment, track them goal-side
+        if my_assignment is not None:
+            return self._track_assignment(inp, p, my_assignment, ball, state)
+        
+        # Rest defence: anchored, goal-side, ready for the counter. The anchor
+        # shades toward the side they prefer to attack (§38) and deepens
+        # against a swarm-pressing side with a high defensive line.
+        #
+        # The deep line was tried and rejected on evidence. Holding a high line
+        # between the ball and our goal (x up to 40) instead of ceding the
+        # middle third looked right on paper -- our outfielders had been
+        # averaging x=24..31 -- but it measured much worse against Vanguard FC
+        # (elite): 12 matches, 1-0-11, 1-13 goals, versus 3-0-9 and 3-11 for
+        # the deep line. Their directness 0.75 and tempo 1.0 turn a high line
+        # into a ball over the top, and with four outfielders there is nobody
+        # behind it. The empty middle third is cheaper than a exposed channel.
+        opp = inp.opp
+        base_line = self._cfg(inp, "defensive_line", 26.0)
+        defensive_line = base_line
+        if opp is not None:
+            if opp.press_intensity() > 0.7:
+                defensive_line -= 2.0
+            if opp.defensive_shape_height() > 34.0:
+                defensive_line = min(base_line + 3.0, 30.0)
+        tx = defensive_line
+        anchor_y = 20.0
+        if opp is not None and opp.prefer_side() != 0.0:
+            anchor_y = geom.clamp(20.0 + opp.prefer_side() * 8.0, 6.0, 34.0)
+        elif state.goalkeeper_us() is not None and ball.y < 20.0:
+            anchor_y = 24.0 if role == ROLE_WIDE_RIGHT else 16.0
+        
+        # COUNTER-PRESS: If we just won the ball, press HIGH immediately
+        if inp.counter_press_active:
+            # Sprint to the ball carrier's position to disrupt their build-up
+            tx = geom.clamp(ball.x - 5.0, 15.0, 40.0)
+            anchor_y = ball.y
+            speed = 1.0
+        else:
+            # Compact defensive block - keep defensive line deeper against low blocks
+            tx = geom.clamp(tx, 6.0, 26.0)
+            speed = 0.7
+        return PlayerIntent(p.id, tx, anchor_y, speed, ball.x, ball.y)
+
+    def _support_press_point(self, inp: PolicyInput, p: Player) -> tuple[float, float]:
+        state = inp.state
+        ball = state.ball
+        pressers = inp.press_plan.pressers + inp.press_plan.second_pressers
+        if pressers:
+            leader = next((q for q in state.outfield_us() if q.id == pressers[0]), None)
+            if leader is not None:
+                mx = (leader.x + ball.x) / 2.0
+                my = (leader.y + ball.y) / 2.0
+                return geom.clamp_point(mx, my)
+        return (ball.x, ball.y)
+
+    def _cover_point(self, inp: PolicyInput, p: Player) -> tuple[float, float]:
+        """Stand goal-side of the ball on the line to our goal, blocking the
+        most dangerous pass/shot lane."""
+        state = inp.state
+        ball = state.ball
+        gx, gy = 0.0, GOAL_CENTER_Y
+        # Website-ish: interpolate between ball and our goal.
+        tx = geom.lerp(ball.x, gx, 0.45)
+        ty = geom.lerp(ball.y, gy, 0.45)
+        tx = max(4.0, tx)
+        cx = geom.clamp(tx, 4.0, ball.x)
+        cy = geom.clamp(ty, 3.0, PITCH_WIDTH - 3.0)
+        # Slight lane offset by our y-position to split two attackers.
+        return (cx, cy)
+
+    def _off_ball_recover(self, inp: PolicyInput, p: Player) -> PlayerIntent:
+        """Loose ball: go where it will finally be slow enough to control.
+
+        Sprinting at a kicked ball's current position is pointless: it is
+        travelling at 12-26 m/s and only becomes collectable below 5 m/s after
+        rolling for about a second and a half. The first runner therefore aims
+        at that meeting point, the second joins if it is reachable for them
+        too, and everyone else holds the goal-side shape so winning the ball
+        does not expose us to a counter.
+        """
+        state = inp.state
+        ball = state.ball
+        mx, my, seconds = loose_ball_meeting_point(ball.x, ball.y, ball.vx, ball.vy)
+        mx = geom.clamp(mx, 0.5, PITCH_LENGTH - 0.5)
+        my = geom.clamp(my, 0.5, PITCH_WIDTH - 0.5)
+
+        by_dist = sorted(
+            state.outfield_us(),
+            key=lambda q: (geom.distance(q.x, q.y, mx, my), q.id),
+        )
+        if not by_dist:
+            return PlayerIntent(p.id, ball.x, ball.y, 1.0, ball.x, ball.y)
+
+        for rank, q in enumerate(by_dist[:2]):
+            if p.id != q.id:
+                continue
+            reach = MAX_RUN_SPEED * seconds
+            dist = geom.distance(q.x, q.y, mx, my)
+            if rank == 1 and dist > reach + 2.0:
+                # Cannot get there in time: stay goal-side instead of running
+                # past the ball and leaving the middle open.
+                tx, ty = self._cover_point(inp, p)
+                return PlayerIntent(p.id, tx, ty, 0.9, ball.x, ball.y)
+            return PlayerIntent(p.id, mx, my, 1.0, ball.x, ball.y)
+
+        tx, ty = self._cover_point(inp, p)
+        return PlayerIntent(p.id, tx, ty, 0.85, ball.x, ball.y)
+
+    # ------------------------------------------------------------------ #
+    # Press actions (tackle / slap) applied to pressers near the ball.
+    # ------------------------------------------------------------------ #
+    def _enforce_press_actions(self, inp: PolicyInput, intents: dict[str, PlayerIntent]) -> None:
+        state = inp.state
+        if state.ball.possessing_team != "them":
+            return
+        possessor = state.their_possessor()
+        if possessor is None or not possessor.can_act:
+            return
+        if inp.their_possession_protected():
+            return
+        ball = state.ball
+        gk_them = state.goalkeeper_them()
+        for pid, intent in intents.items():
+            player = next((q for q in state.us if q.id == pid), None)
+            if player is None or not player.can_act:
+                continue
+            if player.role == "goalkeeper":
+                continue
+            d = geom.distance(player.x, player.y, ball.x, ball.y)
+            if d > TACKLE_MAX:
+                continue
+            # Never try to yank the ball from their goalkeeper.
+            if gk_them is not None and possessor.id == gk_them.id:
+                continue
+            facing_ok = geom.facing_diff(player.facing, ball.x, ball.y, player.x, player.y) <= math.radians(SLAP_FACING_DEG)
+            if d <= SLAP_CLEAN and facing_ok and config_uses_slap(inp):
+                intent.action_type = "slap"
+            elif d < TACKLE_CLOSE:
+                intent.action_type = "tackle"
+            elif d <= TACKLE_MAX:
+                # Slide only when the lane to our goal is already covered.
+                if _box_covered(inp):
+                    intent.action_type = "tackle"
+            if intent.action_type in ("tackle", "slap"):
+                intent.action_target = None
+                intent.action_power = None
+
+    def _resolve_ball_carrier_conflicts(self, inp: PolicyInput, intents: dict[str, PlayerIntent]) -> None:
+        state = inp.state
+        if not state.has_control():
+            return
+        possessor_id = state.ball.possessing_player
+        for intent in intents.values():
+            if intent.pid == possessor_id:
+                continue
+            if intent.action_type in ("pass", "shoot", "clear"):
+                intent.action_type = "none"
+                intent.action_target = None
+                intent.action_power = None
+
+    # ------------------------------------------------------------------ #
+    # Kickoff / restart
+    # ------------------------------------------------------------------ #
+    def _kickoff_intents(self, inp: PolicyInput) -> dict[str, PlayerIntent]:
+        """f1 is handed the ball on the centre spot, so we start by carrying it.
+
+        Passing here releases the ball at >=12 m/s into a team that is still
+        walking out of its own half, which is how a kickoff turns into a 15 m
+        loose ball that nobody is able to collect. Drive forward instead and
+        push the rest of the shape ahead of the ball so even a turnover stays
+        dangerous.
+        """
+        state = inp.state
+        intents: dict[str, PlayerIntent] = {}
+        ball = state.ball
+        starter = state.our_possessor()
+        for p in state.outfield_us():
+            role = inp.roles.get(p.id, ROLE_DEFENDER)
+            if starter is not None and p.id == starter.id:
+                tx, ty, speed = self._dribble_target(inp, p)
+                intents[p.id] = PlayerIntent(p.id, tx, ty, speed, tx, ty)
+                continue
+            if role == ROLE_STRIKER:
+                # Stay high: target man and rebound option.
+                tx = geom.clamp(ball.x + 16.0, 38.0, 52.0)
+                ty = self._pick_striker_channel(inp, ball, 44.0)
+            elif role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+                lane = 6.0 if role == ROLE_WIDE_LEFT else 34.0
+                tx, ty = geom.clamp(ball.x + 11.0, 34.0, 48.0), lane
+            else:
+                # Rest defence: never both centre-backs walk past halfway.
+                tx, ty = geom.clamp(ball.x * 0.5 + 4.0, 6.0, 20.0), GOAL_CENTER_Y
+            intents[p.id] = PlayerIntent(p.id, tx, ty, 0.85, ball.x, ball.y)
+        gk = state.goalkeeper_us()
+        if gk is not None:
+            intents[gk.id] = PlayerIntent(gk.id, 3.0, GOAL_CENTER_Y, 0.5, ball.x, ball.y)
+        return intents
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+    def _build_defensive_assignments(self, inp: PolicyInput, state: GameState) -> dict[str, Player]:
+        """Assign each defender a specific attacker to track (man-to-man with zonal fallback).
+        
+        Returns a dict mapping defender_id -> assigned attacker Player.
+        """
+        assignments: dict[str, Player] = {}
+        our_defenders = [p for p in state.outfield_us() if inp.roles.get(p.id) == ROLE_DEFENDER]
+        their_attackers = [q for q in state.outfield_them() if q.x > 25.0]  # Attackers in our half
+        
+        if not our_defenders or not their_attackers:
+            return assignments
+        
+        # Sort by x-position: deepest defender gets deepest attacker
+        our_defenders_sorted = sorted(our_defenders, key=lambda q: q.x)
+        their_attackers_sorted = sorted(their_attackers, key=lambda q: q.x, reverse=True)
+        
+        # Assign each defender to an attacker (1-to-1 where possible)
+        for i, defender in enumerate(our_defenders_sorted):
+            if i < len(their_attackers_sorted):
+                assignments[defender.id] = their_attackers_sorted[i]
+            else:
+                # Extra defenders: assign to space / zonal cover
+                pass
+        
+        return assignments
+
+    def _track_assignment(self, inp: PolicyInput, defender: Player, attacker: Player, 
+                          ball: Ball, state: GameState) -> PlayerIntent:
+        """Track assigned attacker goal-side, intercept through balls, maintain compactness."""
+        
+        # Goal-side positioning: between attacker and our goal
+        # Ideal position: slightly closer to goal than attacker, on the line to goal
+        goal_x, goal_y = 0.0, GOAL_CENTER_Y
+        
+        # Distance to maintain: 3-5m goal-side of attacker
+        track_distance = 4.0
+        dx = attacker.x - goal_x
+        dy = attacker.y - goal_y
+        dist_to_goal = math.hypot(dx, dy)
+        
+        if dist_to_goal > 1e-3:
+            # Position goal-side of attacker
+            tx = attacker.x - (dx / dist_to_goal) * track_distance
+            ty = attacker.y - (dy / dist_to_goal) * track_distance
+        else:
+            tx, ty = attacker.x - track_distance, attacker.y
+        
+        # Clamp to reasonable defensive positions
+        tx = geom.clamp(tx, 4.0, ball.x if ball.x > 10.0 else 20.0)
+        ty = geom.clamp(ty, 3.0, PITCH_WIDTH - 3.0)
+        
+        # INTERCEPTION LOGIC: If through ball is played toward attacker,
+        # step into the passing lane
+        if ball.possessing_team == "them" and ball.vx < -1.0:  # Ball moving toward our goal
+            # Check if ball trajectory intersects our assignment zone
+            ball_to_attacker = geom.distance(ball.x, ball.y, attacker.x, attacker.y)
+            if ball_to_attacker < 15.0:  # Ball played toward our man
+                # Move to intercept: position on ball-attacker line, goal-side
+                if ball.x > attacker.x:
+                    # Through ball behind us: drop deeper
+                    tx = min(tx, attacker.x - 2.0)
+        
+        # COMPACTNESS: Don't get pulled too wide - maintain defensive structure
+        our_center_y = sum(q.y for q in state.outfield_us()) / max(1, len(state.outfield_us()))
+        max_width_from_center = 15.0
+        if abs(ty - our_center_y) > max_width_from_center:
+            # Drift back toward center to maintain compactness
+            if ty > our_center_y:
+                ty = our_center_y + max_width_from_center
+            else:
+                ty = our_center_y - max_width_from_center
+        
+        speed = 0.85
+        # If attacker is making a run, match their speed
+        if attacker.vx > 2.0 or attacker.vy > 2.0:
+            speed = 1.0
+        
+        return PlayerIntent(defender.id, tx, ty, speed, ball.x, ball.y)
+
+    def _role_base(self, role: str) -> tuple[float, float]:
+        bases = {
+            ROLE_DEFENDER: (14.0, 20.0),
+            ROLE_WIDE_LEFT: (24.0, 8.0),
+            ROLE_WIDE_RIGHT: (24.0, 32.0),
+            ROLE_STRIKER: (40.0, 20.0),
+        }
+        return bases.get(role, (20.0, 20.0))
+
+    def _safe_pass_plan(self, inp: PolicyInput, src: Player, t: Player) -> tuple[float, float, float]:
+        """Conservative pass sizing for the goalkeeper."""
+        plan = plan_lead_pass(src.x, src.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.25)
+        dist = geom.distance(src.x, src.y, t.x, t.y)
+        power = _power_for_distance(dist)
+        return plan.target_x, plan.target_y, power
+
+
+
+def _power_for_distance(dist: float) -> float:
+    """Convert distance to kick power (0.0 to 1.0)."""
+    # Simplified: power scales with distance, capped at 1.0
+    # Rough calibration: 10m = 0.3, 20m = 0.6, 30m = 0.9
+    return min(1.0, max(0.0, dist / 33.3))
+
+
+def config_uses_slap(inp: PolicyInput) -> bool:
+    # Slapping is best when we need to strip a carried ball in a dead play.
+    return getattr(inp.config, "risk", 0.45) > 0.3 or inp.world.pressure_on_ball > 0.6
+
+
+def _box_covered(inp: PolicyInput) -> bool:
+    # At least one covered player goal-side of the ball before sliding.
+    return len(inp.press_plan.cover) >= 1
+

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Match Lab &mdash; My Team FC</title>
+<link rel="stylesheet" href="/lab.css">
+</head>
+<body>
+<header>
+  <h1>Match Lab</h1>
+  <p class="sub">My Team FC vs every opponent in <code>opponents/</code>, rendered from the
+     authoritative engine's own replay. Deterministic: the same opponent and duration
+     always produce the same match.</p>
+</header>
+
+<section class="controls">
+  <div class="field grow">
+    <label for="opponent">Opponent</label>
+    <select id="opponent"></select>
+    <p class="hint" id="opponent-hint">&nbsp;</p>
+  </div>
+  <div class="field">
+    <label for="duration">Duration</label>
+    <select id="duration">
+      <option value="60">60 s</option>
+      <option value="120">120 s</option>
+      <option value="180" selected>180 s</option>
+      <option value="300">300 s</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>&nbsp;</label>
+    <button id="kickoff" class="primary">Play match</button>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="scoreboard">
+    <div class="side home">
+      <span class="chip" id="home-chip"></span>
+      <span class="name" id="home-name">&mdash;</span>
+    </div>
+    <div class="score"><span id="score-a">0</span><span class="sep">:</span><span id="score-b">0</span></div>
+    <div class="side away">
+      <span class="name" id="away-name">&mdash;</span>
+      <span class="chip" id="away-chip"></span>
+    </div>
+    <div class="clock" id="clock">--</div>
+  </div>
+
+  <div class="pitch-wrap">
+    <canvas id="pitch" width="1200" height="800"></canvas>
+    <div class="overlay" id="overlay">
+      <div class="overlay-inner">
+        <p class="overlay-title" id="overlay-title">Pick an opponent and press Play match</p>
+        <p class="overlay-body" id="overlay-body">A Docker build plus one engine run takes
+           roughly 10&ndash;40 seconds.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="timeline">
+    <button id="playpause" class="icon" title="Play / pause (space)">&#9654;</button>
+    <button id="stepback" class="icon" title="Step back">&#9664;&#9664;</button>
+    <button id="stepfwd" class="icon" title="Step forward">&#9654;&#9654;</button>
+    <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+    <span class="tcode" id="tcode">0 / 0</span>
+    <label class="speed">Speed
+      <select id="speed">
+        <option value="0.25">0.25&times;</option>
+        <option value="0.5">0.5&times;</option>
+        <option value="1" selected>1&times;</option>
+        <option value="2">2&times;</option>
+        <option value="4">4&times;</option>
+        <option value="8">8&times;</option>
+      </select>
+    </label>
+  </div>
+
+  <p class="legend">
+    <span class="key"><i class="swatch loose"></i>ball in play</span>
+    <span class="key"><i class="swatch held"></i>held by a player</span>
+    <span class="key"><i class="dot gk"></i>goalkeeper</span>
+    <span class="key"><i class="dot out"></i>outfield</span>
+    <span class="key"><i class="dot stalled"></i>canAct = false</span>
+    <span class="key goalkey" id="goal-key">goals marked on the bar</span>
+  </p>
+</section>
+
+<section class="readout" id="readout">
+  <div><span>Possession</span><b id="r-poss">&mdash;</b></div>
+  <div><span>Shots</span><b id="r-shots">&mdash;</b></div>
+  <div><span>Missed decisions</span><b id="r-missed">&mdash;</b></div>
+  <div><span>Seed</span><b id="r-seed">&mdash;</b></div>
+  <div><span>Engine time</span><b id="r-wall">&mdash;</b></div>
+</section>
+
+<footer>
+  <p>The bundled <code>football-team practice</code> only offers three compiled CPUs, so this
+     uses <code>simulate --opponent-path</code> instead: same engine, same rules, same
+     determinism, but the opponent is yours to choose.
+     <a href="/README.md">How this works</a></p>
+</footer>
+
+<script src="/lab.js"></script>
+</body>
+</html>
