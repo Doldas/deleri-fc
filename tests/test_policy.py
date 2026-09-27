@@ -189,6 +189,78 @@ class PolicyTests(unittest.TestCase):
             (e["reason"] for e in c.log.possessions_decided if e["player"] == "st"), None)
         self.assertEqual(reason, "carry_forward")
 
+    def _box_carrier_obs(self, cx, cy):
+        """One non-striker carrier, a central keeper, and three markers.
+
+        The carrier is deliberately not the natural striker, so the main shoot
+        path refuses -- it needs shot_beats_keeper, or a striker inside the box
+        -- and only the "shoot on sight" rule can produce a shot here. That
+        isolates the rule under test from IN_BOX_SHOT_FLOOR.
+        """
+        return {
+            "protocolVersion": "1.0", "gameId": "sos", "sequence": 1,
+            "simulationTick": 1, "applyAtTick": 1, "timeRemainingSeconds": 300,
+            "phase": "openPlay", "score": {"us": 0, "them": 0},
+            "ball": {"position": {"x": cx, "y": cy}, "velocity": {"x": 0, "y": 0},
+                     "possessingTeam": "us", "possessedBy": "am"},
+            "us": [
+                {"id": "gk", "role": "goalkeeper", "position": {"x": 5, "y": 20}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "cd", "role": "outfield", "position": {"x": 18, "y": 20}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "am", "role": "outfield", "position": {"x": cx, "y": cy}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "w", "role": "outfield", "position": {"x": 44, "y": 6}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "st", "role": "outfield", "position": {"x": 50, "y": 26}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+            ],
+            "them": [
+                {"id": "tgk", "role": "goalkeeper", "position": {"x": 58, "y": 20}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "m1", "role": "outfield", "position": {"x": 54, "y": 16}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "m2", "role": "outfield", "position": {"x": 55, "y": 24}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+                {"id": "m3", "role": "outfield", "position": {"x": 54, "y": 20}, "velocity": {"x": 0, "y": 0}, "facingRadians": 0, "canAct": True},
+            ],
+        }
+
+    def test_shoot_on_sight_applies_in_the_box_not_near_the_boundary(self):
+        """"Shoot on sight in the box" was gated on is_near_wall(margin=4.0).
+
+        wall.is_near_wall is a pitch-boundary test -- x <= m or x >= L - m or
+        y <= m or y >= W - m -- so the rule fired only for a player hugging a
+        touchline or the goal line and never for a central attacker in the box.
+        Measured with this fixture, only the position varying, the behaviour
+        was inverted: (52,20), 8 m out with 0.24 rad of goalmouth showing, got
+        no shot at all, while (50,4), further out with a worse 0.17, shot for
+        45.0.
+        """
+        from src.wall import is_near_wall
+        from src.physics import shot_open_angle
+
+        state = GameState.from_observation(self._box_carrier_obs(52.0, 20.0))
+        # Guard the premise: the central carrier is inside the box and nowhere
+        # near a boundary, so this cannot pass through the old gate.
+        self.assertLessEqual(OPP_GOAL_X - 52.0, 11.0)
+        self.assertFalse(is_near_wall(52.0, 20.0, margin=4.0))
+        opps = [(q.x, q.y) for q in state.outfield_them()]
+        self.assertGreaterEqual(shot_open_angle(52.0, 20.0, opps), 0.10)
+
+        inp = make_inp(self._box_carrier_obs(52.0, 20.0))
+        intents = PolicyController().decide(inp)
+        self.assertEqual(intents["am"].action_type, "shoot",
+                         "a non-striker 8 m out in the box with an open goal "
+                         "must get the shoot-on-sight shot")
+
+    def test_shoot_on_sight_no_longer_rewards_a_worse_angle(self):
+        """The old gate preferred the boundary player on opening alone.
+
+        (50,4) is 10 m out and only 0.17 rad open, yet it shot for 45.0 while
+        the central (52,20) at 0.24 rad shot not at all. With the box as the
+        gate, both shoot and the ordering no longer depends on which side of
+        the pitch you happen to be standing on.
+        """
+        by_position = {}
+        for cx, cy in ((52.0, 20.0), (50.0, 4.0)):
+            inp = make_inp(self._box_carrier_obs(cx, cy))
+            by_position[(cx, cy)] = PolicyController().decide(inp)["am"].action_type
+            self.assertEqual(by_position[(cx, cy)], "shoot")
+        self.assertEqual(by_position[(52.0, 20.0)], by_position[(50.0, 4.0)])
+
     def test_their_possession_no_crash_and_defensive(self):
         inp = make_inp(obs((22, 20), "them"), tactical_state=TacticalState.DEFENSIVE_TRANSITION)
         intents = PolicyController().decide(inp)

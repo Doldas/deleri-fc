@@ -971,9 +971,21 @@ class PolicyController:
             inside_box = dist_goal <= 11.0
             opp_pos = [(o.x, o.y) for o in state.outfield_them()]
             open_angle = shot_open_angle(p.x, p.y, opp_pos)
-            if is_near_wall(p.x, p.y, margin=4.0):
+            # This was gated on is_near_wall(margin=4.0), which despite the name
+            # is a *pitch boundary* test -- wall.is_near_wall is
+            # `x <= m or x >= L - m or y <= m or y >= W - m`. So the rule only
+            # ever fired for a player hugging a touchline or the goal line, and
+            # never for a central attacker in the box: the case the comment
+            # above describes. Measured with one non-striker carrier and the
+            # same three markers, only the position varied, and it was
+            # inverted -- (52,20), 8 m out with 0.24 rad of goalmouth showing,
+            # got no shot at all, while (50,4), further out with a worse 0.17,
+            # shot for 45.0. Gate on the box, and keep the boundary case so the
+            # extra trigger the old gate accidentally provided is not silently
+            # dropped.
+            if inside_box or is_near_wall(p.x, p.y, margin=4.0):
                 angle_limit = 0.10 if inside_box else 0.22
-                if shot_open_angle(p.x, p.y, opp_pos) >= angle_limit:
+                if open_angle >= angle_limit:
                     power = 0.92 if inside_box else 0.8
                     shoot_value = 45.0
                     intent = PlayerIntent(p.id, p.x, p.y, 0.4, target.x, target.y, "shoot", (target.x, target.y), power)
@@ -1532,8 +1544,12 @@ class PolicyController:
         
         # Shoot-on-sight in box: if we're in the box with any opening, shoot!
         # Low blocks leave small windows - don't wait for perfect lane.
+        # Same boundary-vs-box gate bug as the copy in
+        # _evaluate_attack_actions: is_near_wall(margin=4.0) tests the pitch
+        # boundary, not the box, so this fallback was unreachable for a central
+        # attacker and only rescued players pressed into the byline.
         open_angle = shot_open_angle(p.x, p.y, opponents)
-        if is_near_wall(p.x, p.y, margin=4.0):
+        if inside_box or is_near_wall(p.x, p.y, margin=4.0):
             angle_limit = 0.10 if inside_box else 0.22
             if open_angle >= angle_limit:
                 power = 0.92 if inside_box else 0.8
