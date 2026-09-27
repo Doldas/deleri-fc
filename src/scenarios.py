@@ -260,6 +260,7 @@ def run_scenario(
         if manager is not None:
             merged.update(_intents_from_decision("us", manager.decide(_obs(st, step)), st))
         merged.update(opp.decide(st, "them"))
+        prev_poss = st.ball.possessing_team
         st = engine.step(st, merged)
         for e in st.events:
             if e == "goal":
@@ -270,10 +271,13 @@ def run_scenario(
                 res.shots += 1
             elif e == "kick:shoot_conceded":
                 res.shots_conceded += 1
-            elif e == "pass":
+            elif e.startswith("kick:"):
                 res.passes += 1
-            elif e == "pass:complete":
-                res.completed_passes += 1
+            elif e == "tackle:win":
+                pass
+        # Pass completion
+        if prev_poss is None and st.ball.possessing_team == "us":
+            res.completed_passes += 1
         res.reward += plan_reward(st, weights, st.events)
 
     res.possession_ours = our_poss_ticks / max(1, ticks)

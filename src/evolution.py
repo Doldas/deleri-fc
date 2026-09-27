@@ -17,7 +17,7 @@ from typing import Callable, Sequence
 from .config import GENOME_KEYS, GENOME_RANGES, genome_hash, make_genome
 from .runtime import RuntimeManager
 from .scenarios import ScenarioResult, evaluate_scenarios
-from .sim import SimResult, play_match
+from .sim import SimResult, play_match, DEFAULT_DECISIONS
 
 PoolEntry = str | tuple[str, dict[str, float]]
 
@@ -117,7 +117,7 @@ def evaluate_genome(
     genome: dict[str, float],
     rng: random.Random,
     opponent: str = "possession",
-    decisions: int = 400,
+    decisions: int = DEFAULT_DECISIONS,
     weights: dict[str, float] | None = None,
     opponents: Sequence[PoolEntry] | None = None,
 ) -> tuple[SimResult, float]:
@@ -360,7 +360,7 @@ def run_evolution(
     rng: random.Random,
     generations: int = 16,
     population_size: int = 10,
-    decisions: int = 400,
+    decisions: int = DEFAULT_DECISIONS,
     opponent: str = "possession",
     elitism: int = 2,
     **kwargs,

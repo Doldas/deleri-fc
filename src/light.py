@@ -199,7 +199,18 @@ class LightEngine:
         self._apply_actions(st, intents)
 
         # 4) Free-ball integration.
-        self._integrate_ball(st, decay)
+        # Integrate at engine tick rate (60 Hz) so fast balls don't skip the goal line,
+        # but apply velocity decay only once per decision tick (matching original physics).
+        substeps = max(1, int(self.dt * 60.0))
+        dt_sub = self.dt / substeps
+        for _ in range(substeps):
+            goal_scored = self._integrate_ball_substep(st, dt_sub)
+            if goal_scored:
+                break
+        # Apply velocity decay once per decision tick (matching original physics)
+        decay = BALL_DECAY ** tick_fraction
+        st.ball.vx *= decay
+        st.ball.vy *= decay
 
         # 5) Auto GK handling.
         self._gk_handling(st)
@@ -208,6 +219,48 @@ class LightEngine:
         self._gk_auto_distribute(st)
 
         return st
+
+    def _integrate_ball_substep(self, st: PlanState, dt_sub: float) -> bool:
+        """Integrate one engine sub-tick. Returns True if a goal was scored."""
+        if st.ball.possessing_team is not None:
+            return False
+        st.ball.x += st.ball.vx * dt_sub
+        st.ball.y += st.ball.vy * dt_sub
+        hit: str | None = None
+        if st.ball.x <= 0.0:
+            if GOAL_LOW_Y <= st.ball.y <= GOAL_HIGH_Y:
+                st.score_them += 1
+                st.events.append("goal_conceded")
+                st.ball.x = 0.0
+                st.ball.possessing_team = None
+                st.ball.possessing_player = None
+                st.ball.vx = st.ball.vy = 0.0
+                self._kickoff_reset(st, "us")
+                return True
+            st.ball.x = 0.0
+            hit = "left"
+        elif st.ball.x >= PITCH_LENGTH:
+            if GOAL_LOW_Y <= st.ball.y <= GOAL_HIGH_Y:
+                st.score_us += 1
+                st.events.append("goal")
+                st.ball.x = PITCH_LENGTH
+                st.ball.possessing_team = None
+                st.ball.possessing_player = None
+                st.ball.vx = st.ball.vy = 0.0
+                self._kickoff_reset(st, "them")
+                return True
+            st.ball.x = PITCH_LENGTH
+            hit = "right"
+        if st.ball.y <= 0.0:
+            st.ball.y = 0.0
+            hit = "bottom"
+        elif st.ball.y >= PITCH_WIDTH:
+            st.ball.y = PITCH_WIDTH
+            hit = "top"
+        if hit is not None:
+            st.ball.vx, st.ball.vy = geom.wall_bounce(st.ball.vx, st.ball.vy, hit)
+        self._loose_ball_control(st)
+        return False
 
     def _apply_actions(self, st: PlanState, intents: dict[tuple[str, str], LIntent]) -> None:
         between = []  # (team, pid, distance)

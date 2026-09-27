@@ -98,6 +98,7 @@ class PossessionBot(OpponentController):
     def decide(self, st: PlanState, team: str) -> dict[tuple[str, str], LIntent]:
         out: dict[tuple[str, str], LIntent] = {}
         bx, by = st.ball.x, st.ball.y
+        goal_x = 60.0 if team == "us" else 0.0
         for p in st.players:
             if p.team != team:
                 continue
@@ -105,12 +106,16 @@ class PossessionBot(OpponentController):
                 out[(team, p.pid)] = LIntent(tx=p.x, ty=p.y, speed=0.5)
                 continue
             if st.ball.possessing_team == team and st.ball.possessing_player == p.pid:
-                # Keep the ball: probe a forward pass.
-                mates = [q for q in st.outfield(team) if q.pid != p.pid]
-                if mates:
-                    t = max(mates, key=lambda q: q.x)
-                    out[(team, p.pid)] = LIntent(tx=t.x, ty=t.y, speed=0.6, act="pass", action_target=(t.x, t.y), power=0.5)
-                    out[(team, t.pid)] = LIntent(tx=t.x, ty=t.y, speed=0.8)
+                # Shoot if close to goal
+                if abs(p.x - goal_x) <= 15.0:
+                    out[(team, p.pid)] = LIntent(tx=goal_x, ty=by, speed=0.5, act="shoot", action_target=(goal_x, 18.0 if by >= 20.0 else 22.0), power=0.9)
+                else:
+                    # Keep the ball: probe a forward pass
+                    mates = [q for q in st.outfield(team) if q.pid != p.pid]
+                    if mates:
+                        t = max(mates, key=lambda q: q.x)
+                        out[(team, p.pid)] = LIntent(tx=t.x, ty=t.y, speed=0.6, act="pass", action_target=(t.x, t.y), power=0.5)
+                        out[(team, t.pid)] = LIntent(tx=t.x, ty=t.y, speed=0.8)
             elif geom.distance(p.x, p.y, bx, by) < 5.0:
                 out[(team, p.pid)] = LIntent(tx=bx, ty=by, speed=0.85)
             else:
@@ -127,6 +132,21 @@ class PressBot(OpponentController):
         field_players = [p for p in st.players if p.team == team and p.role != ROLE_GK]
         if not field_players:
             return out
+        # Check if we can tackle the ball holder
+        if st.ball.possessing_team and st.ball.possessing_team != team:
+            holder = st.player(st.ball.possessing_team, st.ball.possessing_player or "")
+            if holder:
+                presser = min(field_players, key=lambda p: geom.distance(p.x, p.y, holder.x, holder.y))
+                if geom.distance(presser.x, presser.y, holder.x, holder.y) <= 1.5:
+                    out[(team, presser.pid)] = LIntent(tx=holder.x, ty=holder.y, speed=1.0, act="tackle")
+                    # Other players mark
+                    for p in field_players:
+                        if p.pid != presser.pid:
+                            tx = geom.clamp(p.x + (bx - p.x) * 0.2, 0.0, 60.0)
+                            ty = geom.clamp(p.y + (by - p.y) * 0.2, 0.0, 40.0)
+                            out[(team, p.pid)] = LIntent(tx=tx, ty=ty, speed=0.7)
+                    return out
+        # Standard press
         presser = min(field_players, key=lambda p: geom.distance(p.x, p.y, bx, by))
         for p in field_players:
             if p.pid == presser.pid:
@@ -144,6 +164,7 @@ class DirectBot(OpponentController):
     def decide(self, st: PlanState, team: str) -> dict[tuple[str, str], LIntent]:
         out: dict[tuple[str, str], LIntent] = {}
         strike_x = 60.0 if team == "us" else 0.0
+        bx, by = st.ball.x, st.ball.y
         for p in st.players:
             if p.team != team:
                 continue
@@ -159,8 +180,10 @@ class DirectBot(OpponentController):
                 if stricker is not None:
                     out[(team, p.pid)] = LIntent(tx=stricker.x, ty=stricker.y, speed=0.5, act="pass", action_target=(stricker.x, stricker.y), power=0.8)
                     out[(team, stricker.pid)] = LIntent(tx=stricker.x + 2.0, ty=stricker.y, speed=0.8)
+                elif abs(p.x - strike_x) <= 18.0:
+                    out[(team, p.pid)] = LIntent(tx=strike_x, ty=by, speed=0.5, act="shoot", action_target=(strike_x, 18.0 if by >= 20.0 else 22.0), power=0.9)
                 else:
-                    out[(team, p.pid)] = LIntent(tx=strike_x, ty=p.y, speed=0.6)
+                    out[(team, p.pid)] = LIntent(tx=strike_x, ty=by, speed=0.6)
             elif p.x < 30.0 and p.role != ROLE_GK:
                 out[(team, p.pid)] = LIntent(tx=p.x, ty=p.y, speed=0.4)
             else:
@@ -175,12 +198,19 @@ class DefensiveBot(OpponentController):
         out: dict[tuple[str, str], LIntent] = {}
         own_goal_x = 60.0 if team == "us" else 0.0
         bx, by = st.ball.x, st.ball.y
+        field_players = [p for p in st.players if p.team == team and p.role != ROLE_GK]
         for p in st.players:
             if p.team != team:
                 continue
             if p.role == ROLE_GK:
                 out[(team, p.pid)] = LIntent(tx=p.x, ty=p.y, speed=0.5)
                 continue
+            # Tackle if opponent has ball and is close
+            if st.ball.possessing_team and st.ball.possessing_team != team:
+                holder = st.player(st.ball.possessing_team, st.ball.possessing_player or "")
+                if holder and geom.distance(p.x, p.y, holder.x, holder.y) <= 1.5:
+                    out[(team, p.pid)] = LIntent(tx=holder.x, ty=holder.y, speed=1.0, act="tackle")
+                    continue
             if st.ball.possessing_team == team and st.ball.possessing_player == p.pid:
                 out[(team, p.pid)] = LIntent(tx=own_goal_x, ty=p.y, speed=0.4, act="clear", action_target=(own_goal_x * 0.5, p.y), power=0.9)
             else:
@@ -219,6 +249,7 @@ class CounterBot(OpponentController):
         goal_x = 60.0 if team == "us" else 0.0
         mid_x = 30.0 if team == "us" else 30.0
         bx, by = st.ball.x, st.ball.y
+        field_players = [p for p in st.players if p.team == team and p.role != ROLE_GK]
         for p in st.players:
             if p.team != team:
                 continue
@@ -227,13 +258,23 @@ class CounterBot(OpponentController):
                 continue
             holder = st.ball.possessing_team == team and st.ball.possessing_player == p.pid
             if holder:
-                out[(team, p.pid)] = LIntent(tx=goal_x, ty=by, speed=1.0)
+                # Shoot if close, else sprint forward
+                if abs(p.x - goal_x) <= 15.0:
+                    out[(team, p.pid)] = LIntent(tx=goal_x, ty=by, speed=0.5, act="shoot", action_target=(goal_x, 18.0 if by >= 20.0 else 22.0), power=0.9)
+                else:
+                    out[(team, p.pid)] = LIntent(tx=goal_x, ty=by, speed=1.0)
                 continue
             if st.ball.possessing_team == team:
                 # Transition: everyone sprints forward, not to the ball.
                 out[(team, p.pid)] = LIntent(tx=goal_x, ty=geom.clamp(by + (p.y - by) * 0.4, 4.0, 36.0), speed=1.0)
                 continue
             # No possession: goal-side block around the midfield line.
+            # Tackle if ball carrier comes close
+            if st.ball.possessing_team and st.ball.possessing_team != team:
+                holder = st.player(st.ball.possessing_team, st.ball.possessing_player or "")
+                if holder and geom.distance(p.x, p.y, holder.x, holder.y) <= 1.5:
+                    out[(team, p.pid)] = LIntent(tx=holder.x, ty=holder.y, speed=1.0, act="tackle")
+                    continue
             tx = mid_x if p.x < mid_x else p.x
             ty = geom.clamp(p.y + (by - p.y) * 0.1, 4.0, 36.0)
             out[(team, p.pid)] = LIntent(tx=tx, ty=ty, speed=0.7)
@@ -279,12 +320,19 @@ class WallBot(OpponentController):
         goal_x = 60.0 if team == "us" else 0.0
         bx, by = st.ball.x, st.ball.y
         lane = 3.5 if by < 20.0 else 36.5
+        field_players = [p for p in st.players if p.team == team and p.role != ROLE_GK]
         for p in st.players:
             if p.team != team:
                 continue
             if p.role == ROLE_GK:
                 out[(team, p.pid)] = LIntent(tx=p.x, ty=p.y, speed=0.5)
                 continue
+            # Tackle if ball carrier comes close
+            if st.ball.possessing_team and st.ball.possessing_team != team:
+                holder = st.player(st.ball.possessing_team, st.ball.possessing_player or "")
+                if holder and geom.distance(p.x, p.y, holder.x, holder.y) <= 1.5:
+                    out[(team, p.pid)] = LIntent(tx=holder.x, ty=holder.y, speed=1.0, act="tackle")
+                    continue
             if st.ball.possessing_team == team and st.ball.possessing_player == p.pid:
                 mates = [q for q in st.outfield(team) if q.pid != p.pid]
                 # Advance along the near wall; shoot inside the last 18 m.
@@ -454,6 +502,8 @@ def play_match(
         elif opponent is not None:
             merged.update(opponent.decide(st, "them"))
 
+        prev_poss = st.ball.possessing_team
+        prev_poss_player = st.ball.possessing_player
         prev_events = list(st.events)
         st = engine.step(st, merged)
         result.events.extend(st.events)
@@ -466,10 +516,15 @@ def play_match(
                 result.shots += 1
             elif e == "kick:shoot_conceded":
                 result.shots_conceded += 1
-            elif e == "pass":
+            elif e.startswith("kick:"):
+                # Map internal kick events to external names
                 result.passes += 1
-            elif e == "pass:complete":
-                result.completed_passes += 1
+            elif e == "tackle:win":
+                # Opponent won a tackle -> our pass was intercepted
+                pass
+        # Pass completion: if ball was loose and now we possess it, the pass arrived
+        if prev_poss is None and st.ball.possessing_team == "us":
+            result.completed_passes += 1
         result.rewards += plan_reward(st, REWARD_DEFAULTS, st.events)
         if collect_trace:
             result.trace.append(st)
