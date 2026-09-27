@@ -246,6 +246,78 @@ class PolicyTests(unittest.TestCase):
                          "a non-striker 8 m out in the box with an open goal "
                          "must get the shoot-on-sight shot")
 
+    def test_unreachable_pass_is_vetoed_so_the_ball_is_not_launched(self):
+        """A pass aimed inside MIN_PASS_TRAVEL can never be collected.
+
+        A kick leaves at KICK_MIN_SPEED (12 m/s) however little power is asked
+        for, and the engine does not let anyone touch the ball until it has
+        slowed to 5 m/s, so it unavoidably rolls MIN_PASS_TRAVEL (~15.6 m).
+        Aiming at a point closer than that guarantees an overshoot, i.e. a
+        turnover rather than a pass.
+
+        Traced over 24 matches (186 executed passes): 66.7% were aimed inside
+        MIN_PASS_TRAVEL, the p10/p25 aim distances were 0.00 m / 0.21 m, the
+        median overshoot was 14.1 m, power sat at the floor in 68.8% of them,
+        an opponent was closer to the landing point than any teammate in 58.1%,
+        and 59.1% were intercepted. Our passes are 51% of every loose ball in a
+        match, 97.1% of our possessions end with our own kick, and 67.8% of
+        recoveries are re-lost within 0.5 s.
+
+        With every pass target inside the minimum travel distance, the carrier
+        must keep the ball rather than launch it out of reach.
+        """
+        from src.physics import MIN_PASS_TRAVEL
+
+        def obs_with_mates(positions):
+            o = self._box_carrier_obs(30.0, 20.0)
+            o["ball"]["position"] = {"x": 30.0, "y": 20.0}
+            for pid, (px, py) in positions.items():
+                for p in o["us"]:
+                    if p["id"] == pid:
+                        p["position"] = {"x": px, "y": py}
+            return o
+
+        # Every teammate is within MIN_PASS_TRAVEL of the carrier at (30,20),
+        # so no pass can be collected where it is aimed.
+        close = {"cd": (24.0, 20.0), "w": (33.0, 14.0), "st": (34.0, 25.0)}
+        for pid, (px, py) in close.items():
+            self.assertLess(geom.distance(30.0, 20.0, px, py), MIN_PASS_TRAVEL)
+
+        intents = PolicyController().decide(make_inp(obs_with_mates(close)))
+        intent = intents["am"]
+        if intent.action_type == "pass" and intent.action_target is not None:
+            self.fail(
+                "requested a pass aimed %.2f m away, inside the %.2f m minimum "
+                "travel distance: the ball cannot be collected there"
+                % (geom.distance(30.0, 20.0, intent.action_target[0],
+                                 intent.action_target[1]), MIN_PASS_TRAVEL)
+            )
+
+    def test_wall_shot_is_range_bounded(self):
+        """wall_shot had no upper distance bound and is_near_wall is a boundary test.
+
+        `is_near_wall(x, y, m)` is `x <= m or x >= L - m or y <= m or y >= W - m`,
+        so the wall-shot rule also fired for a defender hugging a touchline deep
+        in our own defensive third. Traced: all 5 shot requests the team ever
+        made were refused by the engine, and 2 were launched from x ~ 4-5 m --
+        55 m from goal -- at power 0.95.
+        """
+        from src.wall import is_near_wall
+
+        obs = self._box_carrier_obs(5.0, 4.0)
+        obs["ball"]["position"] = {"x": 5.0, "y": 4.0}
+        for p in obs["us"]:
+            if p["id"] == "am":
+                p["position"] = {"x": 5.0, "y": 4.0}
+        # Premise: this carrier is deep in our own corner and next to a boundary.
+        self.assertGreater(OPP_GOAL_X - 5.0, 40.0)
+        self.assertTrue(is_near_wall(5.0, 4.0, margin=6.0))
+
+        intents = PolicyController().decide(make_inp(obs))
+        self.assertNotEqual(intents["am"].action_type, "shoot",
+                            "must not request a shot from 55 m out just because "
+                            "the carrier is near a touchline")
+
     def test_shoot_on_sight_no_longer_rewards_a_worse_angle(self):
         """The old gate preferred the boundary player on opening alone.
 
