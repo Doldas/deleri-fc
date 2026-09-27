@@ -455,9 +455,16 @@ def match_context(
 
 class PolicyController:
     log: PolicyLog
+    # Coordinated receiver movement for passes:
+    # When a pass is selected, we store the intended receiver and collection point
+    # so that _decide_off_ball can move the receiver toward the collection point.
+    _pending_pass_receiver: str | None = None
+    _pending_pass_collection: tuple[float, float] | None = None
 
     def __init__(self) -> None:
         self.log = PolicyLog()
+        self._pending_pass_receiver = None
+        self._pending_pass_collection = None
 
     def _ctx_mods(self, inp: PolicyInput) -> dict[str, float]:
         return _CONTEXT_MODS.get(inp.context(), {})
@@ -483,11 +490,17 @@ class PolicyController:
             return self._kickoff_intents(inp)
 
         possessor = state.our_possessor()
+        
+        # Process possessor FIRST so that any pass decision sets the pending
+        # pass receiver before off-ball players are evaluated.
+        if possessor is not None:
+            intent = self._decide_possessor(inp, possessor)
+            intents[possessor.id] = intent
+        
         for p in ours:
             if possessor is not None and p.id == possessor.id:
-                intent = self._decide_possessor(inp, p)
-            else:
-                intent = self._decide_off_ball(inp, p, possessor)
+                continue
+            intent = self._decide_off_ball(inp, p, possessor)
             intents[p.id] = intent
 
         gk = state.goalkeeper_us()
@@ -1048,10 +1061,10 @@ class PolicyController:
         if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 45.0:
             cross = self._cross_choice(inp, p)
             if cross is not None:
-                tx, ty, power = cross
+                tx, ty, power, receiver_id, collect_x, collect_y = cross
                 # Cross value depends on striker position and box occupancy
                 cross_value = 25.0  # Base value for creating chance
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, cross[0], cross[1], "pass", (cross[0], cross[1]), cross[2])
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
                 candidates.append((cross_value, intent, "cross"))
         
         # ---- 3. CUTBACK FROM BYLINE ----
@@ -1059,49 +1072,56 @@ class PolicyController:
         if cutback is not None:
             # Cutback creates high-quality chance at edge of box
             cutback_value = 35.0
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, cutback[0], cutback[1], "pass", (cutback[0], cutback[1]), cutback[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = cutback
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((cutback_value, intent, "cutback"))
-        
+
         # ---- 4. THROUGH BALL ----
         through = self._through_ball_choice(inp, p)
         if through is not None:
             through_value = 40.0  # High value - breaks defensive line
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, through[0], through[1], "pass", (through[0], through[1]), through[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = through
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((through_value, intent, "through_ball"))
         
         # ---- 5. WALL PASS ----
         wall = self._wall_pass_choice(inp, p)
         if wall is not None:
             wall_value = 30.0  # Good for breaking lines
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, wall[0], wall[1], "pass", (wall[0], wall[1]), wall[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = wall
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((wall_value, intent, "wall_pass"))
         
         # ---- 6. SWITCH PLAY ----
         switch = self._switch_play_choice(inp, p)
         if switch is not None:
             switch_value = 20.0  # Opens up weak side
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, switch[0], switch[1], "pass", (switch[0], switch[1]), switch[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = switch
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((switch_value, intent, "switch_play"))
         
         # ---- 7. PULL BACK ----
         pullback = self._pullback_choice(inp, p)
         if pullback is not None:
             pullback_value = 28.0  # Creates shot from edge of box
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, pullback[0], pullback[1], "pass", (pullback[0], pullback[1]), pullback[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = pullback
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((pullback_value, intent, "pullback"))
         
         # ---- 8. ONE-TWO (High Press Escape) ----
         onetwo = self._onetwo_choice(inp, p)
         if onetwo is not None:
             onetwo_value = 22.0  # Escapes press, maintains possession
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, onetwo[0], onetwo[1], "pass", (onetwo[0], onetwo[1]), onetwo[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = onetwo
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((onetwo_value, intent, "high_press_onetwo"))
         
         # ---- 9. THIRD MAN RUN ----
         third = self._third_man_choice(inp, p)
         if third is not None:
             third_value = 25.0  # Breaks press with forward run
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, third[0], third[1], "pass", (third[0], third[1]), third[2])
+            tx, ty, power, receiver_id, collect_x, collect_y = third
+            intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((third_value, intent, "high_press_third_man"))
         
         # ---- 10. GK BYPASS (High Press) ----
@@ -1109,7 +1129,8 @@ class PolicyController:
             bypass = self._gk_bypass_choice(inp, p)
             if bypass is not None:
                 bypass_value = 30.0  # Direct counter-attack
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, bypass[0], bypass[1], "pass", (bypass[0], bypass[1]), bypass[2])
+                tx, ty, power, receiver_id, collect_x, collect_y = bypass
+                intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
                 candidates.append((bypass_value, intent, "high_press_gk_bypass"))
         
         # ---- 13. WALL SHOT ----
@@ -1141,7 +1162,7 @@ class PolicyController:
         # ---- 15. SAFE PASS (last resort) ----
         safe_pass = self._collectable_pass(inp, p)
         if safe_pass is not None:
-            best, tx, ty, power = safe_pass
+            best, tx, ty, power, collect_x, collect_y = safe_pass
             pass_value = 10.0  # Safe but low value
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((pass_value, intent, f"safe_pass_to_{best}"))
@@ -1191,6 +1212,20 @@ class PolicyController:
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_value, best_intent, reason = candidates[0]
+            
+            # If the chosen action is a pass, store the receiver and collection point
+            # so that _decide_off_ball can move the receiver toward the collection point.
+            if best_intent.action_type == "pass" and best_intent.action_target is not None:
+                target = best_intent.action_target
+                # Find which teammate is closest to the target (intended receiver)
+                for t in inp.state.outfield_us():
+                    if t.id != p.id and t.can_act:
+                        dist = geom.distance(t.x, t.y, target[0], target[1])
+                        if dist < 10.0:  # Close enough to be the intended receiver
+                            self._pending_pass_receiver = t.id
+                            self._pending_pass_collection = target
+                            break
+            
             log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": best_intent.action_type, "reason": reason, "value": best_value}
             self.log.record(log_entry)
             return self._veto_own_goal(inp, p, best_intent)
@@ -1201,8 +1236,11 @@ class PolicyController:
         self.log.record(log_entry)
         return PlayerIntent(p.id, tx, ty, speed, tx, ty)
     
-    def _cross_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Cross from wing to striker in box."""
+    def _cross_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Cross from wing to striker in box.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         role = inp.roles.get(p.id, ROLE_DEFENDER)
         if role not in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) or p.x < 45.0:
@@ -1225,7 +1263,7 @@ class PolicyController:
                 if miss < 7.0:
                     opp_pos = [(o.x, o.y) for o in state.outfield_them()]
                     if pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.12):
-                        return (collect_x, collect_y, power)
+                        return (collect_x, collect_y, power, striker.id, collect_x, collect_y)
     
     def _second_ball_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
         """Anticipate second ball / rebound in dangerous area."""
@@ -1246,8 +1284,11 @@ class PolicyController:
                 # Position to receive second ball
                 return (mx, my, 0.0)  # 0.0 power = move only
         return None
-    def _cutback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Cutback from byline when no clear forward path exists."""
+    def _cutback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Cutback from byline when no clear forward path exists.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         role = inp.roles.get(p.id, ROLE_DEFENDER)
         if role not in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) or p.x < 46.0:
@@ -1292,12 +1333,15 @@ class PolicyController:
                         )
                         miss = geom.distance(collect_x, collect_y, t.x, t.y)
                         if miss < 7.0 and pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.12):
-                            return (collect_x, collect_y, power)
+                            return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     # -- 4. THROUGH BALL -----------------------------------------------
-    def _through_ball_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Through ball to runner behind high defensive line."""
+    def _through_ball_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Through ball to runner behind high defensive line.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         ball = state.ball
         
@@ -1328,12 +1372,15 @@ class PolicyController:
                     )
                     miss = geom.distance(collect_x, collect_y, t.x, t.y)
                     if miss < 7.0 and pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.15):
-                        return (collect_x, collect_y, power)
+                        return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     # -- 6. SWITCH PLAY ------------------------------------------------
-    def _switch_play_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Quick switch to opposite flank when ball is on one side."""
+    def _switch_play_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Quick switch to opposite flank when ball is on one side.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         ball = state.ball
         role = inp.roles.get(p.id, ROLE_DEFENDER)
@@ -1362,12 +1409,15 @@ class PolicyController:
                         if travel > 12.0:  # Must be collectable distance
                             miss = geom.distance(collect_x, collect_y, t.x, t.y)
                             if miss < 7.0:
-                                return (collect_x, collect_y, power)
+                                return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     # -- 7. PULL BACK --------------------------------------------------
-    def _pullback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Striker pulls back to edge of box for arriving winger/midfielder."""
+    def _pullback_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Striker pulls back to edge of box for arriving winger/midfielder.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         role = inp.roles.get(p.id, ROLE_DEFENDER)
         if role != ROLE_STRIKER or p.x < 38.0 or p.x > 46.0:
@@ -1402,12 +1452,15 @@ class PolicyController:
                         )
                         miss = geom.distance(collect_x, collect_y, t.x, t.y)
                         if miss < 7.0:
-                            return (collect_x, collect_y, power)
+                            return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     # -- 8. ONE-TWO (High Press Escape) --------------------------------
-    def _onetwo_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Quick one-two with nearby teammate under high press."""
+    def _onetwo_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Quick one-two with nearby teammate under high press.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         if not _is_high_press(state) or inp.world.pressure_on_ball < 0.4:
             return None
@@ -1426,14 +1479,18 @@ class PolicyController:
             if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.1):
                 plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.4)
                 if plan.target_x > 0:
-                    dist = geom.distance(p.x, p.y, plan.target_x, plan.target_y)
-                    power = min(1.0, max(0.0, dist / 33.3))
-                    return (plan.target_x, plan.target_y, power)
+                    collect_x, collect_y, power, _ = pass_collection_point(
+                        p.x, p.y, plan.target_x, plan.target_y, 0.0
+                    )
+                    return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     # -- 9. THIRD MAN RUN ----------------------------------------------
-    def _third_man_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Third man run - pass to player with space ahead."""
+    def _third_man_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Third man run - pass to player with space ahead.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         if not _is_high_press(state) or inp.world.pressure_on_ball < 0.4:
             return None
@@ -1452,14 +1509,18 @@ class PolicyController:
                 if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.12):
                     plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.3)
                     if plan.target_x > 0:
-                        dist = geom.distance(p.x, p.y, plan.target_x, plan.target_y)
-                        power = min(1.0, max(0.0, dist / 33.3))
-                        return (plan.target_x, plan.target_y, power)
+                        collect_x, collect_y, power, _ = pass_collection_point(
+                            p.x, p.y, plan.target_x, plan.target_y, 0.0
+                        )
+                        return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     # -- 10. GK BYPASS (High Press) ------------------------------------
-    def _gk_bypass_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """GK distribution bypass under high press."""
+    def _gk_bypass_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """GK distribution bypass under high press.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         if not _is_high_press(state):
             return None
@@ -1471,14 +1532,15 @@ class PolicyController:
                 if pass_lane_clear(p.x, p.y, t.x, t.y, opp_pos, margin=0.12):
                     plan = plan_lead_pass(p.x, p.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.2)
                     if plan.target_x > 0:
-                        dist = geom.distance(p.x, p.y, plan.target_x, plan.target_y)
-                        power = min(1.0, max(0.0, dist / 33.3))
-                        return (plan.target_x, plan.target_y, power)
+                        collect_x, collect_y, power, _ = pass_collection_point(
+                            p.x, p.y, plan.target_x, plan.target_y, 0.0
+                        )
+                        return (collect_x, collect_y, power, t.id, collect_x, collect_y)
         return None
 
     def _collectable_pass(
         self, inp: PolicyInput, p: Player
-    ) -> tuple[str, float, float, float] | None:
+    ) -> tuple[str, float, float, float, float, float] | None:
         """Best pass whose receiver can realistically get to the ball.
 
         RULES.md: a free ball is collectable only below 5 m/s, and every pass
@@ -1487,9 +1549,11 @@ class PolicyController:
         down from rest. So a pass is only worth taking when the receiver is
         already near the landing spot, unmarked, with a clear lane, and the
         pass actually moves us forward. Otherwise we keep carrying the ball.
+
+        Returns: (receiver_id, tx, ty, power, collect_x, collect_y)
         """
         state = inp.state
-        best: tuple[str, float, float, float] | None = None
+        best: tuple[str, float, float, float, float, float] | None = None
         best_score = -1e9
         for rid, tx, ty, power in self._receivers(inp, p):
             t = next((q for q in state.outfield_us() if q.id == rid), None)
@@ -1514,7 +1578,10 @@ class PolicyController:
             score = progress * 2.0 + nearest * 0.8 - travel * 0.5
             if score > best_score:
                 best_score = score
-                best = (rid, tx, ty, power)
+                collect_x, collect_y, _, _ = pass_collection_point(
+                    p.x, p.y, tx, ty, power
+                )
+                best = (rid, tx, ty, power, collect_x, collect_y)
         return best
 
     def _shot_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
@@ -1864,7 +1931,11 @@ class PolicyController:
         
         return None
 
-    def _wall_pass_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
+    def _wall_pass_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
+        """Wall pass to bypass opponents.
+        
+        Returns: (tx, ty, power, receiver_id, collect_x, collect_y)
+        """
         state = inp.state
         world = inp.world
         if not is_near_wall(p.x, p.y, margin=6.0):
@@ -1889,7 +1960,7 @@ class PolicyController:
                         if pass_lane_clear(wall_x, contact_y, t.x, t.y, opp_pos, margin=0.12):
                             dist = geom.distance(p.x, p.y, wall_x, contact_y)
                             power = min(1.0, max(0.0, dist / 33.3))
-                            return (wall_x, contact_y, power)
+                            return (wall_x, contact_y, power, t.id, wall_x, contact_y)
         
         # 2. Central player near wall: wall pass to advancing winger
         if state.ball.x > 30.0 and role in (ROLE_DEFENDER, ROLE_STRIKER):
@@ -1903,7 +1974,7 @@ class PolicyController:
                             if pass_lane_clear(cand.contact_x, cand.contact_y, t.x, t.y, opp_pos, margin=0.1):
                                 dist = geom.distance(p.x, p.y, cand.contact_x, cand.contact_y)
                                 power = min(1.0, max(0.0, dist / 33.3))
-                                return (cand.contact_x, cand.contact_y, power)
+                                return (cand.contact_x, cand.contact_y, power, t.id, cand.contact_x, cand.contact_y)
         
         # 3. Original wall pass logic (enhanced scoring)
         direct = self._receivers(inp, p, count=2)
@@ -1927,7 +1998,7 @@ class PolicyController:
             if score > best_wall_score:
                 best_wall_score = score
                 dist = geom.distance(p.x, p.y, cand.contact_x, cand.contact_y)
-                best_wall = (cand.contact_x, cand.contact_y, _power_for_distance(dist))
+                best_wall = (cand.contact_x, cand.contact_y, _power_for_distance(dist), t.id, cand.contact_x, cand.contact_y)
         if best_wall is not None and best_wall_score > best_direct + 1.0:
             return best_wall
         return None
@@ -2229,6 +2300,19 @@ class PolicyController:
         width = self._cfg(inp, "width", 0.7)
         support = self._cfg(inp, "support_distance", 7.0)
 
+        # COORDINATED RECEIVER MOVEMENT:
+        # If this player is the intended receiver for a pass, move them toward
+        # the predicted collection point so they arrive as the ball becomes controllable.
+        if (self._pending_pass_receiver == p.id 
+                and self._pending_pass_collection is not None 
+                and possessor is not None 
+                and possessor.can_act):
+            tx, ty = self._pending_pass_collection
+            # Clear the pending pass so it doesn't persist beyond this decision cycle
+            self._pending_pass_receiver = None
+            self._pending_pass_collection = None
+            return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
+        
         base = self._role_base(role)
         
         # ===============================================================
@@ -2763,6 +2847,18 @@ class PolicyController:
         too, and everyone else holds the goal-side shape so winning the ball
         does not expose us to a counter.
         """
+        # COORDINATED RECEIVER MOVEMENT:
+        # If this player is the intended receiver for a pass that was just played,
+        # move them toward the predicted collection point (which matches the
+        # loose_ball_meeting_point since the pass target IS the collection point).
+        if (self._pending_pass_receiver == p.id 
+                and self._pending_pass_collection is not None):
+            tx, ty = self._pending_pass_collection
+            # Clear the pending pass so it doesn't persist beyond this decision cycle
+            self._pending_pass_receiver = None
+            self._pending_pass_collection = None
+            return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
+        
         state = inp.state
         ball = state.ball
         mx, my, seconds = loose_ball_meeting_point(ball.x, ball.y, ball.vx, ball.vy)
