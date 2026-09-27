@@ -150,7 +150,359 @@ CARRY_FULL_GAIN = 8.0
 CARRY_SHOOT_RANGE = 20.0
 CARRY_SHOOT_BONUS = 4.0
 
-# --- Low Block Detection ----------------------------------------------------
+# --- Expected Value Constants (replaces hardcoded action values) -----------
+# These replace the hardcoded action values with proper expected value computation.
+# All values are in "goal-equivalent" units where 1.0 = 1 goal.
+#
+# Outcome values (in goal-equivalents)
+EV_GOAL_VALUE = 100.0          # Scoring a goal
+EV_SHOT_ON_TARGET_SAVED = -5.0  # Shot saved -> opponent counter-attack risk
+EV_SHOT_BLOCKED = -10.0         # Shot blocked -> dangerous counter
+EV_SHOT_WIDE = 0.0             # Shot wide = neutral (goal kick)
+EV_SHOT_POST = 0.0             # Hit post = neutral (goal kick)
+EV_GOAL_CONCEDED = -100.0      # Conceding a goal
+EV_LOSS_OF_POSSESSION = -20.0   # Losing possession in dangerous area
+EV_LOSS_OF_POSSESSION_SAFE = -5.0  # Losing possession in safe area
+
+# Pass/carry outcomes
+EV_PASS_COMPLETED = 5.0        # Completed pass -> retained possession
+EV_PASS_INTERCEPTED = -15.0    # Intercepted -> counter-attack
+EV_PASS_OUT_OF_PLAY = 0.0      # Out of play = neutral (throw-in/goal kick)
+EV_CARRY_PROGRESS = 10.0       # Successful forward carry per metre
+EV_CARRY_LOSS = -20.0          # Tackled while carrying
+EV_CARRY_HOLD = 2.0            # Successful sideways/backwards carry
+
+# Action-specific bonuses (multiply base outcome)
+EV_THROUGH_BALL_MULTIPLIER = 1.5  # Through balls create high-quality chances
+EV_CUTBACK_MULTIPLIER = 1.8       # Cutbacks create high-quality shots
+EV_CROSS_MULTIPLIER = 1.3         # Crosses create aerial chances
+EV_CUTBACK_SHOT_BONUS = 1.5       # Cutback shots are higher quality
+EV_CROSS_HEADER_BONUS = 1.2       # Headers from crosses
+EV_WALL_PASS_MULTIPLIER = 1.2     # Wall passes bypass defenders
+EV_SWITCH_MULTIPLIER = 1.1        # Switches open weak side
+
+# Risk factors
+EV_COUNTER_ATTACK_RISK = 0.3      # Probability counter-attack leads to goal conceded
+EV_TACKLE_SUCCESS_RATE = 0.6      # Base tackle success rate
+
+# Base values for fallback
+EV_BASE_ACTION_VALUE = 0.0
+
+# --- Expected Value Calculator -----------------------------------------------
+
+class ExpectedValueCalculator:
+    """Computes expected values for actions based on game state and physics.
+    
+    Replaces hardcoded action values with actual expected value computation:
+    EV = P(success) * Value(success) + P(failure) * Value(failure)
+    """
+    
+    def __init__(self, inp: PolicyInput):
+        self.inp = inp
+        self.state = inp.state
+        self.world = inp.world
+        self.ball = self.state.ball
+    
+    # --- Probability Models ---
+    
+    def p_shot_goal(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """Probability a shot results in a goal."""
+        dist_goal = OPP_GOAL_X - p.x
+        gk = self.state.goalkeeper_them()
+        gkx = gk.x if gk else -1.0
+        gky = gk.y if gk else 20.0
+        
+        # Base probability from shot_beats_keeper
+        target_obj = type('ShotTarget', (), {'x': target[0], 'y': target[1], 'power': power})()
+        beats = shot_beats_keeper(p.x, p.y, gkx, gky, target[1], OPP_GOAL_X - p.x, power)
+        
+        # Base probability from shot quality
+        if beats:
+            return 0.35  # 35% chance if beats keeper
+        
+        # Distance-based probability
+        if dist_goal <= 8.0:
+            return 0.25  # Close range
+        elif dist_goal <= 15.0:
+            return 0.12  # Medium range
+        else:
+            return 0.04  # Long range
+    
+    def p_shot_saved(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """Probability shot is saved by keeper."""
+        return 0.55  # Most shots on target are saved
+    
+    def p_shot_blocked(self, p: Player, target: tuple[float, float]) -> float:
+        """Probability shot is blocked by defender."""
+        opp_pos = [(o.x, o.y) for o in self.state.outfield_them() if o.x > self.state.ball.possessing_player]
+        # Check if any defender is in the shot path
+        for o in self.state.outfield_them():
+            if o.x > p.x and o.x < OPP_GOAL_X:
+                # Rough check: defender between shooter and goal
+                pass
+        return 0.15  # 15% blocked
+    
+    def p_shot_wide(self, p: Player, target: tuple[float, float]) -> float:
+        """Probability shot misses target (wide/post)."""
+        return 0.10  # 10% off target
+    
+    def p_pass_complete(self, p: Player, target: tuple[float, float], power: float, 
+                         receiver_id: str | None = None) -> float:
+        """Probability pass is completed to intended receiver."""
+        dist = geom.distance(p.x, p.y, target[0], target[1])
+        
+        # Base completion rate decays with distance
+        if dist <= 10.0:
+            base = 0.85
+        elif dist <= 20.0:
+            base = 0.65
+        elif dist <= 30.0:
+            base = 0.45
+        else:
+            base = 0.25
+        
+        # Receiver quality
+        if receiver_id:
+            receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
+            if receiver and receiver.can_act:
+                base *= 1.1
+            else:
+                base *= 0.5
+        
+        # Lane clearance
+        opp_pos = [(o.x, o.y) for o in self.state.outfield_them()]
+        if not pass_lane_clear(p.x, p.y, target[0], target[1], 
+                               [(o.x, o.y) for o in self.state.outfield_them()], margin=0.12):
+            base *= 0.4
+        
+        return min(1.0, max(0.0, base))
+    
+    def p_pass_intercepted(self, p: Player, target: tuple[float, float]) -> float:
+        return 1.0 - self.p_pass_complete(p, target, 0.5)
+    
+    def p_carry_success(self, p: Player, tx: float, ty: float) -> float:
+        """Probability carry maintains possession."""
+        # Check if path is contested
+        opp_pos = [(o.x, o.y) for o in self.state.outfield_them()]
+        contested = any(geom.distance(o.x, o.y, tx, ty) < 4.0 for o in self.state.outfield_them())
+        
+        if self.state.ball.possessing_team == "us" and self.state.ball.possessing_player == p.id:
+            return 0.85 if not contested else 0.65
+        return 0.95  # Off-ball movement always succeeds
+    
+    def p_carry_tackled(self, p: Player, tx: float, ty: float) -> float:
+        return 1.0 - self.p_carry_success(p, tx, ty)
+    
+    def p_tackle_success(self, tackler: Player, ball_holder: Player) -> float:
+        """Probability tackle wins the ball."""
+        dist = geom.distance(tackler.x, tackler.y, ball_holder.x, ball_holder.y)
+        if dist <= TACKLE_CLOSE:
+            return 0.85
+        elif dist <= TACKLE_MAX:
+            return 0.60
+        return 0.0
+    
+    # --- Value Models ---
+    
+    def value_goal(self) -> float:
+        return EV_GOAL_VALUE
+    
+    def value_shot_saved(self) -> float:
+        return EV_SHOT_ON_TARGET_SAVED
+    
+    def value_shot_blocked(self) -> float:
+        return EV_SHOT_BLOCKED
+    
+    def value_shot_wide(self) -> float:
+        return EV_SHOT_WIDE
+    
+    def value_pass_completed(self, p: Player, target: tuple[float, float]) -> float:
+        """Value of a completed pass at target."""
+        # Base value: forward progress toward goal
+        progress = target[0] - self.state.ball.x if hasattr(self.state.ball, 'possession_x') else target[0] - self.state.ball.x
+        base = EV_PASS_COMPLETED + max(0, progress) * 0.5
+        
+        # Bonus for entering dangerous zones
+        if target[0] > 40.0:  # Final third
+            base += 5.0
+        if target[0] > 48.0:  # Box
+            base += 10.0
+        return base
+    
+    def value_pass_intercepted(self, target: tuple[float, float]) -> float:
+        # More dangerous if intercepted high up the pitch
+        if target[0] > 40.0:
+            return EV_LOSS_OF_POSSESSION
+        elif target[0] > 20.0:
+            return EV_LOSS_OF_POSSESSION / 2
+        return EV_LOSS_OF_POSSESSION_SAFE
+    
+    def value_carry_progress(self, p: Player, tx: float) -> float:
+        """Value of carrying forward."""
+        gain = tx - p.x
+        if gain <= 0:
+            return EV_CARRY_HOLD
+        
+        # Base value from forward progress
+        progress = min(gain / CARRY_FULL_GAIN, 1.0)
+        base = EV_CARRY_HOLD + (EV_CARRY_PROGRESS - EV_CARRY_HOLD) * progress
+        
+        # Bonus for reaching shooting range
+        if OPP_GOAL_X - tx <= CARRY_SHOOT_RANGE:
+            base += EV_CARRY_PROGRESS * 0.5
+        return base
+    
+    def value_carry_loss(self, p: Player) -> float:
+        # More dangerous if lost high up the pitch
+        if p.x > 40.0:
+            return EV_LOSS_OF_POSSESSION
+        elif p.x > 20.0:
+            return EV_LOSS_OF_POSSESSION / 2
+        return EV_LOSS_OF_POSSESSION_SAFE
+    
+    # --- Action EV Computations ---
+    
+    def ev_shot(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """Expected value of a shot."""
+        p_goal = self.p_shot_goal(p, target, power)
+        p_saved = self.p_shot_saved(p, target, power)
+        p_blocked = self.p_shot_blocked(p, target)
+        p_wide = self.p_shot_wide(p, target)
+        
+        # Normalize probabilities
+        total = p_goal + p_saved + p_blocked + p_wide
+        p_goal /= total
+        p_saved /= total
+        p_blocked /= total
+        p_wide /= total
+        
+        ev = (p_goal * self.value_goal() +
+              p_saved * self.value_shot_saved() +
+              p_blocked * self.value_shot_blocked() +
+              p_wide * self.value_shot_wide())
+        return ev
+    
+    def ev_pass(self, p: Player, target: tuple[float, float], power: float,
+                receiver_id: str | None = None, multiplier: float = 1.0) -> float:
+        """Expected value of a pass."""
+        p_complete = self.p_pass_complete(p, target, power)
+        p_intercepted = self.p_pass_intercepted(p, target)
+        
+        # Normalize
+        total = p_complete + p_intercepted
+        p_complete /= total
+        p_intercepted /= total
+        
+        value_complete = self.value_pass_completed(p, target)
+        value_intercepted = self.value_pass_intercepted(target)
+        
+        ev = multiplier * (p_complete * value_complete + p_intercepted * self.value_pass_intercepted(target))
+        return ev
+    
+    def ev_carry(self, p: Player, tx: float, ty: float) -> float:
+        """Expected value of a carry/dribble."""
+        p_success = self.p_carry_success(p, tx, ty)
+        p_loss = self.p_carry_tackled(p, tx, ty)
+        
+        # Normalize
+        total = p_success + p_loss
+        p_success /= total
+        p_loss /= total
+        
+        value_success = self.value_carry_progress(p, tx)
+        value_loss = self.value_carry_loss(p)
+        
+        return p_success * value_success + p_loss * value_loss
+    
+    def ev_through_ball(self, p: Player, target: tuple[float, float], power: float,
+                         receiver_id: str) -> float:
+        """Expected value of a through ball."""
+        base_ev = self.ev_pass(p, target, 0.5, receiver_id, EV_THROUGH_BALL_MULTIPLIER)
+        
+        # Bonus: if completed, receiver is in dangerous position for shot
+        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
+        if receiver:
+            dist_to_goal = OPP_GOAL_X - target[0]
+            if dist_to_goal <= 15.0:
+                # High chance of immediate shot
+                base_ev *= 1.3
+        return base_ev
+    
+    def ev_cutback(self, p: Player, target: tuple[float, float], power: float,
+                    receiver_id: str) -> float:
+        base_ev = self.ev_pass(p, target, power, receiver_id, EV_CUTBACK_MULTIPLIER)
+        
+        # Cutbacks create high-quality shot opportunities
+        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
+        if receiver and target[0] > 35.0:
+            base_ev *= EV_CUTBACK_MULTIPLIER
+        return base_ev
+    
+    def ev_cross(self, p: Player, target: tuple[float, float], power: float,
+                  receiver_id: str) -> float:
+        base_ev = self.ev_pass(p, target, power, receiver_id, EV_CROSS_MULTIPLIER)
+        
+        # Crosses target box area
+        if target[0] > 42.0:
+            base_ev *= EV_CROSS_MULTIPLIER
+        return base_ev
+    
+    def ev_cutback(self, p: Player, target: tuple[float, float], power: float,
+                    receiver_id: str) -> float:
+        base_ev = self.ev_pass(p, target, power, receiver_id, EV_CUTBACK_MULTIPLIER)
+        
+        # Cutbacks create high-quality shot opportunities at edge of box
+        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
+        if receiver and target[0] > 35.0:
+            base_ev *= EV_CUTBACK_MULTIPLIER
+        return base_ev
+    
+    def ev_wall_pass(self, p: Player, target: tuple[float, float], power: float,
+                      receiver_id: str) -> float:
+        # Wall pass has two segments: passer->wall, wall->receiver
+        p_leg1 = self.p_pass_complete(p, target, power)
+        # Second leg from wall to receiver
+        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
+        p_leg2 = 0.75  # Wall pass second leg typically cleaner
+        p_complete = p_leg1 * p_leg2
+        p_intercepted = 1.0 - p_complete
+        
+        value_complete = self.value_pass_completed(p, target) * EV_WALL_PASS_MULTIPLIER
+        return p_complete * value_complete + p_intercepted * self.value_pass_intercepted(target)
+    
+    def ev_switch_play(self, p: Player, target: tuple[float, float], power: float,
+                        receiver_id: str) -> float:
+        return self.ev_pass(p, target, power, receiver_id, EV_SWITCH_MULTIPLIER)
+    
+    def ev_pullback(self, p: Player, target: tuple[float, float], power: float,
+                     receiver_id: str) -> float:
+        return self.ev_pass(p, target, power, receiver_id, 1.2)
+    
+    def ev_onetwo(self, p: Player, target: tuple[float, float], power: float,
+                   receiver_id: str) -> float:
+        # One-two is two quick passes
+        p_complete = self.p_pass_complete(p, target, power) ** 2  # Two passes
+        return p_complete * self.value_pass_completed(p, target) * 1.3
+    
+    def ev_third_man(self, p: Player, target: tuple[float, float], power: float,
+                      receiver_id: str) -> float:
+        return self.ev_pass(p, target, power, receiver_id, 1.2)
+    
+    def ev_wall_pass(self, p: Player, target: tuple[float, float], power: float,
+                      receiver_id: str) -> float:
+        # Wall pass: two segments
+        p_leg1 = self.p_pass_complete(p, target, power)
+        p_leg2 = 0.8
+        p_complete = p_leg1 * p_leg2
+        p_intercepted = 1.0 - p_complete
+        value_complete = self.value_pass_completed(p, target) * EV_WALL_PASS_MULTIPLIER
+        return p_complete * value_complete + p_intercepted * self.value_pass_intercepted(target)
+    
+    def ev_gk_bypass(self, p: Player, target: tuple[float, float], power: float,
+                      receiver_id: str) -> float:
+        return self.ev_pass(p, target, power, receiver_id, 1.2)
+
+# --- End Expected Value Calculator ------------------------------------------
 # A low block is a deep, compact defensive structure where opponent's defensive
 # line is deep (x > 40) and they have 3+ players behind the ball in a narrow band.
 # This triggers specific attacking patterns: width, crosses, cutbacks, switches.
@@ -209,6 +561,8 @@ from .physics import (
     shot_open_angle,
     wall_pass_target,
     wall_shot_target,
+    speed_for_travel,
+    _power_from_speed,
 )
 from .opponent import OpponentModel
 from .state import Ball, GameState, Player, WorldModel
@@ -1998,7 +2352,7 @@ class PolicyController:
             if score > best_wall_score:
                 best_wall_score = score
                 dist = geom.distance(p.x, p.y, cand.contact_x, cand.contact_y)
-                best_wall = (cand.contact_x, cand.contact_y, _power_for_distance(dist), t.id, cand.contact_x, cand.contact_y)
+                best_wall = (cand.contact_x, cand.contact_y, _power_from_speed(speed_for_travel(dist)), t.id, cand.contact_x, cand.contact_y)
         if best_wall is not None and best_wall_score > best_direct + 1.0:
             return best_wall
         return None
@@ -3072,16 +3426,10 @@ class PolicyController:
         """Conservative pass sizing for the goalkeeper."""
         plan = plan_lead_pass(src.x, src.y, t.x, t.y, t.vx, t.vy, velocity_weight=0.25)
         dist = geom.distance(src.x, src.y, t.x, t.y)
-        power = _power_for_distance(dist)
+        power = _power_from_speed(speed_for_travel(dist))
         return plan.target_x, plan.target_y, power
 
 
-
-def _power_for_distance(dist: float) -> float:
-    """Convert distance to kick power (0.0 to 1.0)."""
-    # Simplified: power scales with distance, capped at 1.0
-    # Rough calibration: 10m = 0.3, 20m = 0.6, 30m = 0.9
-    return min(1.0, max(0.0, dist / 33.3))
 
 
 def config_uses_slap(inp: PolicyInput) -> bool:
