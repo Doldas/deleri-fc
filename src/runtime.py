@@ -244,16 +244,33 @@ class RuntimeManager:
         if ctx.counter_press_active:
             ctx.counter_press_active = False
 
-        # Optional limited MCTS override on possession build-up/progression.
+# Optional limited MCTS override on high-value attacking states only.
         # Use adapted genome for MCTS too.
         mcts_note = None
-        if ctx.mcts_planner is not None and state.has_control() and world.ball_zone in ("own", "mid"):
-            # Update MCTS planner with current adapted genome
-            ctx.mcts_planner.genome = adapted_genome
-            best = ctx.mcts_planner.choose(inp, intents)
-            if best is not None:
-                intents = best
-                mcts_note = "mcts"
+        if ctx.mcts_planner is not None and state.has_control():
+            # Only trigger MCTS in high-value attacking situations:
+            # - Final third (ball_zone == "final")
+            # - Elite goalkeeper detected
+            # - Low block detected
+            # - Wall attack opportunity
+            # - Late game trailing (desperation)
+            # - Counter-press active
+            ctx.opp.update(state)  # Refresh opponent model
+            inp_time_remaining = getattr(inp, 'time_remaining', None) or ctx.match_duration
+            high_value = (
+                world.ball_zone == "final"
+                or ctx.opp.detect_archetype() == "elite_goalkeeper"
+                or ctx.opp.detect_archetype() == "low_block"
+                or world.ball_near_wall
+                or (ctx.match_duration is not None and ctx.match_duration * 0.2 >= inp_time_remaining and state.score_us < state.score_them)
+                or ctx.counter_press_active
+            )
+            if high_value:
+                ctx.mcts_planner.genome = adapted_genome
+                best = ctx.mcts_planner.choose(inp, intents)
+                if best is not None:
+                    intents = best
+                    mcts_note = "mcts"
 
         wire = [player_intent.to_wire() for player_intent in intents.values()]
 

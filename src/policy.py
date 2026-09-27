@@ -264,7 +264,7 @@ class PolicyInput:
     def late(self) -> bool:
         # Late = last 20% of match duration. Track initial time to infer match duration.
         # If we don't have initial time, fall back to absolute 120s.
-        match_duration = getattr(self, '_match_duration', None)
+        match_duration = getattr(self, 'match_duration', None)
         if match_duration is None:
             return self.tr <= 120.0
         return self.tr <= match_duration * 0.2
@@ -359,12 +359,15 @@ def _is_high_press(state: GameState) -> bool:
 
 # Multiplicative parameter adjustments per match context (§32). Values > 1
 # raise the parameter, < 1 lower it. Only keys present here are affected.
+# For shooting_threshold: higher value = longer shooting range (more aggressive).
+# Trailing late -> more aggressive shooting (higher threshold).
+# Leading late -> more conservative (shorter range).
 _CONTEXT_MODS: dict[str, dict[str, float]] = {
     "leading_late": {
         "passing_risk": 0.6,
         "verticality": 0.8,
-        "shooting_threshold": 1.15,
-        "wall_shot_threshold": 1.1,
+        "shooting_threshold": 0.8,
+        "wall_shot_threshold": 0.8,
         "depth": 0.9,
         "support_distance": 1.15,
         "width": 0.9,
@@ -377,8 +380,8 @@ _CONTEXT_MODS: dict[str, dict[str, float]] = {
     "trailing_late": {
         "passing_risk": 1.3,
         "verticality": 1.25,
-        "shooting_threshold": 0.8,
-        "wall_shot_threshold": 0.85,
+        "shooting_threshold": 1.2,
+        "wall_shot_threshold": 1.15,
         "depth": 1.1,
         "support_distance": 0.85,
         "width": 1.1,
@@ -921,7 +924,7 @@ class PolicyController:
                 base_value = 0.8 if beats else 0.15
                 # Minimum floor for natural strikers inside box
                 min_shoot_value = 10.0 if (_is_natural_striker(inp, p) and inside_box) else 0.0
-                shoot_value = max(0.0, base_value * 100.0 - dist_goal * 0.4)
+                shoot_value = max(min_shoot_value, base_value * 100.0 - dist_goal * 0.4)
                 if shoot_value > 0:
                     intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (target.x, target.y), target.power)
                     candidates.append((shoot_value, intent, "shoot"))
@@ -1064,20 +1067,6 @@ class PolicyController:
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, bypass[0], bypass[1], "pass", (bypass[0], bypass[1]), bypass[2])
                 candidates.append((bypass_value, intent, "high_press_gk_bypass"))
         
-        # ---- 11. REBOUND SETUP ----
-        rebound = self._rebound_setup_choice(inp, p)
-        if rebound is not None:
-            rebound_value = 45.0  # Very high value - creates chaos in box
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, rebound[0], rebound[1], "shoot", (rebound[0], rebound[1]), rebound[2])
-            candidates.append((rebound_value, intent, "rebound_setup"))
-        
-        # ---- 12. SECOND BALL / REBOUND ANTICIPATION ----
-        second_ball = self._second_ball_choice(inp, p)
-        if second_ball is not None:
-            second_ball_value = 35.0  # Anticipating loose ball in dangerous area
-            intent = PlayerIntent(p.id, p.x, p.y, 0.4, second_ball[0], second_ball[1], "pass", (second_ball[0], second_ball[1]), second_ball[2])
-            candidates.append((second_ball_value, intent, "second_ball"))
-        
         # ---- 13. WALL SHOT ----
         if is_near_wall(p.x, p.y, margin=6.0) and (OPP_GOAL_X - p.x) > 8.0:
             wall_shot = wall_shot_target(p.x, p.y, gkx if 'gkx' in dir() else -1.0, gky if 'gky' in dir() else 20.0)
@@ -1144,27 +1133,6 @@ class PolicyController:
                     opp_pos = [(o.x, o.y) for o in state.outfield_them()]
                     if pass_lane_clear(p.x, p.y, collect_x, collect_y, opp_pos, margin=0.12):
                         return (collect_x, collect_y, power)
-        return None
-    
-    def _rebound_setup_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
-        """Set up a rebound opportunity by shooting at keeper's hands/post."""
-        state = inp.state
-        gk = state.goalkeeper_them()
-        if gk is None:
-            return None
-        
-        # Shoot at keeper's body to create rebound
-        dist_goal = OPP_GOAL_X - p.x
-        if dist_goal < 18.0 and p.can_act:
-            gkx, gky = gk.x, gk.y
-            # Aim at keeper's body (center of goal)
-            tx, ty = OPP_GOAL_X, GOAL_CENTER_Y
-            power = 0.85
-            # Check if lane is reasonably clear
-            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
-            if pass_lane_clear(p.x, p.y, tx, ty, opp_pos, margin=0.15):
-                return (tx, ty, power)
-        return None
     
     def _second_ball_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float] | None:
         """Anticipate second ball / rebound in dangerous area."""

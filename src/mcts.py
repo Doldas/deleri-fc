@@ -111,20 +111,21 @@ class MCTSPlanner:
         total = 0.0
         for _ in range(self.iterations):
             total += 1.0
-            label = max(root.children, key=lambda lb: self._ucb(root, root.children[lb], total, visits))
+            label = max(root.children, key=lambda lb: self._ucb(root, root.children[lb], total, visits, values))
             visits[label] += 1
             values[label] += self._rollout(base, candidates[label].intents)
 
         best_label = max(candidates, key=lambda lb: values[lb] / max(1, visits[lb]))
         return candidates[best_label].intents
 
-    def _ucb(self, root: _Node, node: _Node, total: float, visits: dict[str, int]) -> float:
+    def _ucb(self, root: _Node, node: _Node, total: float, visits: dict[str, int], values: dict[str, float]) -> float:
         n = visits[node.label]
         if n == 0:
             return 1e9 + node.prior
-        # Mean value is stored separately (values dict); here we only need the
-        # exploration bonus to break ties across unvisited/local optima.
-        return node.prior * self.cpuct * math.sqrt(math.log(total + 1.0) / (n + 1.0))
+        # Mean value Q = W/N (values dict stores accumulated W)
+        q = values[node.label] / n
+        # PUCT: Q + c_puct * prior * sqrt(ln(N)/n)
+        return q + node.prior * self.cpuct * math.sqrt(math.log(total + 1.0) / n)
 
     def _rollout(self, state: PlanState, our_intents: dict[str, PlayerIntent]) -> float:
         st = state

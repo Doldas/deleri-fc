@@ -188,7 +188,9 @@ class PolicyTests(unittest.TestCase):
             PolicyController()._cfg(trailing, "verticality", 0.55),
             PolicyController()._cfg(leading, "verticality", 0.55),
         )
-        self.assertLess(
+        # Trailing late should be more aggressive (higher shooting threshold = longer range)
+        # Leading late should be more conservative (lower shooting threshold)
+        self.assertGreater(
             PolicyController()._cfg(trailing, "shooting_threshold", 0.5),
             PolicyController()._cfg(leading, "shooting_threshold", 0.5),
         )
