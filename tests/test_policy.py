@@ -12,6 +12,8 @@ from src.policy import (
     match_context,
     ball_travel_before_control,
     loose_ball_meeting_point,
+    CARRY_CLEAN_VALUE,
+    CARRY_HOLD_VALUE,
 )
 from src.opponent import OpponentModel
 from src.state import GameState, WorldModel
@@ -125,6 +127,67 @@ class PolicyTests(unittest.TestCase):
                         f"{pid} was chosen to shoot at the keeper's body from "
                         f"{dist_goal:.1f} m, a shot the keeper can hold",
                     )
+
+    def test_carry_value_scores_progress_not_distance_remaining(self):
+        """carry_value was max(5.0, (OPP_GOAL_X - p.x) * 0.1) -- "progress toward goal".
+
+        (OPP_GOAL_X - p.x) is the distance *still to run*, so the value fell as
+        the carrier advanced and the 5.0 floor then bound for every x >= 10: the
+        same number at the halfway line and five metres out. That made the
+        lowest-valued candidate in the planner the one the loose-ball physics
+        note in src/policy.py calls the only reliable way to keep possession,
+        and it lost to safe_pass's 10.0 in every state where a pass merely
+        happened to be legal.
+        """
+        c = PolicyController()
+        # Identical 8 m of forward ground; the only difference is a marker
+        # standing in the lane we picked.
+        clean_inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        busy_inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=34))
+        p_clean = [q for q in clean_inp.state.outfield_us() if q.id == "st"][0]
+        p_busy = [q for q in busy_inp.state.outfield_us() if q.id == "st"][0]
+
+        clean = c._carry_value(clean_inp, p_clean, 38.0, 20.0)
+        busy = c._carry_value(busy_inp, p_busy, 38.0, 20.0)
+        self.assertAlmostEqual(clean, CARRY_CLEAN_VALUE, places=6)
+        self.assertLess(busy, clean, "a contested lane must be worth less than a clean one")
+
+        # Forward ground is what pays, so a dribble cut short by half is worth
+        # proportionally less.
+        self.assertLess(c._carry_value(clean_inp, p_clean, 34.0, 20.0), clean)
+
+        # Going nowhere forward is the old floor, not zero: still keep the ball.
+        self.assertAlmostEqual(
+            c._carry_value(clean_inp, p_clean, 30.0, 20.0), CARRY_HOLD_VALUE, places=6)
+        self.assertAlmostEqual(
+            c._carry_value(clean_inp, p_clean, 26.0, 20.0), CARRY_HOLD_VALUE, places=6)
+
+        # And it must be able to beat a collectable pass (10.0), or the old bug
+        # returns wearing a different constant.
+        self.assertGreater(clean, 10.0)
+
+    def test_carry_beats_a_collectable_pass_on_a_clean_lane(self):
+        """Behavioural half of the carry valuation, not just the arithmetic.
+
+        A pass is only collectable once it has slowed below the control limit,
+        so a collectable pass is still a race to win the ball back, while a
+        dribble keeps it glued 0.65 m in front. The carrier here has a clean
+        forward lane *and* a collectable pass available; it should carry.
+        """
+        inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        c = PolicyController()
+        p = [q for q in inp.state.outfield_us() if q.id == "st"][0]
+
+        # Guard the premise: if no pass were available the test would prove
+        # nothing about beating one.
+        self.assertIsNotNone(c._collectable_pass(inp, p), "fixture must offer a pass")
+        tx, ty, _ = c._dribble_target(inp, p)
+        self.assertEqual(c._segment_contest(inp.state, p.x, p.y, tx, ty), 0.0)
+
+        c.decide(inp)
+        reason = next(
+            (e["reason"] for e in c.log.possessions_decided if e["player"] == "st"), None)
+        self.assertEqual(reason, "carry_forward")
 
     def test_their_possession_no_crash_and_defensive(self):
         inp = make_inp(obs((22, 20), "them"), tactical_state=TacticalState.DEFENSIVE_TRANSITION)

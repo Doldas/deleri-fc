@@ -130,6 +130,26 @@ DRIBBLE_BLOCKED_PENALTY = 7.0
 # test_no_shot_is_aimed_at_the_keeper_body.
 IN_BOX_SHOT_FLOOR = 24.0
 
+# Value of a carry that wins real forward ground down a clean lane. It sits
+# above safe_pass (10.0) and below switch_play (20.0) on purpose: given the
+# loose-ball physics above -- a pass leaves the ball at KICK_MIN_SPEED and has
+# to decelerate below the control limit before anybody may touch it, while a
+# dribble keeps it glued 0.65 m in front -- a clean carry is the better way to
+# move the ball up the pitch, but it should not displace the deliberate
+# pattern plays (cross 25, pullback 28, wall pass 30, cutback 35, through 40).
+CARRY_CLEAN_VALUE = 15.0
+# Value of a carry that goes nowhere forward. Still legal and still better than
+# turning the ball over, so it stays positive and remains the last resort.
+CARRY_HOLD_VALUE = 5.0
+# Forward ground that scores full marks, matching the long step _dribble_target
+# takes, so a carry that is cut short by the touchline is worth proportionally
+# less.
+CARRY_FULL_GAIN = 8.0
+# Ending a carry inside this range of the opponent goal is worth a bonus: the
+# next decision is a shot rather than another pass.
+CARRY_SHOOT_RANGE = 20.0
+CARRY_SHOOT_BONUS = 4.0
+
 # --- Low Block Detection ----------------------------------------------------
 # A low block is a deep, compact defensive structure where opponent's defensive
 # line is deep (x > 40) and they have 3+ players behind the ball in a narrow band.
@@ -1094,7 +1114,7 @@ class PolicyController:
         
         # ---- 14. CARRY (Dribble) ----
         tx, ty, speed = self._dribble_target(inp, p)
-        carry_value = max(5.0, (OPP_GOAL_X - p.x) * 0.1)  # Progress toward goal
+        carry_value = self._carry_value(inp, p, tx, ty)
         carry_intent = PlayerIntent(p.id, tx, ty, speed, tx, ty)
         candidates.append((carry_value, carry_intent, "carry_forward"))
         
@@ -2049,6 +2069,51 @@ class PolicyController:
         tx = geom.clamp(tx, 1.5, OPP_GOAL_X - 1.5)
         ty = geom.clamp(ty, 2.0, PITCH_WIDTH - 2.0)
         return tx, ty, 1.0
+
+    def _segment_contest(self, state, ax: float, ay: float, bx: float, by: float) -> float:
+        """How much of the run a->b the opponents' outfielders stand in, 0.0..1.0.
+
+        Same geometry _dribble_target uses to choose a heading, so the value we
+        put on a carry is measured over the lane we actually picked rather than
+        a straight line to goal that may never be attempted.
+        """
+        vx, vy = bx - ax, by - ay
+        seg = vx * vx + vy * vy
+        worst = 0.0
+        for o in state.outfield_them():
+            t = 0.0 if seg <= 1e-9 else max(0.0, min(1.0, ((o.x - ax) * vx + (o.y - ay) * vy) / seg))
+            d = math.hypot(o.x - (ax + vx * t), o.y - (ay + vy * t))
+            if d < DRIBBLE_LANE_RADIUS:
+                worst = max(worst, (DRIBBLE_LANE_RADIUS - d) / DRIBBLE_LANE_RADIUS)
+        return worst
+
+    def _carry_value(self, inp: PolicyInput, p: Player, tx: float, ty: float) -> float:
+        """What a carry is worth: forward ground won, discounted by the contest.
+
+        This replaced
+
+            carry_value = max(5.0, (OPP_GOAL_X - p.x) * 0.1)   # Progress toward goal
+
+        which was not progress toward goal. (OPP_GOAL_X - p.x) is the distance
+        *still to run*, so the value fell as the carrier advanced and the 5.0
+        floor then bound for every x >= 10: flat, identical at the halfway line
+        and five metres out. The only thing it got right was its comment's
+        intent, and the effect was that the lowest-valued candidate in the
+        planner was the one the loose-ball physics note above calls the only
+        reliable way to keep the ball. A carrier with a clean lane and a
+        collectable pass available would hand the ball over anyway, because
+        5.0 lost to safe_pass's 10.0 every time.
+        """
+        gain = tx - p.x
+        if gain <= 0.0:
+            # Sideways or backwards: still keep the ball, but nothing gained.
+            return CARRY_HOLD_VALUE
+        progress = geom.clamp(gain / CARRY_FULL_GAIN, 0.0, 1.0)
+        safety = 1.0 - self._segment_contest(inp.state, p.x, p.y, tx, ty)
+        value = CARRY_HOLD_VALUE + (CARRY_CLEAN_VALUE - CARRY_HOLD_VALUE) * progress * safety
+        if OPP_GOAL_X - tx <= CARRY_SHOOT_RANGE:
+            value += CARRY_SHOOT_BONUS
+        return value
 
     def _decide_off_ball(self, inp: PolicyInput, p: Player, possessor: Player | None) -> PlayerIntent:
         state = inp.state
