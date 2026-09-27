@@ -113,6 +113,23 @@ DRIBBLE_LANE_RADIUS = 3.5
 # genuinely open goal is never traded for a wide detour.
 DRIBBLE_BLOCKED_PENALTY = 7.0
 
+# --- Attacking Action Values -------------------------------------------------
+# Floor on a natural striker's shot from inside the box, in the same arbitrary
+# units as the candidate list below.
+#
+# It exists because of ordering, not aggression. The recycling candidates are
+# worth switch_play 20.0 and safe_pass 10.0, so a floor below 20.0 means the
+# striker passes sideways/backwards from inside the area while the opponents'
+# keeper walks up to collect. A genuine chance scores base_value 0.8 -> 80.0,
+# so anything under that still loses to a real opening.
+#
+# This floor previously sat at 10.0 and lost to switch_play. That is what made a
+# bogus "rebound setup" candidate load-bearing: it was worth 45.0, so it won the
+# striker's decision by brute force, and it aimed at the keeper's body, which is
+# the one shot a keeper is guaranteed to hold. See
+# test_no_shot_is_aimed_at_the_keeper_body.
+IN_BOX_SHOT_FLOOR = 24.0
+
 # --- Low Block Detection ----------------------------------------------------
 # A low block is a deep, compact defensive structure where opponent's defensive
 # line is deep (x > 40) and they have 3+ players behind the ball in a narrow band.
@@ -914,16 +931,15 @@ class PolicyController:
             target = pick_shot_target(p.x, p.y, gkx, gky)
             beats = shot_beats_keeper(p.x, p.y, gkx, gky, target.y, dist_goal, target.power)
             # Only shoot if: (1) beats keeper, OR (2) natural striker inside box
-            is_finisher = _is_natural_striker(inp, p)
             inside_box = dist_goal <= 11.0
-            is_finisher = _is_natural_striker(inp, p)
-            if not beats and not (is_finisher and inside_box):
+            if not beats and not (is_nat_striker and inside_box):
                 shoot_value = 0.0  # Don't shoot
             else:
                 # Base value: higher if beats keeper
                 base_value = 0.8 if beats else 0.15
-                # Minimum floor for natural strikers inside box
-                min_shoot_value = 10.0 if (_is_natural_striker(inp, p) and inside_box) else 0.0
+                # Floor for natural strikers inside the box, so shooting wins
+                # over recycling the ball. See IN_BOX_SHOT_FLOOR.
+                min_shoot_value = IN_BOX_SHOT_FLOOR if (is_nat_striker and inside_box) else 0.0
                 shoot_value = max(min_shoot_value, base_value * 100.0 - dist_goal * 0.4)
                 if shoot_value > 0:
                     intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (target.x, target.y), target.power)
@@ -971,20 +987,16 @@ class PolicyController:
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (test_target.x, test_target.y), test_target.power)
                 candidates.append((12.0, intent, "test_keeper"))
         
-        # ---- 1b. REBOUND SETUP ----
-        # Shoot at keeper's body to create rebound (strikers only)
-        gk = state.goalkeeper_them()
-        if _is_natural_striker(inp, p) and gk is not None and dist_goal < 20.0 and p.can_act:
-            gkx, gky = gk.x, gk.y
-            # Aim at keeper's body (center of goal)
-            tx, ty = OPP_GOAL_X, GOAL_CENTER_Y
-            power = 0.85
-            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
-            if pass_lane_clear(p.x, p.y, tx, ty, opp_pos, margin=0.15):
-                rebound_value = 45.0
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "shoot", (tx, ty), power)
-                candidates.append((rebound_value, intent, "rebound_setup"))
-        
+        # NOTE: a "rebound setup" candidate used to live here -- shoot at the
+        # keeper's body from up to 20 m, worth 45.0, tying the best genuine shot
+        # in this planner. It was removed because it is the one shot a keeper is
+        # guaranteed to deal with: aiming at GOAL_CENTER_Y from in front of a
+        # keeper sitting on the centre line needs well under GK_DIVE_LATERAL_MIN
+        # of lateral reach, which the engine calls a standing catch. It also
+        # never consulted shot_beats_keeper, unlike the test_keeper branch
+        # above, and its move target was the goal itself. See
+        # test_no_shot_is_aimed_at_the_keeper_body.
+
         # ---- 1b. SECOND BALL ANTICIPATION ----
         # If ball is loose in dangerous area, anticipate where it goes
         ball = state.ball

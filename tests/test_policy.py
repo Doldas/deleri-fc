@@ -16,7 +16,8 @@ from src.policy import (
 from src.opponent import OpponentModel
 from src.state import GameState, WorldModel
 from src import geom
-from src.geom import PITCH_LENGTH, PITCH_WIDTH
+from src.geom import PITCH_LENGTH, PITCH_WIDTH, GOAL_CENTER_Y, OPP_GOAL_X
+from src.physics import shot_beats_keeper
 
 SLOTS = [
     {"id": "defender", "role": "defender", "position": {"x": 14, "y": 20}},
@@ -88,6 +89,42 @@ class PolicyTests(unittest.TestCase):
         intents = PolicyController().decide(inp)
         self.assertEqual(intents["st"].action_type, "shoot")
         self.assertIsNotNone(intents["st"].action_target)
+
+    def test_no_shot_is_aimed_at_the_keeper_body(self):
+        """A shot at the goal centre is a shot at the keeper.
+
+        The engine treats a save needing less than GK_DIVE_LATERAL_MIN (0.8 m)
+        of lateral reach as a standing catch, and a keeper holding his line
+        sits on the centre. So an intent aimed at GOAL_CENTER_Y is only a real
+        chance when shot_beats_keeper agrees.
+
+        This is the invariant a "rebound setup" candidate broke: it aimed at
+        GOAL_CENTER_Y from up to 20 m, never consulted shot_beats_keeper, and
+        was worth 45.0 -- tying the best genuine shot in the planner, so the
+        striker could prefer feeding the keeper over actually scoring.
+        """
+        for st_x in (36, 40, 44, 48, 52):
+            with self.subTest(dist_goal=OPP_GOAL_X - st_x):
+                inp = make_inp(obs((st_x, 20), "us", our_st_x=st_x, them_x=10))
+                intents = PolicyController().decide(inp)
+                gk = inp.state.goalkeeper_them()
+                if gk is None:
+                    self.fail("test needs an opponent keeper on the pitch")
+                dist_goal = OPP_GOAL_X - st_x
+                for pid, it in intents.items():
+                    if it.action_type != "shoot" or it.action_target is None:
+                        continue
+                    _, ty = it.action_target
+                    if abs(ty - GOAL_CENTER_Y) > 0.01:
+                        continue  # aimed at a corner, not at the keeper
+                    self.assertTrue(
+                        shot_beats_keeper(
+                            st_x, 20.0, gk.x, gk.y, ty, dist_goal,
+                            it.action_power or 0.9,
+                        ),
+                        f"{pid} was chosen to shoot at the keeper's body from "
+                        f"{dist_goal:.1f} m, a shot the keeper can hold",
+                    )
 
     def test_their_possession_no_crash_and_defensive(self):
         inp = make_inp(obs((22, 20), "them"), tactical_state=TacticalState.DEFENSIVE_TRANSITION)

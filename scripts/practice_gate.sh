@@ -35,7 +35,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-TEAM="$ROOT/My Teams/my-team-fc"
+# The team directory was renamed my-team-fc -> deleri-fc, and the opponent
+# pool was moved under training/opponents. Both paths below used to be stale,
+# which made this gate resolve to nothing and silently exercise no matches.
+TEAM="$ROOT/My Teams/deleri-fc"
+OPPONENTS="$TEAM/training/opponents"
 CLI="$ROOT/tools/team-cli/linux-x64/football-team"
 
 GAMES="${GAMES:-20}"           # 20 games = 40 matches per opponent
@@ -108,7 +112,7 @@ echo "== match-level gates ($MATCHES matches each, seed $SEED) =="
 run_gate reference            --opponent      reference                  "$MIN_WIN_REFERENCE"  "$MIN_GPM_REFERENCE"
 run_gate reference-strikers   --opponent      reference-strikers         "$MIN_WIN_STRIKERS"
 run_gate slapstick-united     --opponent      slapstick-united           "$MIN_WIN_SLAPSTICK"
-run_gate counter-elite/Vanguard --opponent-path "$ROOT/opponents/counter-elite" "$MIN_WIN_VANGUARD" "" "$MAX_VANGUARD_CONCEDED"
+run_gate counter-elite/Vanguard --opponent-path "$OPPONENTS/counter-elite" "$MIN_WIN_VANGUARD" "" "$MAX_VANGUARD_CONCEDED"
 
 echo
 if [ "$status" -eq 0 ]; then

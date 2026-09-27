@@ -166,6 +166,13 @@ class TestGKPropagation(unittest.TestCase):
         self.controller = PolicyController()
 
     def _make_inp(self, gk_x: float, gk_y: float):
+        # The striker stands at x=50, i.e. 10 m out and inside the box
+        # (inside_box is dist_goal <= 11), so a shot is legitimately on the
+        # table and these tests can compare how the shot TARGET moves with the
+        # keeper. It used to sit at x=42, 18 m out, where a shot at a keeper
+        # standing on his line is a standing catch and is correctly refused --
+        # that test only went green because the "rebound setup" candidate forced
+        # a shoot through at any range under 20 m. See IN_BOX_SHOT_FLOOR.
         obs = {
             "protocolVersion": "1.0",
             "gameId": "gk_wiring_test",
@@ -176,7 +183,7 @@ class TestGKPropagation(unittest.TestCase):
             "phase": "openPlay",
             "score": {"us": 0, "them": 0},
             "ball": {
-                "position": {"x": 42.0, "y": 20.0},
+                "position": {"x": 50.0, "y": 20.0},
                 "velocity": {"x": 0.0, "y": 0.0},
                 "possessingTeam": "us",
                 "possessedBy": "st"
@@ -186,7 +193,7 @@ class TestGKPropagation(unittest.TestCase):
                 {"id": "cd", "role": "outfield", "position": {"x": 18.0, "y": 20.0}, "velocity": {"x": 0.0, "y": 0.0}, "facingRadians": 0.0, "canAct": True},
                 {"id": "am", "role": "outfield", "position": {"x": 32.0, "y": 16.0}, "velocity": {"x": 0.0, "y": 0.0}, "facingRadians": 0.0, "canAct": True},
                 {"id": "w", "role": "outfield", "position": {"x": 30.0, "y": 6.0}, "velocity": {"x": 0.0, "y": 0.0}, "facingRadians": 0.0, "canAct": True},
-                {"id": "st", "role": "outfield", "position": {"x": 42.0, "y": 20.0}, "velocity": {"x": 0.0, "y": 0.0}, "facingRadians": 0.0, "canAct": True},
+                {"id": "st", "role": "outfield", "position": {"x": 50.0, "y": 20.0}, "velocity": {"x": 0.0, "y": 0.0}, "facingRadians": 0.0, "canAct": True},
             ],
             "them": [
                 {"id": "tgk", "role": "goalkeeper", "position": {"x": gk_x, "y": gk_y}, "velocity": {"x": 0.0, "y": 0.0}, "facingRadians": 0.0, "canAct": True},
