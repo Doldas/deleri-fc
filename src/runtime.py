@@ -2,6 +2,13 @@
 
 Per-match context is keyed by gameId and seeded deterministically
 (AISTRATEGI §41–42, §5 of AGENTS.md).
+
+Coordinate normalization:
+The engine always uses the same coordinate system (x=0..60, y=0..40) regardless
+of which side we spawn on. The "us" team in the observation is always the team
+we control, but our goalkeeper may be at x~6 (attacking +x) or x~54 (attacking -x).
+We detect our attacking direction once at kickoff and normalize all state to a
+canonical system where we always attack toward +x (OPP_GOAL_X = 60).
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from .mcts import MCTSPlanner
 from .opponent import OpponentModel
 from .policy import (
     DEFAULT_MATCH_DURATION,
+    PlayerIntent,
     PolicyController,
     PolicyInput,
     is_late,
@@ -26,9 +34,154 @@ from .policy import (
 )
 from .state import GameState, WorldModel
 from .tactics import PressPlan, TacticalState, assign_roles, detect, plan_press
+from .geom import PITCH_LENGTH, PITCH_WIDTH, GOAL_CENTER_Y, GOAL_LOW_Y, GOAL_HIGH_Y
 
 _TACTICS_JSON = Path(__file__).resolve().parents[1] / "tactics.json"
 _EVOLVED_POLICY_JSON = Path(__file__).resolve().parents[1] / "artifacts" / "policies" / "distilled_policy.json"
+
+
+def _normalize_x(x: float, attack_sign: int) -> float:
+    """Convert engine x to canonical x (we always attack +x)."""
+    if attack_sign == 1:
+        return x
+    return PITCH_LENGTH - x
+
+
+def _normalize_vx(vx: float, attack_sign: int) -> float:
+    """Convert engine vx to canonical vx."""
+    if attack_sign == 1:
+        return vx
+    return -vx
+
+
+def _normalize_facing(facing: float, attack_sign: int) -> float:
+    """Convert engine facing to canonical facing."""
+    if attack_sign == 1:
+        return facing
+    # Mirror horizontally: angle -> pi - angle (in radians)
+    import math
+    return math.pi - facing
+
+
+def _denormalize_x(x: float, attack_sign: int) -> float:
+    """Convert canonical x back to engine x."""
+    return _normalize_x(x, attack_sign)  # Self-inverse
+
+
+def _denormalize_vx(vx: float, attack_sign: int) -> float:
+    """Convert canonical vx back to engine vx."""
+    return _normalize_vx(vx, attack_sign)  # Self-inverse
+
+
+def _denormalize_facing(facing: float, attack_sign: int) -> float:
+    """Convert canonical facing back to engine facing."""
+    return _normalize_facing(facing, attack_sign)  # Self-inverse
+
+
+def _normalize_state(state: GameState, attack_sign: int) -> GameState:
+    """Return a new GameState with coordinates normalized to canonical (attack +x)."""
+    if attack_sign == 1:
+        return state
+    
+    # Mirror all x coordinates and vx
+    from .state import Ball, Player
+    
+    norm_us = []
+    for p in state.us:
+        norm_us.append(Player(
+            id=p.id,
+            team=p.team,
+            role=p.role,
+            x=_normalize_x(p.x, attack_sign),
+            y=p.y,
+            vx=_normalize_vx(p.vx, attack_sign),
+            vy=p.vy,
+            facing=_normalize_facing(p.facing, attack_sign),
+            can_act=p.can_act,
+        ))
+    
+    norm_them = []
+    for p in state.them:
+        norm_them.append(Player(
+            id=p.id,
+            team=p.team,
+            role=p.role,
+            x=_normalize_x(p.x, attack_sign),
+            y=p.y,
+            vx=_normalize_vx(p.vx, attack_sign),
+            vy=p.vy,
+            facing=_normalize_facing(p.facing, attack_sign),
+            can_act=p.can_act,
+        ))
+    
+    ball = state.ball
+    norm_ball = Ball(
+        x=_normalize_x(ball.x, attack_sign),
+        y=ball.y,
+        vx=_normalize_vx(ball.vx, attack_sign),
+        vy=ball.vy,
+        possessing_team=ball.possessing_team,
+        possessing_player=ball.possessing_player,
+    )
+    
+    return GameState(
+        protocol_version=state.protocol_version,
+        game_id=state.game_id,
+        sequence=state.sequence,
+        simulation_tick=state.simulation_tick,
+        apply_at_tick=state.apply_at_tick,
+        time_remaining=state.time_remaining,
+        phase=state.phase,
+        score_us=state.score_us,
+        score_them=state.score_them,
+        ball=norm_ball,
+        us=tuple(norm_us),
+        them=tuple(norm_them),
+    )
+
+
+def _denormalize_intents(intents: dict[str, 'PlayerIntent'], attack_sign: int) -> dict[str, 'PlayerIntent']:
+    """Convert canonical intents back to engine coordinates."""
+    if attack_sign == 1:
+        return intents
+    
+    from .policy import PlayerIntent
+    
+    result = {}
+    for pid, intent in intents.items():
+        # Denormalize move target
+        tx = _denormalize_x(intent.tx, attack_sign)
+        ty = intent.ty
+        # Denormalize face target
+        fx = _denormalize_x(intent.face_x, attack_sign)
+        fy = intent.face_y
+        # Denormalize action target
+        at_x, at_y = None, None
+        if intent.action_target is not None:
+            at_x = _denormalize_x(intent.action_target[0], attack_sign)
+            at_y = intent.action_target[1]
+            action_target: tuple[float, float] | None = (at_x, at_y)
+        else:
+            action_target = None
+        
+        result[pid] = PlayerIntent(
+            pid=intent.pid,
+            tx=tx,
+            ty=ty,
+            speed=intent.speed,
+            face_x=fx,
+            face_y=fy,
+            action_type=intent.action_type,
+            action_target=action_target,
+            action_power=intent.action_power,
+            # Preserve P1.2 metadata
+            receiver_id=intent.receiver_id,
+            collection_point=(
+                _denormalize_x(intent.collection_point[0], attack_sign),
+                intent.collection_point[1]
+            ) if intent.collection_point is not None else None,  # type: ignore[arg-type]
+        )
+    return result
 
 
 def load_tactics() -> dict:
@@ -91,6 +244,9 @@ class MatchContext:
     # observation) rather than from the default. Guards the fallback adoption
     # below so a default can never masquerade as a real configuration.
     duration_known: bool = False
+    # Attack direction: +1 = we attack toward +x (engine goal at 60), -1 = we attack toward -x (engine goal at 0)
+    # Determined on first observation by our GK position.
+    attack_sign: int = 1
 
     def assign_slots(self, state: GameState) -> None:
         if not self.roles and state.us:
@@ -182,22 +338,37 @@ class RuntimeManager:
     def decide(self, observation: dict) -> dict:
         ctx = self.get_or_create(observation)
         state = GameState.from_observation(observation)
-        ctx.assign_slots(state)
-        world = WorldModel.build(state)
+        
+        # Determine attack direction on first observation (or if not yet determined).
+        # Our GK at x < 30 means we attack +x (normal), x > 30 means we attack -x (mirrored).
+        if ctx.attack_sign == 1:
+            our_gk = state.goalkeeper_us()
+            if our_gk is not None:
+                gk_x = our_gk.x
+                # At kickoff, our GK is at x~6 (normal) or x~54 (mirrored).
+                # Use midpoint of pitch (30) as threshold.
+                if gk_x > PITCH_LENGTH / 2:
+                    ctx.attack_sign = -1
+        
+        # Normalize state to canonical coordinates (we always attack +x).
+        norm_state = _normalize_state(state, ctx.attack_sign)
+        
+        ctx.assign_slots(norm_state)
+        world = WorldModel.build(norm_state)
 
         # If the match configuration never stated a duration, adopt it from the
         # kickoff observation: at the start of a match timeRemainingSeconds *is*
         # the duration. Ties the policy to the real 30/60/120 s configuration
         # instead of a default.
-        if not ctx.duration_known and state.time_remaining > 0.0:
-            ctx.match_duration = state.time_remaining
+        if not ctx.duration_known and norm_state.time_remaining > 0.0:
+            ctx.match_duration = norm_state.time_remaining
             ctx.duration_known = True
 
         # Maintain possession-phase memory.
-        ctx.opp.update(state)
-        ctx.metrics.observe(state, world)
+        ctx.opp.update(norm_state)
+        ctx.metrics.observe(norm_state, world)
 
-        tactical_state = self._detect(ctx, state, world)
+        tactical_state = self._detect(ctx, norm_state, world)
         genome = ctx.genome
 
         # ADAPTACT: Apply opponent-specific counter-tactics (AISTRATEGI §38)
@@ -224,9 +395,9 @@ class RuntimeManager:
         # sit calmer when leading late. Duration must be threaded in, otherwise
         # the context falls back to "not late" and the plan is always calm.
         ctx_str = match_context(
-            state.time_remaining,
-            state.score_us,
-            state.score_them,
+            norm_state.time_remaining,
+            norm_state.score_us,
+            norm_state.score_them,
             ctx.match_duration,
         )
         press_genome = adapted_genome
@@ -239,13 +410,13 @@ class RuntimeManager:
             press_genome["press_trigger_threshold"] = adapted_genome.get("press_trigger_threshold", 0.4) * 1.4
             press_genome["press_intensity"] = max(0.0, adapted_genome.get("press_intensity", 0.55) - 0.2)
 
-        if state.ball.possessing_team == "them":
-            press_plan = plan_press(state, world, press_genome, ctx.roles)
+        if norm_state.ball.possessing_team == "them":
+            press_plan = plan_press(norm_state, world, press_genome, ctx.roles)
         else:
             press_plan = PressPlan()
 
         # Counter-press trigger: if we just regained possession, activate counter-press
-        has_control_now = state.has_control()
+        has_control_now = norm_state.has_control()
         if not ctx.prev_had_control and has_control_now:
             ctx.counter_press_active = True
         elif ctx.prev_had_control and not has_control_now:
@@ -255,7 +426,7 @@ class RuntimeManager:
         ctx.prev_had_control = has_control_now
 
         inp = PolicyInput(
-            state=state,
+            state=norm_state,
             world=world,
             # Use adapted genome (with archetype counters + context mods) for full policy
             config=RuntimeConfig(genome=adapted_genome),
@@ -264,14 +435,17 @@ class RuntimeManager:
             roles=ctx.roles,
             their_possession_ticks=ctx.their_possession_ticks,
             opp=ctx.opp,
-            time_remaining=state.time_remaining,
-            score_us=state.score_us,
-            score_them=state.score_them,
+            time_remaining=norm_state.time_remaining,
+            score_us=norm_state.score_us,
+            score_them=norm_state.score_them,
             counter_press_active=ctx.counter_press_active,
             match_duration=ctx.match_duration,
         )
 
         intents = ctx.policy.decide(inp)
+
+        # Denormalize intents back to engine coordinates.
+        intents = _denormalize_intents(intents, ctx.attack_sign)
 
         # Reset counter-press after it's been used for one decision cycle
         if ctx.counter_press_active:
@@ -280,7 +454,7 @@ class RuntimeManager:
 # Optional limited MCTS override on high-value attacking states only.
         # Use adapted genome for MCTS too.
         mcts_note = None
-        if ctx.mcts_planner is not None and state.has_control():
+        if ctx.mcts_planner is not None and norm_state.has_control():
             # Only trigger MCTS in high-value attacking situations:
             # - Final third (ball_zone == "final")
             # - Elite goalkeeper detected
@@ -288,13 +462,13 @@ class RuntimeManager:
             # - Wall attack opportunity
             # - Late game trailing (desperation)
             # - Counter-press active
-            ctx.opp.update(state)  # Refresh opponent model
+            ctx.opp.update(norm_state)  # Refresh opponent model
             # Duration-relative late test, via the single authority in policy.
             # This used to be an inline `ctx.match_duration * 0.2 >= ...`, a
             # third copy of the definition that could drift from the others.
             late_trailing = is_late(
                 inp.tr, ctx.match_duration
-            ) and state.score_us < state.score_them
+            ) and norm_state.score_us < norm_state.score_them
             high_value = (
                 world.ball_zone == "final"
                 or ctx.opp.detect_archetype() == "elite_goalkeeper"
@@ -308,6 +482,9 @@ class RuntimeManager:
                 best = ctx.mcts_planner.choose(inp, intents)
                 if best is not None:
                     intents = best
+                    # MCTS returns engine-coordinate intents (it operates on normalized state
+                    # but returns decisions for the canonical side). We need to denormalize again.
+                    intents = _denormalize_intents(intents, ctx.attack_sign)
                     mcts_note = "mcts"
 
         wire = [player_intent.to_wire() for player_intent in intents.values()]
