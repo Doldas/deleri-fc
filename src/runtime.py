@@ -17,7 +17,13 @@ from .config import RuntimeConfig, default_genome, make_genome
 from .evaluate import Metrics
 from .mcts import MCTSPlanner
 from .opponent import OpponentModel
-from .policy import PolicyController, PolicyInput, match_context
+from .policy import (
+    DEFAULT_MATCH_DURATION,
+    PolicyController,
+    PolicyInput,
+    is_late,
+    match_context,
+)
 from .state import GameState, WorldModel
 from .tactics import PressPlan, TacticalState, assign_roles, detect, plan_press
 
@@ -81,6 +87,10 @@ class MatchContext:
     explanations: list[dict] = field(default_factory=list)
     mcts_planner: MCTSPlanner | None = None
     match_duration: float = 60.0  # Match duration in seconds (default 60s)
+    # True once match_duration came from the match configuration (or the first
+    # observation) rather than from the default. Guards the fallback adoption
+    # below so a default can never masquerade as a real configuration.
+    duration_known: bool = False
 
     def assign_slots(self, state: GameState) -> None:
         if not self.roles and state.us:
@@ -120,8 +130,16 @@ class RuntimeManager:
         seed_str = str(body.get("randomSeed", ""))
         seed = seed_int(seed_str, game_id) if seed_str else 0
         config = self.runtime_config
-        # Capture match duration from initial timeRemainingSeconds or duration field
-        match_duration = float(body.get("duration", body.get("timeRemainingSeconds", 60.0)))
+        # Capture the authoritative match duration so every tactical time
+        # decision is relative to it (30/60/120 s are all valid). We take the
+        # value from the match configuration, falling back to the kickoff
+        # timeRemainingSeconds observed in decide(); DEFAULT_MATCH_DURATION is
+        # the last resort only.
+        duration = body.get("duration", body.get("timeRemainingSeconds"))
+        duration_known = duration is not None
+        match_duration = (
+            float(duration) if duration_known else DEFAULT_MATCH_DURATION
+        )
         with self._lock:
             ctx = MatchContext(
                 game_id=game_id,
@@ -130,6 +148,7 @@ class RuntimeManager:
                 slots=list(self.configs.get("formation", {}).get("slots", [])),
                 config=config,
                 match_duration=match_duration,
+                duration_known=duration_known,
             )
             ctx.rng = random.Random(seed ^ int(body.get("seriesId", "")[:8].encode("utf-8").hex() or "0", 16))
             if config.enable_mcts:
@@ -166,6 +185,14 @@ class RuntimeManager:
         ctx.assign_slots(state)
         world = WorldModel.build(state)
 
+        # If the match configuration never stated a duration, adopt it from the
+        # kickoff observation: at the start of a match timeRemainingSeconds *is*
+        # the duration. Ties the policy to the real 30/60/120 s configuration
+        # instead of a default.
+        if not ctx.duration_known and state.time_remaining > 0.0:
+            ctx.match_duration = state.time_remaining
+            ctx.duration_known = True
+
         # Maintain possession-phase memory.
         ctx.opp.update(state)
         ctx.metrics.observe(state, world)
@@ -194,8 +221,14 @@ class RuntimeManager:
         mcts_hash = "none"
         
         # §32 context-sensitive press planning: chase harder when trailing late,
-        # sit calmer when leading late.
-        ctx_str = match_context(state.time_remaining, state.score_us, state.score_them)
+        # sit calmer when leading late. Duration must be threaded in, otherwise
+        # the context falls back to "not late" and the plan is always calm.
+        ctx_str = match_context(
+            state.time_remaining,
+            state.score_us,
+            state.score_them,
+            ctx.match_duration,
+        )
         press_genome = adapted_genome
         if ctx_str == "trailing_late":
             press_genome = dict(adapted_genome)
@@ -256,13 +289,18 @@ class RuntimeManager:
             # - Late game trailing (desperation)
             # - Counter-press active
             ctx.opp.update(state)  # Refresh opponent model
-            inp_time_remaining = getattr(inp, 'time_remaining', None) or ctx.match_duration
+            # Duration-relative late test, via the single authority in policy.
+            # This used to be an inline `ctx.match_duration * 0.2 >= ...`, a
+            # third copy of the definition that could drift from the others.
+            late_trailing = is_late(
+                inp.tr, ctx.match_duration
+            ) and state.score_us < state.score_them
             high_value = (
                 world.ball_zone == "final"
                 or ctx.opp.detect_archetype() == "elite_goalkeeper"
                 or ctx.opp.detect_archetype() == "low_block"
                 or world.ball_near_wall
-                or (ctx.match_duration is not None and ctx.match_duration * 0.2 >= inp_time_remaining and state.score_us < state.score_them)
+                or late_trailing
                 or ctx.counter_press_active
             )
             if high_value:

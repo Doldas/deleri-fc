@@ -406,22 +406,34 @@ class PolicyTests(unittest.TestCase):
         self.assertGreaterEqual(intent.tx, 20.0)
 
     def test_match_context_buckets(self):
-        self.assertEqual(match_context(300.0, 1, 0), "leading")
-        self.assertEqual(match_context(300.0, 0, 1), "trailing")
-        self.assertEqual(match_context(300.0, 0, 0), "tied")
-        self.assertEqual(match_context(90.0, 1, 0), "leading_late")
-        self.assertEqual(match_context(90.0, 0, 1), "trailing_late")
-        self.assertEqual(match_context(90.0, 0, 0), "tied_late")
+        # Duration must be explicit: "late" is the last 20% of the configured
+        # match, not a fixed number of seconds. See tests/test_match_context.py.
+        self.assertEqual(match_context(300.0, 1, 0, 300.0), "leading")
+        self.assertEqual(match_context(300.0, 0, 1, 300.0), "trailing")
+        self.assertEqual(match_context(300.0, 0, 0, 300.0), "tied")
+        self.assertEqual(match_context(60.0, 1, 0, 300.0), "leading_late")
+        self.assertEqual(match_context(60.0, 0, 1, 300.0), "trailing_late")
+        self.assertEqual(match_context(60.0, 0, 0, 300.0), "tied_late")
+        # A 30 s match is never "late" before 6 s, whatever the old 120.0 said.
+        self.assertEqual(match_context(30.0, 0, 0, 30.0), "tied")
+        self.assertEqual(match_context(6.0, 0, 0, 30.0), "tied_late")
 
     def test_trailing_late_raises_risk_and_verticality(self):
+        # 60 s remaining of a 300 s match is exactly the 20% late threshold.
+        # This test only passed before because `late` was `tr <= 120.0`, which
+        # made every state late; it now needs a real duration to be exercised.
         leading = make_inp(obs((35, 20), "us", them_x=20))
         leading.score_us = 2
         leading.score_them = 0
         leading.time_remaining = 60.0
+        leading.match_duration = 300.0
         trailing = make_inp(obs((35, 20), "us", them_x=20))
         trailing.score_us = 0
         trailing.score_them = 2
         trailing.time_remaining = 60.0
+        trailing.match_duration = 300.0
+        self.assertEqual(leading.context(), "leading_late")
+        self.assertEqual(trailing.context(), "trailing_late")
         # Estimate the modulated cone from the receivers of the ball carrier.
         cfg = default_genome()
         self.assertGreater(
