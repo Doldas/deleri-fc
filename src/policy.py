@@ -20,6 +20,8 @@ from . import geom
 from .config import (
     BALL_CONTROL_MAX_SPEED,
     BALL_CONTROL_SAFE_SPEED,
+    BALL_DECAY,
+    KICK_MAX_SPEED,
     KICK_MIN_SPEED,
     MAX_RUN_SPEED,
     SLAP_CLEAN,
@@ -29,7 +31,15 @@ from .config import (
     RuntimeConfig,
     shooting_distance,
 )
-from .geom import GOAL_CENTER_Y, GOAL_HIGH_Y, GOAL_LOW_Y, OPP_GOAL_X, PITCH_LENGTH, PITCH_WIDTH
+from .geom import (
+    GOAL_CENTER_Y,
+    GOAL_HALF,
+    GOAL_HIGH_Y,
+    GOAL_LOW_Y,
+    OPP_GOAL_X,
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+)
 
 
 # Default distance for nearest opponent fallback (20m = center of pitch width)
@@ -60,6 +70,75 @@ def _is_natural_striker(inp, p) -> bool:
     dynamic_role = inp.roles.get(p.id, "defender")
     # Consider striker if natural role is striker, or dynamic role is striker and in attacking position
     return natural_role == "striker" or (dynamic_role == "striker" and p.x > 30.0)
+
+
+def _shot_geometry_target(inp: PolicyInput, p: Player) -> tuple[tuple[float, float], float]:
+    """The shot we would actually take from here, as (target_xy, power).
+
+    The aim point is the corner that minimises the goalkeeper's lateral reach
+    after he has shifted across during the ball's flight, so the returned
+    target is already the best available one and every probability computed
+    from it is the real shot we are contemplating.
+    """
+    gk = inp.state.goalkeeper_them()
+    gkx = gk.x if gk is not None else -1.0
+    gky = gk.y if gk is not None else GOAL_CENTER_Y
+    st = pick_shot_target(p.x, p.y, gkx, gky)
+    return (st.x, st.y), st.power
+
+
+def _shot_ev(inp: PolicyInput, p: Player) -> float:
+    """Expected value of the best available shot, from the real geometry.
+
+    This is `ExpectedValueCalculator.ev_shot` on the shot we would actually
+    take. It is deliberately *not* a nominal-position test: the value depends
+    only on where the ball is, where the keeper is, where the defenders are
+    and how well the shot is aimed.
+    """
+    (tx, ty), power = _shot_geometry_target(inp, p)
+    return ExpectedValueCalculator(inp).ev_shot(p, (tx, ty), power)
+
+
+def _shot_p_goal(inp: PolicyInput, p: Player) -> float:
+    """P(goal) of the best available shot -- the decomposed, geometric xG."""
+    (tx, ty), power = _shot_geometry_target(inp, p)
+    return ExpectedValueCalculator(inp).p_shot_goal(p, (tx, ty), power)
+
+
+def _shot_worth_taking(inp: PolicyInput, p: Player) -> bool:
+    """Should this player shoot right now?
+
+    Two bars, both geometric, and neither of them looks at nominal position:
+
+    * Inside the box the test is on *reaching the goal at all*: is the effort
+      on frame and not into a body? At that range an attempt is worth taking
+      even against a keeper who is set, because it is the closest the ball
+      will ever get and holding it there invites a tackle. Note this is
+      deliberately not `P(goal)` -- against a set keeper from the middle the
+      goal probability is ~1%, and refusing to shoot there is what produced
+      the original 35-shots-0-goals season.
+    * Outside the box the bar is a full expected value, and it is high enough
+      that the shot has to be a real chance. This is the lever that matters
+      against a strong keeper: from 18 m up the centre it is a standing catch
+      every time, because he has 0.7 s of flight to cover the far post. The
+      only way to make it a goal is to drag him wide first and then hit the far
+      corner, and `ev_shot` rewards exactly that and nothing else.
+
+    The old version of this function branched on `role`, so a centre-back who
+    had carried the ball upfield was judged on his shirt rather than on the
+    geometry, and a striker in the same position got a different answer for
+    the identical picture. Both are now the same calculation.
+    """
+    ev = ExpectedValueCalculator(inp)
+    (tx, ty), power = _shot_geometry_target(inp, p)
+    dist_goal = OPP_GOAL_X - p.x
+    if dist_goal <= SHOT_IN_BOX_DIST:
+        reaches = (1.0 - ev.p_shot_blocked(p, (tx, ty), power)) * ev.p_shot_on_target(
+            p, (tx, ty), power
+        )
+        return reaches >= EV_SHOT_REACHES_GOAL_BAR
+    return ev.ev_shot(p, (tx, ty), power) > EV_SHOT_WORTH
+
 
 
 def go_20() -> float:
@@ -150,27 +229,71 @@ CARRY_FULL_GAIN = 8.0
 CARRY_SHOOT_RANGE = 20.0
 CARRY_SHOOT_BONUS = 4.0
 
-# --- Expected Value Constants (replaces hardcoded action values) -----------
-# These replace the hardcoded action values with proper expected value computation.
-# All values are in "goal-equivalent" units where 1.0 = 1 goal.
+# --- Expected Value Constants ---------------------------------------------
+# Units are "goal-equivalents": EV_GOAL_VALUE = 100 means one goal is worth
+# 100, and everything else is priced as a fraction of a goal. That forces
+# passes, carries and shots onto one honest scale, which is the whole point:
+# when a pass was scored at 20-30 and a real shot at -2, no amount of tuning
+# the shot model could ever make the team shoot.
+EV_GOAL_VALUE = 100.0
+
+# What a shot that does not score is actually worth, per the engine rules
+# (docs/00-game-engine-rules.md). These are *not* turnovers:
 #
-# Outcome values (in goal-equivalents)
-EV_GOAL_VALUE = 100.0          # Scoring a goal
-EV_SHOT_ON_TARGET_SAVED = -5.0  # Shot saved -> opponent counter-attack risk
-EV_SHOT_BLOCKED = -10.0         # Shot blocked -> dangerous counter
-EV_SHOT_WIDE = 0.0             # Shot wide = neutral (goal kick)
-EV_SHOT_POST = 0.0             # Hit post = neutral (goal kick)
+#  * Goal kicks do not exist in this ruleset. A shot that misses hits the
+#    goal-line wall and rebounds off it at 75%, so the ball is still loose and
+#    still ours to chase. A miss costs tempo, not possession.
+#  * A shot needing 0.8-1.65 m of reach is a dive, and the keeper stays
+#    grounded holding the ball for 0.9 s. That is a forced distribution
+#    window we get for free by shooting.
+#  * A shot needing under 0.8 m is a standing catch, so the keeper plays on
+#    normally and we have genuinely lost the ball.
+EV_SHOT_ON_TARGET_SAVED = -4.0
+EV_SHOT_BLOCKED = -2.0
+EV_SHOT_WIDE = 1.0
+
+# The follow-up we are entitled to after forcing a dive: the keeper is
+# grounded for GK_GROUNDED_SECONDS and cannot distribute, and a miss rebounds
+# off the wall. This is the reason shooting from inside the box is worth doing
+# even when P(goal) is low, and it is why the shot EV beats a sideways pass
+# at close range instead of losing to it.
+GK_GROUNDED_SECONDS = 0.9
+EV_SHOT_SECOND_BALL = 6.0
+
+# --- Pass / carry outcomes -------------------------------------------------
+# Retaining the ball is worth a small amount; what makes a pass attractive is
+# where it puts the ball, and how much of a goal that position is worth. A
+# pass into the box is close to a chance; a pass sideways is not.
+EV_PASS_COMPLETED = 2.0
+# Ground won and ground lost are not symmetric: a pass into the final third is
+# worth having, but a pass that walks the ball 20 m back out of their box hands
+# them the initiative again and costs more than the same metres gained. Before
+# this was signed, a retreat out of the box scored the same flat 2.0 as a
+# square pass, so the team recycled possession forever and the shot could
+# never win the ranking -- which is most of why the season produced 35 shots
+# and no goals, or one shot a match, depending on which patch was live.
+EV_PASS_PROGRESS_PER_M = 0.35
+EV_PASS_REGRESSION_PER_M = 0.60
+# Where the ball ends up matters as much as how far it travelled. These are
+# the strongest levers the attack has for getting the ball into the box, which
+# is the only place a shot is worth taking against a keeper who covers both
+# posts from the centre.
+EV_PASS_FINAL_THIRD_BONUS = 5.0
+EV_PASS_BOX_BONUS = 10.0
+# How far from a set goalkeeper a dribble still counts as contested. Inside his
+# reach it is a certain giveaway; out here it is an ordinary carry.
+CARRY_KEEPER_RADIUS = 5.0
+EV_PASS_INTERCEPTED = -15.0
+EV_PASS_OUT_OF_PLAY = 0.0
+EV_CARRY_PROGRESS = 8.0
+EV_CARRY_LOSS = -20.0
+EV_CARRY_HOLD = 1.5
+
+# Losing the ball is priced by where it happens: deep in their half the
+# transition is dangerous, in our own half it is merely a reset.
 EV_GOAL_CONCEDED = -100.0      # Conceding a goal
 EV_LOSS_OF_POSSESSION = -20.0   # Losing possession in dangerous area
 EV_LOSS_OF_POSSESSION_SAFE = -5.0  # Losing possession in safe area
-
-# Pass/carry outcomes
-EV_PASS_COMPLETED = 5.0        # Completed pass -> retained possession
-EV_PASS_INTERCEPTED = -15.0    # Intercepted -> counter-attack
-EV_PASS_OUT_OF_PLAY = 0.0      # Out of play = neutral (throw-in/goal kick)
-EV_CARRY_PROGRESS = 10.0       # Successful forward carry per metre
-EV_CARRY_LOSS = -20.0          # Tackled while carrying
-EV_CARRY_HOLD = 2.0            # Successful sideways/backwards carry
 
 # Action-specific bonuses (multiply base outcome)
 EV_THROUGH_BALL_MULTIPLIER = 1.5  # Through balls create high-quality chances
@@ -188,318 +311,734 @@ EV_TACKLE_SUCCESS_RATE = 0.6      # Base tackle success rate
 # Base values for fallback
 EV_BASE_ACTION_VALUE = 0.0
 
+# --- Shot-model geometry (all derived from engine constants) ----------------
+# A defender standing exactly in the lane is a certain-ish block; he only has
+# to cover the offset *beyond* his own body radius, so BODY_RADIUS is the free
+# part and REACH is the point where he cannot get there at all.
+SHOT_BLOCK_BODY_RADIUS = 0.5
+SHOT_BLOCK_REACH = 2.5
+# Share of the shot a genuine blocker removes, from arriving with the ball to
+# arriving with time to set himself. Multiple blockers compound.
+SHOT_BLOCK_SHARE_SETTLED = 0.88
+SHOT_BLOCK_SHARE_LATE = 0.35
+# Seconds of slack a defender needs before a block counts as "settled".
+SHOT_BLOCK_T_SETTLED = 0.20
+# Keeper outcomes on a shot that is on frame: standing catch vs clean goal,
+# and a keeper dragged outside his own defensive fifth.
+SHOT_GOAL_STANDING_CATCH = 0.02
+SHOT_GOAL_CLEAN = 0.95
+SHOT_GOAL_GK_OUT = 0.97
+# Lateral aiming error of a struck ball: a fixed strike/impact floor plus a
+# per-metre component, so the same aim point is far harder to hold from 25 m
+# than from 8 m. Used as the standard deviation of the landing distribution
+# against the 6 m frame (see ExpectedValueCalculator.p_shot_wide).
+SHOT_ERROR_BASE = 0.55
+SHOT_ERROR_PER_M = 0.10
+# Even a hopelessly wide effort occasionally finds the frame.
+SHOT_ON_TARGET_FLOOR = 0.03
+
+
+def _normal_cdf(z: float) -> float:
+    """Standard normal CDF (Abramowitz & Stegun 26.2.17, |err| < 7.5e-8)."""
+    t = 1.0 / (1.0 + 0.2316419 * abs(z))
+    poly = t * (
+        0.319381530
+        + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))
+    )
+    tail = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    return 1.0 - tail * poly if z > 0 else tail * poly
+
+# --- Pass race model -------------------------------------------------------
+# Logistic scale (seconds) of the receiver-vs-opponent arrival margin. A level
+# arrival is a coin flip; this is how fast the odds move away from 0.5.
+PASS_MARGIN_SCALE = 0.25
+# How far the ball may stop past the aim point before it starts costing us,
+# and where the pass is treated as a pure turnover risk.
+PASS_OVERSHOLE_FREE = 2.0
+PASS_OVERSHOLE_FATAL = 12.0
+
+# --- Shot decision bars ----------------------------------------------------
+# Inside the box the bar is on *reaching the goal*, not on scoring: the effort
+# has to be on frame and not into a body. At 8 m from the centre against a set
+# keeper P(goal) is around 1%, and demanding a real scoring chance there is
+# what produced the original 35-shots-0-goals season.
+SHOT_IN_BOX_DIST = 11.0
+EV_SHOT_REACHES_GOAL_BAR = 0.05
+# Outside the box the bar is a full expected value, and with EV_GOAL_VALUE = 100
+# it demands roughly a 1-in-20 goal. That is what keeps the hopeless 18 m
+# efforts out: from there the keeper has 0.7 s of flight to cover the far post,
+# so a central shot prices out negative and only a keeper dragged off his line
+# makes it a real chance.
+EV_SHOT_WORTH = 5.0
+# A wall shot has two legs, so nobody -- including the keeper -- can plan where
+# it ends up. That unpredictability is worth a premium over a direct shot.
+EV_WALL_SHOT_BONUS = 1.25
+
 # --- Expected Value Calculator -----------------------------------------------
 
 class ExpectedValueCalculator:
-    """Computes expected values for actions based on game state and physics.
-    
-    Replaces hardcoded action values with actual expected value computation:
-    EV = P(success) * Value(success) + P(failure) * Value(failure)
+    """Expected value of every action we can take, from real geometry.
+
+    Nothing here is a hardcoded action value. Each action is decomposed into
+    mutually exclusive outcomes whose probabilities are *derived* from the
+    engine's own numbers -- keeper lateral reach, the distance a pass rolls
+    before it may be touched, run speed, and the angle of the goalmouth -- and
+    the outcome probabilities of a single action always sum to 1 by
+    construction. A shot is a chain:
+
+        P(blocked)  ->  P(off target)  ->  P(on target)  ->  P(goal | on target)
+
+    and a pass is a race between three arrival times:
+
+        t_ball (when the ball is controllable)
+        t_us   (when our receiver gets there)
+        t_them (when the nearest opponent gets there)
+
+    EV is then the probability-weighted sum of the outcome values.
     """
-    
+
     def __init__(self, inp: PolicyInput):
         self.inp = inp
         self.state = inp.state
-        self.world = inp.world
         self.ball = self.state.ball
-    
-    # --- Probability Models ---
-    
-    def p_shot_goal(self, p: Player, target: tuple[float, float], power: float) -> float:
-        """Probability a shot results in a goal."""
-        dist_goal = OPP_GOAL_X - p.x
-        gk = self.state.goalkeeper_them()
-        gkx = gk.x if gk else -1.0
-        gky = gk.y if gk else 20.0
-        
-        # Base probability from shot_beats_keeper
-        target_obj = type('ShotTarget', (), {'x': target[0], 'y': target[1], 'power': power})()
-        beats = shot_beats_keeper(p.x, p.y, gkx, gky, target[1], OPP_GOAL_X - p.x, power)
-        
-        # Base probability from shot quality
-        if beats:
-            return 0.35  # 35% chance if beats keeper
-        
-        # Distance-based probability
-        if dist_goal <= 8.0:
-            return 0.25  # Close range
-        elif dist_goal <= 15.0:
-            return 0.12  # Medium range
-        else:
-            return 0.04  # Long range
-    
-    def p_shot_saved(self, p: Player, target: tuple[float, float], power: float) -> float:
-        """Probability shot is saved by keeper."""
-        return 0.55  # Most shots on target are saved
-    
-    def p_shot_blocked(self, p: Player, target: tuple[float, float]) -> float:
-        """Probability shot is blocked by defender."""
-        opp_pos = [(o.x, o.y) for o in self.state.outfield_them() if o.x > self.state.ball.possessing_player]
-        # Check if any defender is in the shot path
+
+    # --- shared geometry helpers -------------------------------------------
+
+    def _kick_speed(self, power: float) -> float:
+        """Map a 0..1 power to the ball speed the engine will actually use."""
+        return geom.clamp(
+            KICK_MIN_SPEED + (KICK_MAX_SPEED - KICK_MIN_SPEED) * power,
+            KICK_MIN_SPEED,
+            KICK_MAX_SPEED,
+        )
+
+    def _time_to_control(self, speed0: float) -> float:
+        """Seconds until a ball kicked at `speed0` is slow enough to control.
+
+        The engine decays ball speed by BALL_DECAY every 60 Hz tick and only
+        allows a control at or below BALL_CONTROL_SAFE_SPEED, so this is the
+        time cost every pass pays before anybody can touch it.
+        """
+        if speed0 <= BALL_CONTROL_SAFE_SPEED:
+            return 0.0
+        ticks = math.log(BALL_CONTROL_SAFE_SPEED / speed0) / math.log(BALL_DECAY)
+        return max(0.0, ticks) / TICKS_PER_SECOND
+
+    def _run_eta(self, fx: float, fy: float, tx: float, ty: float) -> float:
+        """Seconds for a runner to cover (fx,fy) -> (tx,ty) at run speed."""
+        return geom.distance(fx, fy, tx, ty) / MAX_RUN_SPEED
+
+    def _player_eta(self, pl: Player, tx: float, ty: float) -> float:
+        """A player who cannot act this tick cannot arrive in time at all."""
+        if not pl.can_act:
+            return float("inf")
+        return self._run_eta(pl.x, pl.y, tx, ty)
+
+    def _nearest_opponent_eta(self, tx: float, ty: float, skip_gk: bool = True) -> float:
+        best = float("inf")
+        for o in self.state.them:
+            if skip_gk and o.role == "goalkeeper":
+                continue
+            best = min(best, self._player_eta(o, tx, ty))
+        return best
+
+    # --- SHOT MODEL --------------------------------------------------------
+    #
+    # A shot is decomposed into the exclusive outcomes the engine can produce,
+    # in the order they are decided, so the probabilities sum to 1 exactly:
+    #
+    #     P(blocked)                              a defender's body is in the lane
+    #   + P(off target)  = (1-block) * P(wide)   the aim misses the frame
+    #   + P(saved)       = (1-block) * P(on) * (1 - P(goal | on))
+    #   + P(goal)        = (1-block) * P(on) * P(goal | on)
+    #
+    # `block` and `wide` are pure geometry. `goal | on target` is the keeper
+    # model: it uses GK_LATERAL_REACH (how far he can actually move), the
+    # flight time of the ball (how long he has to move it), and how much of
+    # the goalmouth is left over after his shift. That is the number
+    # `shot_beats_keeper` turns into a boolean, kept here as a probability.
+
+    def _shot_block_probability(
+        self, p: Player, target: tuple[float, float], power: float
+    ) -> float:
+        """P(the shot is blocked by a defender before it reaches the goal).
+
+        Real geometry on the shooter -> target segment. For every opponent we
+        project them onto that segment and take two numbers:
+
+            offset  perpendicular distance from the lane
+            along   how far down the lane the ball meets it
+
+        A defender is a *candidate* blocker when he is close enough to the
+        lane to get a leg in at all (offset < SHOT_BLOCK_REACH). He then wins
+        the time-to-intercept race: he only has to cover the offset *in
+        excess* of his own body radius, at run speed, before the ball arrives
+        at that point. Two things scale his share of the block:
+
+            centrality  1.0 standing in the lane, -> 0 at the edge of reach
+            timing      LATE when he arrives with the ball, SETTLED when he
+                        has time to set himself
+
+        Multiple blockers compound as 1 - prod(1 - share_i), which is the
+        correct reading of a wall: two half-chances are more likely to stop a
+        shot than either alone, but never certain.
+        """
+        lane_len = geom.distance(p.x, p.y, target[0], target[1])
+        if lane_len <= 1e-6:
+            return 0.0
+        ux = (target[0] - p.x) / lane_len
+        uy = (target[1] - p.y) / lane_len
+        speed0 = max(self._kick_speed(power), 1e-6)
+        span = max(SHOT_BLOCK_REACH - SHOT_BLOCK_BODY_RADIUS, 1e-6)
+
+        survive = 1.0
         for o in self.state.outfield_them():
-            if o.x > p.x and o.x < OPP_GOAL_X:
-                # Rough check: defender between shooter and goal
-                pass
-        return 0.15  # 15% blocked
-    
-    def p_shot_wide(self, p: Player, target: tuple[float, float]) -> float:
-        """Probability shot misses target (wide/post)."""
-        return 0.10  # 10% off target
-    
-    def p_pass_complete(self, p: Player, target: tuple[float, float], power: float, 
-                         receiver_id: str | None = None) -> float:
-        """Probability pass is completed to intended receiver."""
+            rel_x = o.x - p.x
+            rel_y = o.y - p.y
+            along = rel_x * ux + rel_y * uy
+            # Only defenders between the shooter and the goal line matter.
+            if along <= 0.0 or along >= lane_len:
+                continue
+            offset = math.hypot(rel_x - along * ux, rel_y - along * uy)
+            if offset >= SHOT_BLOCK_REACH:
+                continue
+            if not o.can_act:
+                continue  # frozen this tick: he cannot get in the way
+            # He only has to cover the part of the offset his body does not.
+            excess = max(0.0, offset - SHOT_BLOCK_BODY_RADIUS)
+            t_def = excess / MAX_RUN_SPEED
+            t_ball = along / speed0
+            if t_def > t_ball:
+                continue  # the ball is past him before he can get there
+            slack = t_ball - t_def
+            timing = (
+                SHOT_BLOCK_SHARE_SETTLED
+                if slack >= SHOT_BLOCK_T_SETTLED
+                else SHOT_BLOCK_SHARE_LATE
+                + (slack / SHOT_BLOCK_T_SETTLED)
+                * (SHOT_BLOCK_SHARE_SETTLED - SHOT_BLOCK_SHARE_LATE)
+            )
+            centrality = geom.clamp(1.0 - excess / span, 0.0, 1.0)
+            share = geom.clamp(centrality * timing, 0.0, 1.0)
+            if share > 0.0:
+                survive *= 1.0 - share
+        return geom.clamp(1.0 - survive, 0.0, 1.0)
+
+    def p_shot_wide_given_not_blocked(
+        self, p: Player, target: tuple[float, float], power: float
+    ) -> float:
+        """P(the shot misses the goal frame entirely | not blocked).
+
+        Modelled as lateral aiming error rather than a "is the target nicely
+        framed" lookup. A struck ball lands at the aim point plus a lateral
+        error whose spread grows with range, so what matters is how much of
+        the 6 m frame the error distribution still covers:
+
+            sigma = SHOT_ERROR_BASE + SHOT_ERROR_PER_M * range
+            P(on frame) = Phi((GOAL_HIGH_Y - aim) / sigma)
+                        - Phi((GOAL_LOW_Y  - aim) / sigma)
+
+        This is what makes a post-inset aim a genuinely riskier choice than a
+        slightly-less-far-post one, and it is why the trade-off against the
+        keeper model is real: a central aim is easier to keep on frame but
+        much easier for him to cover.
+        """
+        sigma = SHOT_ERROR_BASE + SHOT_ERROR_PER_M * max(OPP_GOAL_X - p.x, 0.0)
+        sigma = max(sigma, 1e-3)
+        p_on = _normal_cdf((GOAL_HIGH_Y - target[1]) / sigma) - _normal_cdf(
+            (GOAL_LOW_Y - target[1]) / sigma
+        )
+        return 1.0 - geom.clamp(p_on, SHOT_ON_TARGET_FLOOR, 1.0)
+
+    def shot_outcome_distribution(
+        self, p: Player, target: tuple[float, float], power: float
+    ) -> dict[str, float]:
+        """The four mutually exclusive, exhaustive shot outcomes.
+
+        This is the single place the shot distribution is built, and the only
+        place the factors are combined. It exists because the four terms used
+        to be mixed in scope: `p_shot_goal` was marginal (it already folded in
+        P(not blocked) and P(on frame)) while `p_shot_wide` and `p_shot_saved`
+        were conditional on getting through. Summing those gave 1.96 on a
+        shot through a three-man wall, and `ev_shot` hid the error by dividing
+        by the total -- which silently re-weighted the outcome *values* as
+        well as the probabilities, so a blocked shot was credited with part of
+        a goal chance that could not happen.
+
+        The chain is now:
+
+            blocked                                        = b
+            wide  = (1-b) * wide|clear                      miss the frame
+            on    = (1-b) * on|clear                        reach the frame
+            goal  = on     * P(goal | on)                   beats the keeper
+            saved = on     * (1 - P(goal | on))             he gets a hand to it
+
+        so blocked + wide + saved + goal == 1 exactly, by construction, for
+        every target and every power.
+        """
+        b = self._shot_block_probability(p, target, power)
+        clear = 1.0 - b
+        wide_given_clear = self.p_shot_wide_given_not_blocked(p, target, power)
+        on_given_clear = 1.0 - wide_given_clear
+        p_goal_given_on = self.p_shot_goal_given_on_target(p, target, power)
+        on = clear * on_given_clear
+        goal = on * p_goal_given_on
+        return {
+            "blocked": b,
+            "wide": clear * wide_given_clear,
+            "saved": on * (1.0 - p_goal_given_on),
+            "goal": goal,
+        }
+
+    def p_shot_blocked(self, p: Player, target: tuple[float, float], power: float) -> float:
+        return self.shot_outcome_distribution(p, target, power)["blocked"]
+
+    def p_shot_wide(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """P(miss the frame entirely) -- marginal, so it excludes blocked shots."""
+        return self.shot_outcome_distribution(p, target, power)["wide"]
+
+    def p_shot_on_target(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """P(reach the frame) -- marginal, so it excludes blocked shots.
+
+        Equals saved + goal: everything that got through and was not stopped in
+        the air.
+        """
+        d = self.shot_outcome_distribution(p, target, power)
+        return d["saved"] + d["goal"]
+
+    def p_shot_saved(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """P(the keeper gets a hand to it) -- marginal."""
+        return self.shot_outcome_distribution(p, target, power)["saved"]
+
+    def p_shot_goal(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """P(goal) for a shot at `target` with `power`.
+
+        The *marginal* goal probability, obtained by composing the exclusive
+        chain block -> on-frame -> beats-keeper. It is deliberately not the
+        old binary: a shot that "beats the keeper" from 20 m through a wall of
+        defenders still has a small goal probability, and a point-blank one
+        with the keeper out of position is close to certain.
+        """
+        return self.shot_outcome_distribution(p, target, power)["goal"]
+
+    def p_shot_goal_given_on_target(
+        self, p: Player, target: tuple[float, float], power: float
+    ) -> float:
+        """P(goal | not blocked, on frame) -- the keeper model.
+
+        The engine gives a keeper at most GK_LATERAL_REACH of lateral reach,
+        and he spends it *while the ball is in flight*. So the decisive number
+        is the goalmouth left over after his shift:
+
+            flight = distance / kick speed
+            shift  = MAX_RUN_SPEED * flight
+            gap    = |gky - target_y| - shift
+
+        gap <= GK_DIVE_LATERAL_MIN -> standing catch, the shot is wasted.
+        gap >= GK_LATERAL_REACH    -> out of dive range, it is a goal.
+        In between it is a dive: a real but not certain chance. A keeper who
+        is dragged out of his own defensive fifth (gk.x < GK_AREA_START)
+        cannot auto-handle at all.
+        """
+        gk = self.state.goalkeeper_them()
+        if gk is None or gk.x < 0.0:
+            return 0.0  # unknown keeper: never assume a free goal
+        if gk.x < GK_AREA_START:
+            return SHOT_GOAL_GK_OUT  # cannot handle from outside his own fifth
+        speed0 = self._kick_speed(power)
+        dist = max(OPP_GOAL_X - p.x, 0.0)
+        flight = dist / max(speed0, 1.0)
+        shift = MAX_RUN_SPEED * flight
+        gap = abs(gk.y - target[1]) - shift
+        if gap <= GK_DIVE_LATERAL_MIN:
+            return SHOT_GOAL_STANDING_CATCH
+        if gap >= GK_LATERAL_REACH:
+            return SHOT_GOAL_CLEAN
+        # A dive: chance rises smoothly from "standing catch" to "clean".
+        span = GK_LATERAL_REACH - GK_DIVE_LATERAL_MIN
+        t = (gap - GK_DIVE_LATERAL_MIN) / span
+        return SHOT_GOAL_STANDING_CATCH + t * (SHOT_GOAL_CLEAN - SHOT_GOAL_STANDING_CATCH)
+
+    # --- PASS MODEL --------------------------------------------------------
+    #
+    # A pass is not "short = safe, long = risky". The engine releases every
+    # pass at >= KICK_MIN_SPEED, and the ball must decay to a controllable
+    # speed before anyone can touch it, so a pass always rolls a minimum
+    # distance first (MIN_PASS_TRAVEL, ~15.6 m). The real question is a
+    # three-way race at the *collection point* -- where the pass first stops
+    # being too fast to control:
+    #
+    #     t_ball = when the ball is finally controllable there
+    #     t_us   = when our receiver can run there
+    #     t_them = when the nearest opponent can run there
+    #
+    # We keep the ball if our receiver arrives first, with the margin between
+    # the two ETAs deciding how safe the pass is. This is the same loose-ball
+    # lifecycle the receiver-movement code was built for.
+
+    def pass_plan(
+        self, p: Player, target: tuple[float, float], power: float | None = None
+    ) -> tuple[float, float, float, float, float]:
+        """Plan a pass: (power, collect_x, collect_y, t_ball, overshoot).
+
+        A pass is only as good as the spot the ball actually *stops* at, and in
+        this engine that is set almost entirely by the power: every pass leaves
+        at >= KICK_MIN_SPEED and must decay to a controllable speed, so the
+        ball rolls 15.6 m at minimum and ~35 m at power 0.7. When no power is
+        supplied we solve for the one that lands on the intended spot with
+        `speed_for_travel`; when the spot is closer than the minimum travel no
+        such power exists, so we use the slowest kick and report how far the
+        ball overshoots past the intended receiver.
+        """
         dist = geom.distance(p.x, p.y, target[0], target[1])
-        
-        # Base completion rate decays with distance
-        if dist <= 10.0:
-            base = 0.85
-        elif dist <= 20.0:
-            base = 0.65
-        elif dist <= 30.0:
-            base = 0.45
-        else:
-            base = 0.25
-        
-        # Receiver quality
+        if power is None:
+            speed0 = speed_for_travel(dist)
+            power = geom.clamp(
+                (speed0 - KICK_MIN_SPEED) / (KICK_MAX_SPEED - KICK_MIN_SPEED),
+                0.0,
+                1.0,
+            )
+        cx, cy, _, _ = pass_collection_point(p.x, p.y, target[0], target[1], power)
+        t_ball = self._time_to_control(self._kick_speed(power))
+        overshoot = geom.distance(cx, cy, target[0], target[1])
+        return power, cx, cy, t_ball, overshoot
+
+    def pass_collection_time(
+        self, p: Player, target: tuple[float, float], power: float | None = None
+    ) -> tuple[float, float, float]:
+        """(collection_x, collection_y, t_ball) for a pass aimed at `target`."""
+        _, cx, cy, t_ball, _ = self.pass_plan(p, target, power)
+        return cx, cy, t_ball
+
+    def p_pass_complete(
+        self,
+        p: Player,
+        target: tuple[float, float],
+        power: float | None = None,
+        receiver_id: str | None = None,
+    ) -> float:
+        """P(the pass is completed by our receiver) from the loose-ball race.
+
+        The receiver is whoever we intended (or the nearest outfielder). Both
+        our receiver and the nearest opponent are raced to the *collection
+        point* -- where the ball first becomes slow enough to control -- and
+        not to the aim point, because in this engine those are different
+        places whenever the pass is short.
+
+        The race is on raw arrival times, which is the physically meaningful
+        comparison: whoever reaches the ball first is standing there when it
+        slows, and an opponent who gets there early simply waits for it. The
+        margin between the two ETAs is what decides it, through a logistic so
+        a dead heat is a coin flip and a clear margin is a completed pass.
+
+        A pass that overshoots its intended receiver is additionally
+        penalised: the ball is stopping somewhere nobody planned for, which is
+        exactly the loose-ball turnover the receiver-movement code exists to
+        avoid.
+        """
+        _, cx, cy, _t_ball, overshoot = self.pass_plan(p, target, power)
+
+        receiver = None
         if receiver_id:
-            receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
-            if receiver and receiver.can_act:
-                base *= 1.1
-            else:
-                base *= 0.5
-        
-        # Lane clearance
-        opp_pos = [(o.x, o.y) for o in self.state.outfield_them()]
-        if not pass_lane_clear(p.x, p.y, target[0], target[1], 
-                               [(o.x, o.y) for o in self.state.outfield_them()], margin=0.12):
-            base *= 0.4
-        
-        return min(1.0, max(0.0, base))
-    
-    def p_pass_intercepted(self, p: Player, target: tuple[float, float]) -> float:
-        return 1.0 - self.p_pass_complete(p, target, 0.5)
-    
+            receiver = next(
+                (pl for pl in self.state.outfield_us() if pl.id == receiver_id), None
+            )
+        if receiver is None:
+            cands = [pl for pl in self.state.outfield_us() if pl.can_act]
+            if not cands:
+                return 0.0
+            receiver = min(cands, key=lambda pl: geom.distance(pl.x, pl.y, cx, cy))
+        if not receiver.can_act:
+            return 0.0
+
+        t_us = self._run_eta(receiver.x, receiver.y, cx, cy)
+        t_them = self._nearest_opponent_eta(cx, cy)
+        if t_them == float("inf"):
+            win = 1.0
+        else:
+            margin = t_them - t_us  # positive: we arrive first
+            win = 1.0 / (1.0 + math.exp(-margin / PASS_MARGIN_SCALE))
+
+        # The ball stopping somewhere other than where we aimed is a sign the
+        # pass was misjudged; the further it is from the plan, the worse.
+        if overshoot > PASS_OVERSHOLE_FREE:
+            penalty = geom.clamp(
+                1.0
+                - (overshoot - PASS_OVERSHOLE_FREE)
+                / (PASS_OVERSHOLE_FATAL - PASS_OVERSHOLE_FREE),
+                0.0,
+                1.0,
+            )
+            win *= penalty
+
+        return geom.clamp(win, 0.0, 1.0)
+
+    def p_pass_intercepted(
+        self, p: Player, target: tuple[float, float], power: float | None = None
+    ) -> float:
+        """P(an opponent collects the pass) = 1 - P(our receiver does)."""
+        return 1.0 - self.p_pass_complete(p, target, power)
+
     def p_carry_success(self, p: Player, tx: float, ty: float) -> float:
-        """Probability carry maintains possession."""
-        # Check if path is contested
-        opp_pos = [(o.x, o.y) for o in self.state.outfield_them()]
-        contested = any(geom.distance(o.x, o.y, tx, ty) < 4.0 for o in self.state.outfield_them())
-        
-        if self.state.ball.possessing_team == "us" and self.state.ball.possessing_player == p.id:
-            return 0.85 if not contested else 0.65
-        return 0.95  # Off-ball movement always succeeds
-    
+        """P(the carry keeps the ball) -- contested ground lowers it.
+
+        The keeper counts as an obstacle, and a stricter one than the outfield
+        radius. He is not in `outfield_them()`, so he was previously invisible
+        here: with the carrier at (52, 20) and the keeper set at (58, 20), the
+        dribble target (58.5, 18.2) sat 1.8 m from a stationary goalkeeper and
+        still scored 0.85 "uncontested". The carrier was then told to run
+        straight into him -- carry EV 6.2 against a shot EV of -1.0 -- and that
+        is why the striker stands 8 m from an open goal doing nothing.
+
+        A carry that ends inside GK_LATERAL_REACH is not a contest, it is a
+        giveaway: the engine collects any loose ball whose swept path passes
+        within that distance.
+
+        Beyond his reach the danger decays smoothly out to
+        CARRY_KEEPER_RADIUS rather than at a flat 4 m, because the goalkeeper
+        is the single most dangerous obstacle on the pitch for a dribbler and a
+        step's worth of daylight is the difference between a cutback and a
+        gift. A binary 4 m test put 1.8 m and 3.9 m on the same footing, which
+        still left the dribble into a set keeper scoring 0.65.
+        """
+        if self.ball.possessing_team != "us" or self.ball.possessing_player != p.id:
+            return 0.95
+        keeper = self.state.goalkeeper_them()
+        if keeper is not None:
+            keeper_gap = geom.distance(keeper.x, keeper.y, tx, ty)
+            if keeper_gap <= GK_LATERAL_REACH:
+                return 0.05
+            if keeper_gap < CARRY_KEEPER_RADIUS:
+                decay = (keeper_gap - GK_LATERAL_REACH) / (
+                    CARRY_KEEPER_RADIUS - GK_LATERAL_REACH
+                )
+                base = 0.05 + (0.85 - 0.05) * geom.clamp(decay, 0.0, 1.0)
+            else:
+                base = 0.85
+        else:
+            base = 0.85
+        contested = any(
+            geom.distance(o.x, o.y, tx, ty) < 4.0 for o in self.state.outfield_them()
+        )
+        return base * (0.65 if contested else 1.0)
+
     def p_carry_tackled(self, p: Player, tx: float, ty: float) -> float:
         return 1.0 - self.p_carry_success(p, tx, ty)
-    
+
     def p_tackle_success(self, tackler: Player, ball_holder: Player) -> float:
-        """Probability tackle wins the ball."""
         dist = geom.distance(tackler.x, tackler.y, ball_holder.x, ball_holder.y)
         if dist <= TACKLE_CLOSE:
             return 0.85
-        elif dist <= TACKLE_MAX:
+        if dist <= TACKLE_MAX:
             return 0.60
         return 0.0
-    
-    # --- Value Models ---
-    
+
+    # --- VALUE MODELS ------------------------------------------------------
+
     def value_goal(self) -> float:
         return EV_GOAL_VALUE
-    
+
     def value_shot_saved(self) -> float:
         return EV_SHOT_ON_TARGET_SAVED
-    
+
     def value_shot_blocked(self) -> float:
         return EV_SHOT_BLOCKED
-    
+
     def value_shot_wide(self) -> float:
         return EV_SHOT_WIDE
-    
+
     def value_pass_completed(self, p: Player, target: tuple[float, float]) -> float:
-        """Value of a completed pass at target."""
-        # Base value: forward progress toward goal
-        progress = target[0] - self.state.ball.x if hasattr(self.state.ball, 'possession_x') else target[0] - self.state.ball.x
-        base = EV_PASS_COMPLETED + max(0, progress) * 0.5
-        
-        # Bonus for entering dangerous zones
-        if target[0] > 40.0:  # Final third
-            base += 5.0
-        if target[0] > 48.0:  # Box
-            base += 10.0
+        """What a completed pass is worth: the ground it wins, plus a small
+        amount for having kept the ball at all.
+
+        The progress term is signed on purpose. With `max(0, progress)` a pass
+        from the box back to the halfway line scored exactly the same as a
+        square pass, so the cheapest-looking option in the whole decision was
+        always to roll it sideways or backwards, and the shot -- however good --
+        never got chosen. Losing ground is priced more heavily than winning it.
+        """
+        gain = target[0] - self.ball.x
+        if gain >= 0.0:
+            base = EV_PASS_COMPLETED + gain * EV_PASS_PROGRESS_PER_M
+        else:
+            base = EV_PASS_COMPLETED + gain * EV_PASS_REGRESSION_PER_M
+        # Landing the ball in a part of the pitch that threatens the goal is
+        # worth more than the metres alone: from the final third we can shoot
+        # this pass sequence out, from our own half we cannot.
+        #
+        # These two are the only levers that actually move the ball into the
+        # box, and a traced engine match showed why they need to be strong: the
+        # carrier was inside the 11 m box on 1 tick out of 276 possession ticks
+        # (0.4%) and the team took no shots at all. Every shot this team does
+        # take converts, so the whole game is won or lost on how often the ball
+        # gets here, not on how good the shot is once it is taken.
+        if target[0] > 40.0:
+            base += EV_PASS_FINAL_THIRD_BONUS
+        if target[0] > 48.0:
+            base += EV_PASS_BOX_BONUS
         return base
-    
+
     def value_pass_intercepted(self, target: tuple[float, float]) -> float:
-        # More dangerous if intercepted high up the pitch
         if target[0] > 40.0:
             return EV_LOSS_OF_POSSESSION
-        elif target[0] > 20.0:
+        if target[0] > 20.0:
             return EV_LOSS_OF_POSSESSION / 2
         return EV_LOSS_OF_POSSESSION_SAFE
-    
+
     def value_carry_progress(self, p: Player, tx: float) -> float:
-        """Value of carrying forward."""
         gain = tx - p.x
         if gain <= 0:
             return EV_CARRY_HOLD
-        
-        # Base value from forward progress
         progress = min(gain / CARRY_FULL_GAIN, 1.0)
         base = EV_CARRY_HOLD + (EV_CARRY_PROGRESS - EV_CARRY_HOLD) * progress
-        
-        # Bonus for reaching shooting range
         if OPP_GOAL_X - tx <= CARRY_SHOOT_RANGE:
             base += EV_CARRY_PROGRESS * 0.5
         return base
-    
+
     def value_carry_loss(self, p: Player) -> float:
-        # More dangerous if lost high up the pitch
         if p.x > 40.0:
             return EV_LOSS_OF_POSSESSION
-        elif p.x > 20.0:
+        if p.x > 20.0:
             return EV_LOSS_OF_POSSESSION / 2
         return EV_LOSS_OF_POSSESSION_SAFE
-    
-    # --- Action EV Computations ---
-    
+
+    # --- ACTION EV ---------------------------------------------------------
+
+    def p_shot_forces_dive(self, p: Player, target: tuple[float, float], power: float) -> float:
+        """P(the keeper has to dive), given the shot is not blocked.
+
+        A dive (0.8 m to 1.65 m of lateral reach) is the outcome that hands us
+        something back: the keeper stays grounded holding the ball for
+        GK_GROUNDED_SECONDS and cannot distribute for the whole of it. It is
+        also the reason a shot from 8 m against a set keeper is still worth
+        taking, even though its P(goal) is about 1%. `ev_shot` prices the dive
+        explicitly instead of burying it in a made-up "shoot on sight" bonus.
+        """
+        keeper = self.state.goalkeeper_them()
+        if keeper is None or keeper.x < GK_AREA_START:
+            return 0.0
+        p_given_on = self.p_shot_goal_given_on_target(p, target, power)
+        # STANDING_CATCH -> CLEAN is the whole dive band; CLEAN means out of
+        # reach, i.e. a goal, so the dive band is the part just above the
+        # standing catch.
+        clean = SHOT_GOAL_CLEAN
+        floor = SHOT_GOAL_STANDING_CATCH
+        if clean <= floor:
+            return 0.0
+        frac = geom.clamp((p_given_on - floor) / (clean - floor), 0.0, 1.0)
+        return frac
+
     def ev_shot(self, p: Player, target: tuple[float, float], power: float) -> float:
-        """Expected value of a shot."""
-        p_goal = self.p_shot_goal(p, target, power)
-        p_saved = self.p_shot_saved(p, target, power)
-        p_blocked = self.p_shot_blocked(p, target)
-        p_wide = self.p_shot_wide(p, target)
-        
-        # Normalize probabilities
-        total = p_goal + p_saved + p_blocked + p_wide
-        p_goal /= total
-        p_saved /= total
-        p_blocked /= total
-        p_wide /= total
-        
-        ev = (p_goal * self.value_goal() +
-              p_saved * self.value_shot_saved() +
-              p_blocked * self.value_shot_blocked() +
-              p_wide * self.value_shot_wide())
-        return ev
-    
-    def ev_pass(self, p: Player, target: tuple[float, float], power: float,
-                receiver_id: str | None = None, multiplier: float = 1.0) -> float:
-        """Expected value of a pass."""
-        p_complete = self.p_pass_complete(p, target, power)
-        p_intercepted = self.p_pass_intercepted(p, target)
-        
-        # Normalize
-        total = p_complete + p_intercepted
-        p_complete /= total
-        p_intercepted /= total
-        
+        """EV of a shot: the exclusive chain weighted by outcome values.
+
+        Because block/wide/saved/goal are composed from one distribution that
+        sums to 1, this needs no ad-hoc renormalisation -- a blocked shot is
+        worth exactly EV_SHOT_BLOCKED times P(block), and so on.
+
+        Two engine facts make a failed shot less bad than a turnover, and both
+        are credited here rather than assumed:
+
+        * goal kicks do not exist, so a miss rebounds off the goal-line wall
+          and the ball is still loose for us to collect (see EV_SHOT_WIDE);
+        * a dive leaves the keeper grounded for GK_GROUNDED_SECONDS, which is a
+          free possession we could not otherwise force, so P(dive) is credited
+          with EV_SHOT_SECOND_BALL.
+
+        There is no division by the total here. The distribution is exclusive
+        and sums to 1 on its own, so renormalising would be a no-op at best; it
+        was previously masking a real error, because the four terms were a mix
+        of marginal and conditional and summed to nearly 2 through a wall.
+        """
+        d = self.shot_outcome_distribution(p, target, power)
+        # A dive needs the ball to actually reach the frame, and the marginal
+        # "reaches the frame" probability is saved + goal.
+        dive = self.p_shot_forces_dive(p, target, power) * (d["saved"] + d["goal"])
+        return (
+            d["blocked"] * self.value_shot_blocked()
+            + d["wide"] * self.value_shot_wide()
+            + d["saved"] * (self.value_shot_saved() + EV_SHOT_SECOND_BALL * dive)
+            + d["goal"] * self.value_goal()
+        )
+
+    def ev_pass(
+        self,
+        p: Player,
+        target: tuple[float, float],
+        power: float,
+        receiver_id: str | None = None,
+        multiplier: float = 1.0,
+    ) -> float:
+        p_complete = self.p_pass_complete(p, target, power, receiver_id)
+        p_intercepted = 1.0 - p_complete
         value_complete = self.value_pass_completed(p, target)
         value_intercepted = self.value_pass_intercepted(target)
-        
-        ev = multiplier * (p_complete * value_complete + p_intercepted * self.value_pass_intercepted(target))
-        return ev
-    
+        return multiplier * (
+            p_complete * value_complete + p_intercepted * value_intercepted
+        )
+
     def ev_carry(self, p: Player, tx: float, ty: float) -> float:
-        """Expected value of a carry/dribble."""
         p_success = self.p_carry_success(p, tx, ty)
-        p_loss = self.p_carry_tackled(p, tx, ty)
-        
-        # Normalize
-        total = p_success + p_loss
-        p_success /= total
-        p_loss /= total
-        
-        value_success = self.value_carry_progress(p, tx)
-        value_loss = self.value_carry_loss(p)
-        
-        return p_success * value_success + p_loss * value_loss
-    
-    def ev_through_ball(self, p: Player, target: tuple[float, float], power: float,
-                         receiver_id: str) -> float:
-        """Expected value of a through ball."""
-        base_ev = self.ev_pass(p, target, 0.5, receiver_id, EV_THROUGH_BALL_MULTIPLIER)
-        
-        # Bonus: if completed, receiver is in dangerous position for shot
-        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
-        if receiver:
-            dist_to_goal = OPP_GOAL_X - target[0]
-            if dist_to_goal <= 15.0:
-                # High chance of immediate shot
-                base_ev *= 1.3
-        return base_ev
-    
-    def ev_cutback(self, p: Player, target: tuple[float, float], power: float,
-                    receiver_id: str) -> float:
-        base_ev = self.ev_pass(p, target, power, receiver_id, EV_CUTBACK_MULTIPLIER)
-        
-        # Cutbacks create high-quality shot opportunities
-        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
-        if receiver and target[0] > 35.0:
-            base_ev *= EV_CUTBACK_MULTIPLIER
-        return base_ev
-    
-    def ev_cross(self, p: Player, target: tuple[float, float], power: float,
-                  receiver_id: str) -> float:
-        base_ev = self.ev_pass(p, target, power, receiver_id, EV_CROSS_MULTIPLIER)
-        
-        # Crosses target box area
+        p_loss = 1.0 - p_success
+        return p_success * self.value_carry_progress(p, tx) + p_loss * self.value_carry_loss(p)
+
+    def ev_through_ball(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
+        base = self.ev_pass(p, target, power, receiver_id, EV_THROUGH_BALL_MULTIPLIER)
+        if OPP_GOAL_X - target[0] <= 15.0:
+            base *= 1.3
+        return base
+
+    def ev_cutback(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
+        base = self.ev_pass(p, target, power, receiver_id, EV_CUTBACK_MULTIPLIER)
+        if target[0] > 35.0:
+            base *= EV_CUTBACK_SHOT_BONUS
+        return base
+
+    def ev_cross(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
+        base = self.ev_pass(p, target, power, receiver_id, EV_CROSS_MULTIPLIER)
         if target[0] > 42.0:
-            base_ev *= EV_CROSS_MULTIPLIER
-        return base_ev
-    
-    def ev_cutback(self, p: Player, target: tuple[float, float], power: float,
-                    receiver_id: str) -> float:
-        base_ev = self.ev_pass(p, target, power, receiver_id, EV_CUTBACK_MULTIPLIER)
-        
-        # Cutbacks create high-quality shot opportunities at edge of box
-        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
-        if receiver and target[0] > 35.0:
-            base_ev *= EV_CUTBACK_MULTIPLIER
-        return base_ev
-    
-    def ev_wall_pass(self, p: Player, target: tuple[float, float], power: float,
-                      receiver_id: str) -> float:
-        # Wall pass has two segments: passer->wall, wall->receiver
-        p_leg1 = self.p_pass_complete(p, target, power)
-        # Second leg from wall to receiver
-        receiver = next((pl for pl in self.state.outfield_us() if pl.id == receiver_id), None)
-        p_leg2 = 0.75  # Wall pass second leg typically cleaner
+            base *= EV_CROSS_HEADER_BONUS
+        return base
+
+    def ev_wall_pass(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
+        p_leg1 = self.p_pass_complete(p, target, power, receiver_id)
+        p_leg2 = 0.75
         p_complete = p_leg1 * p_leg2
         p_intercepted = 1.0 - p_complete
-        
         value_complete = self.value_pass_completed(p, target) * EV_WALL_PASS_MULTIPLIER
         return p_complete * value_complete + p_intercepted * self.value_pass_intercepted(target)
-    
-    def ev_switch_play(self, p: Player, target: tuple[float, float], power: float,
-                        receiver_id: str) -> float:
+
+    def ev_switch_play(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
         return self.ev_pass(p, target, power, receiver_id, EV_SWITCH_MULTIPLIER)
-    
-    def ev_pullback(self, p: Player, target: tuple[float, float], power: float,
-                     receiver_id: str) -> float:
+
+    def ev_pullback(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
         return self.ev_pass(p, target, power, receiver_id, 1.2)
-    
-    def ev_onetwo(self, p: Player, target: tuple[float, float], power: float,
-                   receiver_id: str) -> float:
-        # One-two is two quick passes
-        p_complete = self.p_pass_complete(p, target, power) ** 2  # Two passes
+
+    def ev_onetwo(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
+        p_complete = self.p_pass_complete(p, target, power, receiver_id) ** 2
         return p_complete * self.value_pass_completed(p, target) * 1.3
-    
-    def ev_third_man(self, p: Player, target: tuple[float, float], power: float,
-                      receiver_id: str) -> float:
+
+    def ev_third_man(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
         return self.ev_pass(p, target, power, receiver_id, 1.2)
-    
-    def ev_wall_pass(self, p: Player, target: tuple[float, float], power: float,
-                      receiver_id: str) -> float:
-        # Wall pass: two segments
-        p_leg1 = self.p_pass_complete(p, target, power)
-        p_leg2 = 0.8
-        p_complete = p_leg1 * p_leg2
-        p_intercepted = 1.0 - p_complete
-        value_complete = self.value_pass_completed(p, target) * EV_WALL_PASS_MULTIPLIER
-        return p_complete * value_complete + p_intercepted * self.value_pass_intercepted(target)
-    
-    def ev_gk_bypass(self, p: Player, target: tuple[float, float], power: float,
-                      receiver_id: str) -> float:
+
+    def ev_gk_bypass(
+        self, p: Player, target: tuple[float, float], power: float, receiver_id: str
+    ) -> float:
         return self.ev_pass(p, target, power, receiver_id, 1.2)
 
 # --- End Expected Value Calculator ------------------------------------------
@@ -551,6 +1090,9 @@ def loose_ball_meeting_point(
 MAX_COLLECTABLE_PASS = ball_travel_before_control(KICK_MIN_SPEED) + 1.0
 
 from .physics import (
+    GK_AREA_START,
+    GK_DIVE_LATERAL_MIN,
+    GK_LATERAL_REACH,
     MIN_PASS_TRAVEL,
     pass_collection_point,
     pass_lane_clear,
@@ -1303,6 +1845,19 @@ class PolicyController:
         gky = gk.y if gk else 20.0
         
         candidates: list[tuple[float, PlayerIntent, str]] = []  # (value, intent, reason)
+        # One calculator for every candidate below. Every value on this board is
+        # a goal-equivalent expected value computed by this class, so shots,
+        # passes, carries and special balls are all on one scale and can be
+        # compared directly.
+        #
+        # This board used to mix real numbers with a set of made-up constants
+        # (cross 25, cutback 35, through ball 40, wall pass 30, pullback 28,
+        # one-two 22, switch 20, safe pass 10). Every one of them was larger
+        # than any honest shot, and a shot from 8 m against a set keeper is
+        # worth about -1. So the striker stood 8 m from an open goal and chose
+        # a through ball instead. That single mismatch is the direct cause of
+        # the 1-shot-per-match season.
+        evcalc = ExpectedValueCalculator(inp)
         
 # ---- 1. SHOOT ----
         # Compute shot directly using pick_shot_target (bypasses _shot_choice GK HELL blocking)
@@ -1311,54 +1866,37 @@ class PolicyController:
         gky = gk.y if gk else 20.0
         dist_goal = OPP_GOAL_X - p.x
         max_dist = shooting_distance(self._cfg(inp, "shooting_threshold", 0.5))
-        
-        # Use natural striker check (based on player ID) to prevent defenders from shooting
-        is_nat_striker = _is_natural_striker(inp, p)
-        
+
+        # ---- 1. SHOOT: value the real shot, geometrically ----
+        # The decision is made by the decomposed outcome distribution
+        # (blocked / wide / saved / goal) of the best shot available from
+        # here, through `ExpectedValueCalculator.ev_shot`. There is no
+        # nominal-position branch anywhere in it: a centre-back who has
+        # carried the ball to the same spot as a striker gets the same answer
+        # for the same picture, and both are told to pass if the shot is a
+        # standing catch.
         if dist_goal <= max_dist:
-            target = pick_shot_target(p.x, p.y, gkx, gky)
-            beats = shot_beats_keeper(p.x, p.y, gkx, gky, target.y, dist_goal, target.power)
-            # Only shoot if: (1) beats keeper, OR (2) natural striker inside box
-            inside_box = dist_goal <= 11.0
-            if not beats and not (is_nat_striker and inside_box):
-                shoot_value = 0.0  # Don't shoot
-            else:
-                # Base value: higher if beats keeper
-                base_value = 0.8 if beats else 0.15
-                # Floor for natural strikers inside the box, so shooting wins
-                # over recycling the ball. See IN_BOX_SHOT_FLOOR.
-                min_shoot_value = IN_BOX_SHOT_FLOOR if (is_nat_striker and inside_box) else 0.0
-                shoot_value = max(min_shoot_value, base_value * 100.0 - dist_goal * 0.4)
-                if shoot_value > 0:
-                    intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (target.x, target.y), target.power)
-                    candidates.append((shoot_value, intent, "shoot"))
+            (tx, ty), power = _shot_geometry_target(inp, p)
+            shot_ev = ExpectedValueCalculator(inp).ev_shot(p, (tx, ty), power)
+            if _shot_worth_taking(inp, p):
+                intent = PlayerIntent(
+                    p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y,
+                    "shoot", (tx, ty), power,
+                )
+                # The value *is* the EV, so shots compete with passes and
+                # carries on the same scale instead of a made-up constant.
+                candidates.append((shot_ev, intent, "shoot"))
         
         # ---- Shoot-on-sight in box: if we're in the box with any opening, shoot! ----
         # Low blocks leave small windows - don't wait for perfect lane.
-        if dist_goal <= max_dist:
-            inside_box = dist_goal <= 11.0
-            opp_pos = [(o.x, o.y) for o in state.outfield_them()]
-            open_angle = shot_open_angle(p.x, p.y, opp_pos)
-            # This was gated on is_near_wall(margin=4.0), which despite the name
-            # is a *pitch boundary* test -- wall.is_near_wall is
-            # `x <= m or x >= L - m or y <= m or y >= W - m`. So the rule only
-            # ever fired for a player hugging a touchline or the goal line, and
-            # never for a central attacker in the box: the case the comment
-            # above describes. Measured with one non-striker carrier and the
-            # same three markers, only the position varied, and it was
-            # inverted -- (52,20), 8 m out with 0.24 rad of goalmouth showing,
-            # got no shot at all, while (50,4), further out with a worse 0.17,
-            # shot for 45.0. Gate on the box, and keep the boundary case so the
-            # extra trigger the old gate accidentally provided is not silently
-            # dropped.
-            if inside_box or is_near_wall(p.x, p.y, margin=4.0):
-                angle_limit = 0.10 if inside_box else 0.22
-                if open_angle >= angle_limit:
-                    power = 0.92 if inside_box else 0.8
-                    shoot_value = 45.0
-                    intent = PlayerIntent(p.id, p.x, p.y, 0.4, target.x, target.y, "shoot", (target.x, target.y), power)
-                    candidates.append((shoot_value, intent, "shoot"))
-        
+        # NOTE: the old "shoot-on-sight in the box" trigger used to live here,
+        # worth a hardcoded 45.0 and gated on `open_angle` rather than on the
+        # shot's actual value. It duplicated the block above and, because 45.0
+        # was a constant, it outbid a genuine open goal from range no matter
+        # how hopeless that was. Inside the box is now handled where it
+        # belongs: `EV_SHOT_WORTH_IN_BOX` lowers the bar for close range, so a
+        # clear chance at 8 m is still taken while a covered one is not.
+
         # Wall shot: only when NOT in clear 1v1 (ball close to goal) and near wall
         # In 1v1, direct shot is better - wall shot adds unpredictability
         if (is_near_wall(p.x, p.y, margin=6.0) and 8.0 < dist_goal <= max_dist):
@@ -1370,22 +1908,32 @@ class PolicyController:
                 if pass_lane_clear(p.x, p.y, wx, wy, opp_pos, margin=0.12):
                     # Check second leg (wall to goal) is also clear
                     if pass_lane_clear(wx, wy, OPP_GOAL_X, wy, opp_pos, margin=0.12):
-                        shoot_value = 30.0
+                        # A wall shot is a real shot: value it through the same
+                        # distribution rather than a made-up 30.0, but award it
+                        # the unpredictability bonus it earns (two legs means a
+                        # deflection nobody can plan for, including the keeper).
+                        wall_ev = ExpectedValueCalculator(inp).ev_shot(
+                            p, (wx, wy), power
+                        ) * EV_WALL_SHOT_BONUS
+                        # A wall shot is a `shoot`, not its own action: the
+                        # engine only accepts none/pass/shoot/clear/tackle/
+                        # slap, so emitting "wall_shot" here put an illegal
+                        # action on the wire. The tactical difference is the
+                        # target -- the deflection spot rather than the goal --
+                        # which is what this intent carries.
                         intent = PlayerIntent(p.id, p.x, p.y, 0.4, wx, wy, "shoot", (wx, wy), power)
-                        candidates.append((shoot_value, intent, "wall_shot"))
-        
-        # ---- 1b. TEST THE KEEPER (long shot to pull keeper out / create rebound) ----
-        # Only strikers inside the box should test the keeper from distance
-        inside_box = dist_goal <= 11.0
-        is_finisher = _is_natural_striker(inp, p)
-        if _is_natural_striker(inp, p) and dist_goal <= max_dist * 1.5 and dist_goal > 15.0:
-            # Long shot to test keeper / create rebound (strikers only, and only if inside box or beats keeper)
-            test_target = pick_shot_target(p.x, p.y, gkx, gky)
-            test_beats = shot_beats_keeper(p.x, p.y, gkx, gky, test_target.y, dist_goal, test_target.power)
-            if test_beats or inside_box:
-                test_value = 12.0  # Higher value for testing keeper
-                intent = PlayerIntent(p.id, p.x, p.y, 0.4, OPP_GOAL_X, GOAL_CENTER_Y, "shoot", (test_target.x, test_target.y), test_target.power)
-                candidates.append((12.0, intent, "test_keeper"))
+                        candidates.append((wall_ev, intent, "wall_shot"))
+
+        # NOTE: the "test the keeper from range" branch used to live here. It
+        # was gated on `_is_natural_striker`, i.e. on the player's shirt rather
+        # than on the picture, and it fired from up to 1.5x the shooting range
+        # on a fixed value of 12.0. That is precisely the exception the shot
+        # model is meant to remove: from 15-25 m the only shots worth taking
+        # are the ones where the keeper has been dragged off his line, and
+        # `ev_shot` already scores those far higher than 12.0 while scoring the
+        # covered ones below zero. Long-range shooting is now available to
+        # whoever has the ball when -- and only when -- the geometry pays.
+
         
         # NOTE: a "rebound setup" candidate used to live here -- shoot at the
         # keeper's body from up to 20 m, worth 45.0, tying the best genuine shot
@@ -1407,7 +1955,10 @@ class PolicyController:
             dist = geom.distance(p.x, p.y, mx, my)
             reach_time = dist / (MAX_RUN_SPEED * 0.9)
             if reach_time < secs - 0.2:
-                second_ball_value = 35.0
+                # Running to a loose ball is a carry, so it is priced as one.
+                # It was a flat 35.0, which is above any honest shot and would
+                # win this board outright whenever it fired.
+                second_ball_value = evcalc.ev_carry(p, mx, my)
                 intent = PlayerIntent(p.id, mx, my, 1.0, mx, my, "none")
                 candidates.append((second_ball_value, intent, "second_ball"))
         
@@ -1417,7 +1968,7 @@ class PolicyController:
             if cross is not None:
                 tx, ty, power, receiver_id, collect_x, collect_y = cross
                 # Cross value depends on striker position and box occupancy
-                cross_value = 25.0  # Base value for creating chance
+                cross_value = evcalc.ev_cross(p, (tx, ty), power, receiver_id)
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
                 candidates.append((cross_value, intent, "cross"))
         
@@ -1425,56 +1976,56 @@ class PolicyController:
         cutback = self._cutback_choice(inp, p)
         if cutback is not None:
             # Cutback creates high-quality chance at edge of box
-            cutback_value = 35.0
             tx, ty, power, receiver_id, collect_x, collect_y = cutback
+            cutback_value = evcalc.ev_cutback(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((cutback_value, intent, "cutback"))
 
         # ---- 4. THROUGH BALL ----
         through = self._through_ball_choice(inp, p)
         if through is not None:
-            through_value = 40.0  # High value - breaks defensive line
             tx, ty, power, receiver_id, collect_x, collect_y = through
+            through_value = evcalc.ev_through_ball(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((through_value, intent, "through_ball"))
         
         # ---- 5. WALL PASS ----
         wall = self._wall_pass_choice(inp, p)
         if wall is not None:
-            wall_value = 30.0  # Good for breaking lines
             tx, ty, power, receiver_id, collect_x, collect_y = wall
+            wall_value = evcalc.ev_wall_pass(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((wall_value, intent, "wall_pass"))
         
         # ---- 6. SWITCH PLAY ----
         switch = self._switch_play_choice(inp, p)
         if switch is not None:
-            switch_value = 20.0  # Opens up weak side
             tx, ty, power, receiver_id, collect_x, collect_y = switch
+            switch_value = evcalc.ev_switch_play(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((switch_value, intent, "switch_play"))
         
         # ---- 7. PULL BACK ----
         pullback = self._pullback_choice(inp, p)
         if pullback is not None:
-            pullback_value = 28.0  # Creates shot from edge of box
             tx, ty, power, receiver_id, collect_x, collect_y = pullback
+            pullback_value = evcalc.ev_pullback(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((pullback_value, intent, "pullback"))
         
         # ---- 8. ONE-TWO (High Press Escape) ----
         onetwo = self._onetwo_choice(inp, p)
         if onetwo is not None:
-            onetwo_value = 22.0  # Escapes press, maintains possession
             tx, ty, power, receiver_id, collect_x, collect_y = onetwo
+            onetwo_value = evcalc.ev_onetwo(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((onetwo_value, intent, "high_press_onetwo"))
         
         # ---- 9. THIRD MAN RUN ----
         third = self._third_man_choice(inp, p)
         if third is not None:
-            third_value = 25.0  # Breaks press with forward run
             tx, ty, power, receiver_id, collect_x, collect_y = third
+            third_value = evcalc.ev_third_man(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((third_value, intent, "high_press_third_man"))
         
@@ -1482,8 +2033,8 @@ class PolicyController:
         if inp.roles.get(p.id) == "goalkeeper":
             bypass = self._gk_bypass_choice(inp, p)
             if bypass is not None:
-                bypass_value = 30.0  # Direct counter-attack
                 tx, ty, power, receiver_id, collect_x, collect_y = bypass
+                bypass_value = evcalc.ev_gk_bypass(p, (tx, ty), power, receiver_id)
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
                 candidates.append((bypass_value, intent, "high_press_gk_bypass"))
         
@@ -1503,21 +2054,41 @@ class PolicyController:
                 opp_pos = [(o.x, o.y) for o in state.outfield_them()]
                 if pass_lane_clear(p.x, p.y, wx, wy, opp_pos, margin=0.12):
                     if pass_lane_clear(wx, wy, OPP_GOAL_X, wy, opp_pos, margin=0.12):
-                        wall_shot_value = 28.0
+                        # Same distribution as a direct shot, plus the
+                        # unpredictability a two-leg wall shot earns: nobody,
+                        # keeper included, can plan where it ends up.
+                        wall_shot_value = ExpectedValueCalculator(inp).ev_shot(
+                            p, (wx, wy), power
+                        ) * EV_WALL_SHOT_BONUS
                         intent = PlayerIntent(p.id, p.x, p.y, 0.4, wx, wy, "shoot", (wx, wy), power)
                         candidates.append((wall_shot_value, intent, "wall_shot"))
         
         # ---- 14. CARRY (Dribble) ----
+        # Priced on the goal-equivalent scale with everything else, so a carry
+        # and a shot are directly comparable. `_carry_value` scored carries on
+        # its own CARRY_* scale, where a clean dribble into the box was worth
+        # CARRY_CLEAN_VALUE + CARRY_SHOOT_BONUS and quietly outbid a correctly
+        # priced shot -- so the striker would dribble at a keeper instead of
+        # shooting past him.
         tx, ty, speed = self._dribble_target(inp, p)
-        carry_value = self._carry_value(inp, p, tx, ty)
+        carry_value = evcalc.ev_carry(p, tx, ty)
         carry_intent = PlayerIntent(p.id, tx, ty, speed, tx, ty)
         candidates.append((carry_value, carry_intent, "carry_forward"))
         
         # ---- 15. SAFE PASS (last resort) ----
+        # Priced like every other candidate, on the same scale. This used to be
+        # a flat 10.0, which is worse than useless: it was high enough to beat a
+        # correctly-priced shot (8 m out is a standing catch at ~1% xG, so the
+        # honest shot EV is around -1) and it was *not* directional, so it won
+        # the ranking from a position 8 m from goal just as readily as from our
+        # own half. The team therefore rolled the ball sideways out of the box
+        # instead of shooting, which is the whole 35-shots-0-goals story.
         safe_pass = self._collectable_pass(inp, p)
         if safe_pass is not None:
             best, tx, ty, power, collect_x, collect_y = safe_pass
-            pass_value = 10.0  # Safe but low value
+            pass_value = ExpectedValueCalculator(inp).ev_pass(
+                p, (tx, ty), power, receiver_id=best
+            )
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power)
             candidates.append((pass_value, intent, f"safe_pass_to_{best}"))
         
@@ -1950,7 +2521,39 @@ class PolicyController:
         
         opponents = [q.pos for q in state.outfield_them() if q.x > p.x]
         inside_box = dist_goal <= 11.0
+        
+                # Wall shot first: it is only offered from near a wall, and it is a
+        # real shot, so it is valued through the same distribution.
+        if (is_near_wall(p.x, p.y, margin=6.0) and 8.0 < dist_goal <= max_dist):
+            wall_shot = wall_shot_target(p.x, p.y, gkx, gky)
+            if wall_shot:
+                wx, wy, power = wall_shot
+                opp_pos = [(o.x, o.y) for o in state.outfield_them()]
+                if pass_lane_clear(p.x, p.y, wx, wy, opp_pos, margin=0.12):
+                    if pass_lane_clear(wx, wy, OPP_GOAL_X, wy, opp_pos, margin=0.12):
+                        return (wx, wy, power)
 
+        # The direct shot, aimed at the corner the keeper cannot cover after
+        # his own shift, and judged by `ev_shot`. There is no "GK hell" branch
+        # any more and no nominal-position exception: a keeper sitting on the
+        # centre line already makes the shot a standing catch, so `_shot_ev`
+        # prices it below the bar on its own. Dragging him wide is what raises
+        # the value, and the attackers are pulled wide by the shape logic
+        # rather than by a special case in the shot code.
+        (tx, ty), power = _shot_geometry_target(inp, p)
+        if not _shot_worth_taking(inp, p):
+            return None
+
+        opponents = [(o.x, o.y) for o in state.outfield_them() if o.x > p.x]
+        lane_margin = 0.08 if inside_box else 0.15
+        if shot_lane_clear(p.x, p.y, tx, ty, opponents, margin=lane_margin):
+            return (tx, ty, power)
+
+        # A blocked lane is already priced into `ev_shot` (P(blocked) reduces
+        # P(goal)), so there is no need for a second "is the lane clear?"
+        # gate here: the shot is worth taking exactly when the distribution
+        # says so, lane included.
+        return (tx, ty, power)
         # Wall shot: only when NOT in clear 1v1 (ball close to goal) and near wall
         # In 1v1, direct shot is better - wall shot adds unpredictability
         if (is_near_wall(p.x, p.y, margin=6.0) and 8.0 < dist_goal <= max_dist):
