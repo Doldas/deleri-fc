@@ -12,7 +12,7 @@ on a canvas so you can watch a match against any team in the repository.
 ## Run it
 
 ```bash
-cd "My Teams/my-team-fc"
+cd "My Teams/deleri-fc"
 python3 training/lab/lab_server.py --port 5177
 ```
 
@@ -43,7 +43,7 @@ That can take a minute; later matches reuse the cached layer.
 A match job runs:
 
 ```bash
-football-team simulate --path "My Teams/my-team-fc" --games 1 \
+football-team simulate --path "My Teams/deleri-fc" --games 1 \
   --duration <seconds> --replay <tmp> [--opponent | --opponent-path] <team>
 ```
 (Note: `--opponent-path` points to `training/opponents/<team>`)

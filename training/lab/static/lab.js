@@ -99,7 +99,96 @@ const state = {
   poll: null,
 };
 
-// ---------------------------------------------------------------- geometry
+// Role abbreviations (2 letters) for display on players
+// Handles engine replay IDs like "team-a:gk", "team-a:d1", "team-b:f1" etc.
+const ROLE_ABBR = {
+  // Our team (team-a) replay IDs
+  "team-a:gk": "GK",
+  "team-a:d1": "DF",
+  "team-a:d2": "DF",
+  "team-a:f1": "ST",
+  "team-a:f2": "ST",
+  // Opponent team (team-b) replay IDs
+  "team-b:gk": "GK",
+  "team-b:d1": "DF",
+  "team-b:d2": "DF",
+  "team-b:f1": "ST",
+  "team-b:f2": "ST",
+  // Short IDs from observation (our team)
+  gk: "GK",
+  def: "DF",
+  cb: "DF",
+  df: "DF",
+  db: "DF",
+  dm: "DF",
+  left: "WL",
+  right: "WR",
+  lw: "WL",
+  rw: "WR",
+  wb: "WB",
+  lwb: "WL",
+  rwb: "WR",
+  st: "ST",
+  cf: "ST",
+  fw: "ST",
+  am: "AM",
+  cm: "CM",
+  lm: "LM",
+  rm: "RM",
+  wm: "WM",
+  mm: "CM",
+  // Short IDs from observation (opponent team with t_ prefix)
+  tgk: "GK",
+  tdef: "DF",
+  tcb: "DF",
+  tdf: "DF",
+  tdb: "DF",
+  tdm: "DF",
+  tleft: "WL",
+  tright: "WR",
+  tlw: "WL",
+  trw: "WR",
+  twb: "WB",
+  tlwb: "WL",
+  trwb: "WR",
+  tst: "ST",
+  tcf: "ST",
+  tfw: "ST",
+  tam: "AM",
+  tcm: "CM",
+  tlm: "LM",
+  trm: "RM",
+  twm: "WM",
+  tmm: "CM",
+};
+
+function roleAbbr(pid) {
+  if (!pid) return "??";
+  const key = pid.toLowerCase();
+  // Try exact match first (handles engine replay IDs like "team-a:gk")
+  if (ROLE_ABBR[key]) return ROLE_ABBR[key];
+  // Try stripping team prefix (handles "team-a:gk" -> "gk")
+  const parts = key.split(":");
+  if (parts.length === 2 && ROLE_ABBR[parts[1]]) return ROLE_ABBR[parts[1]];
+  // Try stripping t_ prefix (handles "tgk" -> "gk")
+  if (key.startsWith("t") && ROLE_ABBR[key.slice(1)]) return ROLE_ABBR[key.slice(1)];
+  // Fallback: first 2 chars
+  return key.slice(0, 2).toUpperCase();
+}
+
+// Legend items for the role key
+const ROLE_LEGEND = [
+  { abbr: "GK", name: "Goalkeeper" },
+  { abbr: "DF", name: "Defender" },
+  { abbr: "WL", name: "Winger Left" },
+  { abbr: "WR", name: "Winger Right" },
+  { abbr: "ST", name: "Striker" },
+  { abbr: "AM", name: "Attacking Midfielder" },
+  { abbr: "CM", name: "Central Midfielder" },
+  { abbr: "LM", name: "Left Midfielder" },
+  { abbr: "RM", name: "Right Midfielder" },
+  { abbr: "WB", name: "Wing-Back" },
+];
 
 let view = { scale: 1, ox: 0, oy: 0 };
 
@@ -210,7 +299,7 @@ function drawFrame() {
       const gk = /gk/.test(ids[p] || "");
       const isBallHolder = held && f.owner[i] === (side === "a" ? 0 : 1) &&
         dist(x, y, bx, by) < 1.6;
-      drawPlayer(x, y, facing[i * per + p], primary, gk, canAct, isBallHolder);
+      drawPlayer(x, y, facing[i * per + p], primary, gk, canAct, isBallHolder, ids[p]);
     }
   }
 
@@ -225,7 +314,7 @@ function drawFrame() {
 
 const dist = (x1, y1, x2, y2) => Math.hypot(x1 - x2, y1 - y2);
 
-function drawPlayer(x, y, facing, primary, gk, canAct, isHolder) {
+function drawPlayer(x, y, facing, primary, gk, canAct, isHolder, pid) {
   const px = sx(x), py = sy(y);
   const r = (gk ? 0.95 : 0.8) * view.scale;
 
@@ -271,6 +360,26 @@ function drawPlayer(x, y, facing, primary, gk, canAct, isHolder) {
     ctx.lineWidth = Math.max(1, 0.1 * view.scale);
     ctx.strokeStyle = "rgba(240,180,41,0.9)";
     ctx.stroke();
+  }
+
+  // Role abbreviation label (2 letters) inside the player circle with high contrast
+  if (pid) {
+    const label = roleAbbr(pid);
+    // Choose text color based on kit primary color luminance for best contrast
+    const kitRgb = hexToRgb(primary);
+    const luminance = kitRgb ? (0.299 * kitRgb[0] + 0.587 * kitRgb[1] + 0.114 * kitRgb[2]) : 128;
+    const textColor = luminance > 140 ? "#000" : "#fff";
+    const strokeColor = luminance > 140 ? "#fff" : "#000";
+
+    const fontSize = Math.max(8, 0.35 * view.scale);
+    ctx.font = `bold ${fontSize}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = Math.max(2, 0.15 * view.scale);
+    ctx.strokeStyle = strokeColor;
+    ctx.strokeText(label, px, py);
+    ctx.fillStyle = textColor;
+    ctx.fillText(label, px, py);
   }
 }
 

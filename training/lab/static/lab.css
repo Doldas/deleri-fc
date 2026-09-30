@@ -18,44 +18,45 @@
 
 body {
   margin: 0;
-  padding: 20px clamp(12px, 3vw, 40px) 48px;
+  padding: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 10px/1.2 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.92em;
+  font-size: 0.8em;
   background: var(--panel-2);
-  padding: 1px 5px;
-  border-radius: 4px;
+  padding: 1px 2px;
+  border-radius: 2px;
 }
 
-h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
-header .sub { margin: 0 0 20px; color: var(--ink-dim); max-width: 78ch; }
+h1 { margin: 0 0 0; font-size: 13px; letter-spacing: -0.01em; }
+header { margin: 0; padding: 0; }
+header .sub { margin: 0 0 2px; color: var(--ink-dim); max-width: 78ch; font-size: 9px; }
 
 /* ---------- controls ---------- */
 
 .controls {
   display: flex;
-  gap: 14px;
+  gap: 3px;
   align-items: flex-start;
   flex-wrap: wrap;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 14px 16px;
-  margin-bottom: 16px;
+  border-radius: 2px;
+  padding: 3px 5px;
+  margin-bottom: 2px;
 }
 
-.field { display: flex; flex-direction: column; gap: 6px; }
-.field.grow { flex: 1 1 320px; min-width: 260px; }
+.field { display: flex; flex-direction: column; gap: 1px; }
+.field.grow { flex: 1 1 140px; min-width: 80px; }
 
 label {
-  font-size: 11px;
+  font-size: 7px;
   text-transform: uppercase;
-  letter-spacing: 0.07em;
+  letter-spacing: 0.05em;
   color: var(--ink-dim);
 }
 
@@ -64,8 +65,8 @@ select, button {
   color: var(--ink);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 8px 10px;
+  border-radius: 2px;
+  padding: 2px 3px;
 }
 
 select:focus-visible, button:focus-visible, input:focus-visible {
@@ -85,15 +86,15 @@ button.primary {
 }
 button.primary:hover:not(:disabled) { background: #268a3c; }
 
-.hint { margin: 0; font-size: 12px; color: var(--ink-dim); min-height: 18px; }
+.hint { margin: 0; font-size: 7px; color: var(--ink-dim); min-height: 10px; }
 .hint .tag {
   display: inline-block;
-  padding: 0 6px;
-  border-radius: 4px;
+  padding: 0 2px;
+  border-radius: 1px;
   background: var(--panel-2);
   border: 1px solid var(--line);
-  font-size: 11px;
-  margin-right: 5px;
+  font-size: 6px;
+  margin-right: 1px;
 }
 
 /* ---------- stage ---------- */
@@ -101,19 +102,20 @@ button.primary:hover:not(:disabled) { background: #268a3c; }
 .stage {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 14px 16px 16px;
+  border-radius: 2px;
+  padding: 3px 5px 5px;
+  margin-bottom: 2px;
 }
 
 .scoreboard {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding-bottom: 12px;
+  gap: 4px;
+  padding-bottom: 3px;
   flex-wrap: wrap;
 }
 
-.scoreboard .side { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.scoreboard .side { display: flex; align-items: center; gap: 2px; min-width: 0; }
 .scoreboard .side.home { flex: 1 1 0; justify-content: flex-end; }
 .scoreboard .side.away { flex: 1 1 0; }
 .scoreboard .name {
@@ -121,28 +123,29 @@ button.primary:hover:not(:disabled) { background: #268a3c; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-size: 10px;
 }
 .scoreboard .side.home .name { text-align: right; }
 
 .chip {
-  width: 16px; height: 16px;
-  border-radius: 4px;
+  width: 9px; height: 9px;
+  border-radius: 2px;
   background: #555;
   border: 1px solid rgba(255, 255, 255, 0.35);
   flex: none;
 }
 
 .score {
-  font: 700 26px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-  display: flex; gap: 6px;
-  padding: 0 6px;
+  font: 700 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: flex; gap: 1px;
+  padding: 0 1px;
 }
 .score .sep { color: var(--ink-dim); }
 
 .clock {
-  font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--ink-dim);
-  min-width: 74px;
+  min-width: 44px;
   text-align: right;
 }
 
@@ -152,7 +155,7 @@ canvas {
   width: 100%;
   height: auto;
   display: block;
-  border-radius: 8px;
+  border-radius: 3px;
   background: var(--grass-a);
 }
 
@@ -162,21 +165,21 @@ canvas {
   display: grid;
   place-items: center;
   background: rgba(9, 12, 17, 0.82);
-  border-radius: 8px;
+  border-radius: 2px;
   text-align: center;
-  padding: 24px;
+  padding: 6px;
 }
 .overlay[hidden] { display: none; }
-.overlay-inner { max-width: 60ch; }
-.overlay-title { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
-.overlay-body { margin: 0; color: var(--ink-dim); }
+.overlay-inner { max-width: 35ch; }
+.overlay-title { margin: 0 0 1px; font-size: 11px; font-weight: 600; }
+.overlay-body { margin: 0; color: var(--ink-dim); font-size: 9px; }
 .overlay-body.error { color: var(--err); white-space: pre-wrap; text-align: left;
-  font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  font-family: ui-monospace, Menlo, monospace; font-size: 8px; }
 .overlay-body.busy::after {
   content: "";
   display: inline-block;
-  width: 9px; height: 9px;
-  margin-left: 8px;
+  width: 5px; height: 5px;
+  margin-left: 3px;
   border: 2px solid var(--ink-dim);
   border-top-color: transparent;
   border-radius: 50%;
@@ -190,24 +193,24 @@ canvas {
 .timeline {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 2px;
+  margin-top: 2px;
   flex-wrap: wrap;
 }
 
 button.icon {
-  width: 34px;
-  padding: 6px 0;
+  width: 22px;
+  padding: 2px 0;
   text-align: center;
-  font-size: 11px;
+  font-size: 8px;
   line-height: 1;
 }
 
 #scrub {
-  flex: 1 1 200px;
-  min-width: 140px;
+  flex: 1 1 120px;
+  min-width: 70px;
   accent-color: var(--accent);
-  height: 22px;
+  height: 14px;
 }
 
 /* Goal ticks drawn over the scrub track. The native range input cannot host
@@ -215,75 +218,105 @@ button.icon {
 .timeline { position: relative; }
 .goalmarks {
   position: absolute;
-  left: 42px;            /* past the three icon buttons */
-  right: 190px;          /* past the counter and speed picker */
+  left: 26px;
+  right: 120px;
   top: 50%;
   height: 0;
   pointer-events: none;
 }
 .goalmarks i {
   position: absolute;
-  width: 3px;
-  height: 11px;
-  margin-top: -5px;
-  margin-left: -1px;
-  border-radius: 2px;
+  width: 1px;
+  height: 6px;
+  margin-top: -3px;
+  margin-left: 0;
+  border-radius: 1px;
   opacity: 0.95;
 }
 
 .tcode {
-  font: 12px/1 ui-monospace, Menlo, monospace;
+  font: 8px/1 ui-monospace, Menlo, monospace;
   color: var(--ink-dim);
-  min-width: 96px;
+  min-width: 56px;
   text-align: right;
 }
 
-.speed { display: flex; align-items: center; gap: 6px; }
-.speed select { padding: 5px 7px; }
+.speed { display: flex; align-items: center; gap: 2px; }
+.speed select { padding: 2px 3px; font-size: 8px; }
 
 .legend {
   display: flex;
-  gap: 16px;
+  gap: 6px;
   flex-wrap: wrap;
-  margin: 12px 0 0;
-  font-size: 12px;
+  margin: 2px 0 0;
+  font-size: 8px;
   color: var(--ink-dim);
 }
-.key { display: inline-flex; align-items: center; gap: 6px; }
-.swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.key { display: inline-flex; align-items: center; gap: 2px; }
+.swatch { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
 .swatch.loose { background: #fff; }
 .swatch.held { background: var(--warn); }
-.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
 .dot.gk { background: #58a6ff; }
 .dot.out { background: #7d8590; }
 .dot.stalled { background: transparent; border: 2px dashed #f85149; }
 .goalkey { color: var(--warn); }
 
+/* Role legend (second line) */
+.legend.roles-legend {
+  margin: 2px 0 0;
+  gap: 4px;
+  font-size: 7px;
+  border-top: 1px solid var(--line);
+  padding-top: 2px;
+}
+.legend.roles-legend .legend-title {
+  font-weight: 600;
+  color: var(--ink);
+  margin-right: 2px;
+}
+.legend.roles-legend .key.role {
+  gap: 1px;
+}
+.legend.roles-legend .role-abbr {
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 1px;
+  padding: 1px 2px;
+  color: var(--accent);
+  min-width: 16px;
+  display: inline-block;
+  text-align: center;
+}
+
 /* ---------- readout ---------- */
 
 .readout {
   display: flex;
-  gap: 10px;
+  gap: 3px;
   flex-wrap: wrap;
-  margin-top: 16px;
+  margin-top: 4px;
 }
 .readout > div {
-  flex: 1 1 130px;
+  flex: 1 1 75px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 10px 12px;
+  border-radius: 2px;
+  padding: 3px 5px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 0;
 }
 .readout span {
-  font-size: 11px;
+  font-size: 7px;
   text-transform: uppercase;
-  letter-spacing: 0.07em;
+  letter-spacing: 0.05em;
   color: var(--ink-dim);
 }
-.readout b { font: 600 15px/1.2 ui-monospace, Menlo, monospace; }
+.readout b { font: 600 9px/1 ui-monospace, Menlo, monospace; }
 
-footer { margin-top: 22px; color: var(--ink-dim); font-size: 13px; max-width: 80ch; }
+footer { margin-top: 4px; color: var(--ink-dim); font-size: 9px; max-width: 80ch; }
 footer a { color: var(--accent); }
