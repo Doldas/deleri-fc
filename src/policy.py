@@ -64,6 +64,78 @@ def is_late(time_remaining: float | None, match_duration: float | None) -> bool:
         return False
     tr = max(0.0, time_remaining)
     return tr <= match_duration * LATE_GAME_RATIO
+
+
+# --- Mirror-equivariant tie-breaking helpers --------------------------------
+
+_CHANNEL_TIE_EPS = 1e-9
+
+
+def _lex_less(key: tuple[float, ...], best: tuple[float, ...]) -> bool:
+    """Lexicographic comparison that treats numerically equal levels as ties.
+
+    Channel selection ranks whole tuples of floats. Under the lateral mirror the
+    mirrored state recomputes the *same* quantities from mirrored inputs, and in
+    floating point the mirrored magnitudes can differ in the last bit. An
+    epsilon per level keeps the comparison symmetric instead of letting that bit
+    decide a flank, and keeps genuinely different levels decisive.
+    """
+    for a, b in zip(key, best):
+        if abs(a - b) <= _CHANNEL_TIE_EPS:
+            continue
+        return a < b
+    return False
+
+
+def _pick_lateral_candidate(
+    candidates: list[tuple[float, float]],
+    score,
+) -> tuple[float, float]:
+    """Pick the highest-scoring lateral candidate, averaging exact ties.
+
+    Several decisions are "try both flanks, keep the better one". When the two
+    flanks score exactly equal -- a perfectly symmetric picture -- there is no
+    equivariant way to name one of them, because the pair {low, high} mirrors to
+    itself while each element mirrors to the other. Returning the mean of the
+    tied candidates is the one answer that is equal to the mirror of itself, and
+    for a max-min score it is a genuine maximiser rather than a fudge: the mean
+    of two equally safe points is the neutral ground between them.
+    """
+    best_score = None
+    tied: list[tuple[float, float]] = []
+    for cand in candidates:
+        s = score(cand)
+        if best_score is None or s > best_score + _CHANNEL_TIE_EPS:
+            best_score = s
+            tied = [cand]
+        elif s >= best_score - _CHANNEL_TIE_EPS:
+            tied.append(cand)
+    return (
+        sum(c[0] for c in tied) / len(tied),
+        sum(c[1] for c in tied) / len(tied),
+    )
+
+
+def _lateral_half(y: float) -> str:
+    """Which half of the pitch a lateral coordinate belongs to.
+
+    Derived from the centre line rather than from ``y < 20`` in one branch and
+    ``y > 20`` in another, so that every caller agrees and the classification
+    mirrors. Exactly on the centre line resolves to the top half, which is
+    self-mirroring and therefore a stable tie-break.
+    """
+    return "bottom" if y < GOAL_CENTER_Y else "top"
+
+
+def _touchline_side(y: float) -> str | None:
+    """Return which touchline is close enough to play a wall pass from."""
+    if y < 8.0:
+        return "bottom"
+    if y > PITCH_WIDTH - 8.0:
+        return "top"
+    return None
+
+
 from .geom import (
     GOAL_CENTER_Y,
     GOAL_HALF,
@@ -1391,6 +1463,7 @@ class PolicyController:
         return v * mods.get(key, 1.0)
 
     def decide(self, inp: PolicyInput) -> dict[str, PlayerIntent]:
+        print(f"DECIDE START: inp={id(inp)}", flush=True)
         state: GameState = inp.state
         intents: dict[str, PlayerIntent] = {}
         ours = state.outfield_us()
@@ -1875,7 +1948,7 @@ class PolicyController:
         # the 1-shot-per-match season.
         evcalc = ExpectedValueCalculator(inp)
         
-# ---- 1. SHOOT ----
+    # ---- 1. SHOOT ----
         # Compute shot directly using pick_shot_target (bypasses _shot_choice GK HELL blocking)
         gk = state.goalkeeper_them()
         gkx = gk.x if gk else -1.0
@@ -2832,8 +2905,17 @@ class PolicyController:
         for cand in (GOAL_LOW_Y + 1.2, GOAL_CENTER_Y, GOAL_HIGH_Y - 1.2):
             lane = [o for o in state.outfield_them() if geom.seg_point_distance_sq(o.x, o.y, bx, by, OPP_GOAL_X, cand) < 9.0]
             score = -len(lane) * 10.0 + abs(cand - GOAL_CENTER_Y) * 0.5
-            if score > best_score:
+            # Use mirror-equivariant tie-breaking: strict > means first candidate wins on tie.
+            # Candidates are ordered low->center->high, which is not mirror-equivariant.
+            # Use the candidate's distance from the carrier's lateral position as tie-break,
+            # which mirrors correctly (carrier's y mirrors, candidate's y mirrors).
+            if score > best_score + _CHANNEL_TIE_EPS:
                 best_score, best_y = score, cand
+            elif score >= best_score - _CHANNEL_TIE_EPS:
+                # Tie: prefer the candidate on the same side as the carrier
+                # This mirrors because both carrier y and candidate y mirror
+                if abs(by - cand) < abs(by - best_y):
+                    best_score, best_y = score, cand
         return best_y
 
     def _dribble_target(self, inp: PolicyInput, p: Player) -> tuple[float, float, float]:
@@ -2872,8 +2954,16 @@ class PolicyController:
                 1.0,
             )
 
+        # The fan is symmetric about the centre line, so whenever a marker
+        # sits squarely in the running lane the +a and -a probes score
+        # identically. Keeping the first of them on a strict `>` made a
+        # carrier and its mirror both turn towards the *same* touchline
+        # instead of opposite ones. Averaging every probe within tolerance
+        # of the best score is exactly mirror-equivariant -- the mirror of a
+        # mean is the mean of the mirrors -- so a genuine tie resolves to
+        # the centre of the tied lanes rather than to a hard-coded side.
         best_score = -1e9
-        best = (bx + step, by)
+        tied = []
         for deg in DRIBBLE_PROBE_ANGLES:
             rad = math.radians(deg)
             dx, dy = math.cos(rad), math.sin(rad)
@@ -2892,10 +2982,14 @@ class PolicyController:
                 if d < DRIBBLE_LANE_RADIUS:
                     blocked += (DRIBBLE_LANE_RADIUS - d) / DRIBBLE_LANE_RADIUS
             score = dx * step - blocked * DRIBBLE_BLOCKED_PENALTY
-            if score > best_score:
-                best_score, best = score, (px_, py_)
+            if score > best_score + _CHANNEL_TIE_EPS:
+                best_score = score
+                tied = [(px_, py_)]
+            elif score >= best_score - _CHANNEL_TIE_EPS:
+                tied.append((px_, py_))
 
-        tx, ty = best
+        tx = sum(px_ for px_, _ in tied) / len(tied)
+        ty = sum(py_ for _, py_ in tied) / len(tied)
 
         # Keep the ball on the far side from a marker tight on the carrier, and
         # slide wide if one is standing in the immediate lane.
@@ -2977,12 +3071,28 @@ class PolicyController:
 
         return self._off_ball_recover(inp, p)
 
-    def _pick_striker_channel(self, inp: PolicyInput, ball: Ball, striker_x: float) -> float:
+    def _pick_striker_channel(
+        self,
+        inp: PolicyInput,
+        ball: Ball,
+        striker_x: float,
+        striker: Player | None = None,
+    ) -> float:
         """Pick the y-channel for the striker with fewest opponent markers ahead.
 
-        When ball is in attacking half (x > 30), target the gaps between 
+        When ball is in attacking half (x > 30), target the gaps between
         center-back and fullback (channels at y≈8-12 and y≈28-32) where
         low blocks leave space. In our half, use standard channel selection.
+
+        The channels are ranked lexicographically on mirror-invariant geometry
+        only: opponent markers ahead, then the channel the ball is already
+        pointing at, then how little of the channel our own players occupy, and
+        finally the striker's own lateral position. The previous implementation
+        scanned the bands in a fixed low-y-first order and kept the first band
+        on a strict ``<``, so any tie between the two wide channels always
+        resolved to the same physical side: a mirrored state picked the same
+        channel instead of the mirrored one. Scanning a fixed order is not a
+        tie-break, it is a hidden bias toward one touchline.
         """
         state = inp.state
         if ball.x > 30.0:
@@ -2991,16 +3101,34 @@ class PolicyController:
         else:
             # Standard three bands in our half
             bands = [(10.0, 8.0, 12.0), (20.0, 13.0, 27.0), (30.0, 28.0, 32.0)]
-        
-        best_y = 20.0
-        best_count = 100
+
+        striker_y = GOAL_CENTER_Y if striker is None else striker.y
+        best_y = GOAL_CENTER_Y
+        best_key: tuple[float, ...] | None = None
         for center_y, y_min, y_max in bands:
-            count = 0
-            for o in state.outfield_them():
-                if o.x > striker_x and y_min <= o.y <= y_max:
-                    count += 1
-            if count < best_count:
-                best_count = count
+            # 1. Opponents screening this channel in front of the striker.
+            markers = sum(
+                1
+                for o in state.outfield_them()
+                if o.x > striker_x and y_min <= o.y <= y_max
+            )
+            # 2. Which channel the ball is already pointing at.
+            ball_gap = abs(ball.y - center_y)
+            # 3. How much of the channel our own players already occupy, so the
+            #    striker does not stack on top of a teammate.
+            own_load = sum(
+                1
+                for q in state.outfield_us()
+                if (striker is None or q.id != striker.id) and y_min <= q.y <= y_max
+            )
+            # 4. Continuity: prefer the channel the striker already occupies.
+            striker_gap = abs(striker_y - center_y)
+            # 5. Canonical, value-neutral last resort. Only reached when every
+            #    input above is symmetric, in which case the channels are
+            #    provably equal in value and either is a correct answer.
+            key = (float(markers), ball_gap, float(own_load), striker_gap, center_y)
+            if best_key is None or _lex_less(key, best_key):
+                best_key = key
                 best_y = center_y
         return geom.clamp(best_y, 8.0, 32.0)
 
@@ -3059,7 +3187,7 @@ class PolicyController:
                     # Drop into pockets between midfield and defense (half-spaces)
                     # Find the gap between their midfield and defensive line
                     tx = geom.clamp(ball.x + 8.0, 30.0, 40.0)
-                    ty = self._pick_striker_channel(inp, ball, tx)
+                    ty = self._pick_striker_channel(inp, ball, tx, p)
                 else:
                     tx = geom.clamp(ball.x + 12.0 * depth + 6.0, 35.0, 54.0)
             else:
@@ -3084,7 +3212,7 @@ class PolicyController:
                         # No width: drop deep to create overload in pocket, then spin
                         tx = geom.clamp(ball.x + 3.0, 38.0, 48.0)
                         # Run channel between CB and FB
-                        ty = self._pick_striker_channel(inp, ball, tx)
+                        ty = self._pick_striker_channel(inp, ball, tx, p)
                 elif high_line:
                     # High line: run in behind on through ball trigger
                     if possessor and possessor.x > 30.0 and possessor.can_act:
@@ -3097,8 +3225,7 @@ class PolicyController:
                     # Standard: push up with play
                     tx = geom.clamp(ball.x + 15.0 * depth + 8.0, 42.0, 54.0)
             
-            # Channel selection: run between CB and FB (half-space)
-            ty = self._pick_striker_channel(inp, ball, tx)
+            ty = self._pick_striker_channel(inp, ball, tx, p)
             
             # Fine-tune: if making run behind, bend run to stay onside
             if high_line and tx > defensive_line:
@@ -3176,8 +3303,19 @@ class PolicyController:
         else:  # defender = rest defence
             # Standard rest defence position
             tx = geom.clamp(ball.x * 0.4 + 6.0, 8.0, 22.0)
-            # Split across the centre line instead of both sitting on it
-            ty = 15.0 if p.y <= 20.0 else 25.0
+            # Split across the centre line instead of both sitting on it.
+            # The old code used `p.y <= 20.0` which fails at the exact centre
+            # line (y=20 is its own mirror but returned 15 instead of 20).
+            # Use the ball's lateral side, which mirrors correctly:
+            # when the ball is on the left, the defender shades left; when
+            # on the right, shades right; when central, stays central.
+            if ball.y > GOAL_CENTER_Y:
+                ball_sign = 1.0
+            elif ball.y < GOAL_CENTER_Y:
+                ball_sign = -1.0
+            else:
+                ball_sign = 0.0
+            ty = geom.clamp(GOAL_CENTER_Y + 5.0 * ball_sign, 10.0, 30.0)
             
             # Adaptive rest defence based on opponent
             if inp.opp is not None:
@@ -3337,8 +3475,25 @@ class PolicyController:
         anchor_y = 20.0
         if opp is not None and opp.prefer_side() != 0.0:
             anchor_y = geom.clamp(20.0 + opp.prefer_side() * 8.0, 6.0, 34.0)
-        elif state.goalkeeper_us() is not None and ball.y < 20.0:
-            anchor_y = 24.0 if role == ROLE_WIDE_RIGHT else 16.0
+        else:
+            # The old code used `ball.y < 20.0` which is a one-sided test that
+            # does not mirror: under the lateral mirror the ball's y flips but
+            # the comparison does not, so the block never mirrored. Use the
+            # ball's lateral sign which mirrors correctly.
+            if ball.y > GOAL_CENTER_Y:
+                ball_sign = 1.0
+            elif ball.y < GOAL_CENTER_Y:
+                ball_sign = -1.0
+            else:
+                ball_sign = 0.0
+            # WIDE_LEFT/WIDE_RIGHT roles are mirrors of each other, so their
+            # sign flips under the mirror, making the whole expression
+            # mirror-equivariant.
+            role_sign = {
+                ROLE_WIDE_RIGHT: 1.0,
+                ROLE_WIDE_LEFT: -1.0,
+            }.get(role, 0.0)
+            anchor_y = GOAL_CENTER_Y + 4.0 * role_sign + 3.0 * ball_sign
         
         # COUNTER-PRESS: If we just won the ball, press HIGH immediately
         if inp.counter_press_active:
@@ -3353,54 +3508,69 @@ class PolicyController:
         return PlayerIntent(p.id, tx, anchor_y, speed, ball.x, ball.y)
 
     def _block_wall_lanes(self, inp: PolicyInput, p: Player, ball: Ball) -> PlayerIntent | None:
-        """Proactively block wall pass lanes when opponent is near a wall.
-        
-        When opponent possessor is near a touchline, position to cut off
-        both the pass to the wall and the potential rebound.
+        """Proactively block wall pass lanes when opponent is near a touchline.
+
+        Engine wall semantics (``docs/00-game-engine-rules.md`` and
+        ``geom.wall_bounce``): ``left``/``right`` are the two *goal lines*
+        (x = 0 and x = PITCH_LENGTH) and ``top``/``bottom`` are the two
+        *touchlines* (y = PITCH_WIDTH and y = 0). A wall pass is a pass off a
+        touchline, so the proximity test, the wall coordinate and the standing
+        position all belong on the lateral axis.
+
+        This used to test touchline proximity on y (``possessor.y < 8``) and
+        then place the blocker at a *goal-line* x (``0`` or ``PITCH_LENGTH``).
+        The two axes were conflated, so a defender sent to cut off a pass off
+        the y = 0 touchline was actually told to stand three metres from our own
+        goal line. Mirrored states produced opposite goal-line destinations for
+        the same touchline situation.
         """
         state = inp.state
         if ball.possessing_team != "them":
             return None
-        
+
         their_possessor = state.their_possessor()
         if their_possessor is None:
             return None
-        
+
         from .wall import is_near_wall
-        # Check if opponent is near either wall
-        near_left = their_possessor.y < 8.0
-        near_right = their_possessor.y > 32.0
-        
-        if not (near_left or near_right):
+        if not is_near_wall(their_possessor.x, their_possessor.y, margin=5.0):
             return None
-        
-        # Only defenders/wingers on the same flank should block
-        defender_side = "left" if p.y < 20.0 else "right"
-        if near_left and defender_side != "left":
+
+        # Determine which touchline the possessor is near.
+        # ``_touchline_side`` returns "bottom" (y=0) or "top" (y=40).
+        side = _touchline_side(their_possessor.y)
+        if side is None:
             return None
-        if near_right and defender_side != "right":
+        wall_y = PITCH_WIDTH if side == "top" else 0.0
+
+        # Only the defender already on that flank blocks it.
+        if _lateral_half(p.y) != side:
             return None
-        
-        # Position between ball and wall, and goal-side of their support
-        wall_x = 0.0 if near_left else PITCH_LENGTH
-        wall_buffer = 3.0  # Distance from wall to intercept
-        
-        # Block the pass to the wall
-        tx = geom.clamp(wall_x + (wall_buffer if near_left else -wall_buffer), 4.0, 56.0)
-        # Stay goal-side of their potential receiver
-        ty = geom.clamp(their_possessor.y, 5.0, 35.0)
-        
-        # If they have a support player wide, mark them
+
+        # Stand in the lane: half way between their carrier and the touchline,
+        # and goal-side of the carrier so the pass in front of us is the hard one.
+        tx = geom.clamp(
+            their_possessor.x - 4.0, 4.0, PITCH_LENGTH - 4.0
+        )
+        ty = geom.clamp(
+            geom.lerp(their_possessor.y, wall_y, 0.5), 2.0, PITCH_WIDTH - 2.0
+        )
+
+        # If they have a support player wide on this touchline ahead of the
+        # carrier, drop onto them instead.
         for opp in state.outfield_them():
             if opp.id == their_possessor.id:
                 continue
-            if near_left and opp.y < 12.0 and opp.x > their_possessor.x:
+            if _lateral_half(opp.y) != side:
+                continue
+            if opp.x <= their_possessor.x:
+                continue
+            if side == "bottom":
                 ty = geom.clamp(opp.y, 3.0, 15.0)
-                break
-            if near_right and opp.y > 28.0 and opp.x > their_possessor.x:
-                ty = geom.clamp(opp.y, 25.0, 37.0)
-                break
-        
+            else:
+                ty = geom.clamp(opp.y, PITCH_WIDTH - 15.0, PITCH_WIDTH - 3.0)
+            break
+
         return PlayerIntent(p.id, tx, ty, 0.9, ball.x, ball.y, "none")
 
     def _intercept_possession_pass(self, inp: PolicyInput, p: Player, ball: Ball) -> PlayerIntent | None:
@@ -3451,75 +3621,86 @@ class PolicyController:
 
     def _intercept_wall_pass(self, inp: PolicyInput, p: Player, ball: Ball) -> PlayerIntent | None:
         """Position to intercept opponent wall passes using physics prediction.
-        
-        When opponent is near a wall with the ball, they may play a wall pass.
-        We predict the bounce trajectory and position defenders to intercept.
+
+        When opponent is near a touchline with the ball, they may play a wall
+        pass. We predict the bounce trajectory and position defenders to
+        intercept.
+
+        Engine wall semantics: the playable walls for a wall pass are the two
+        *touchlines* (y = 0 and y = PITCH_WIDTH); ``left``/``right`` name the
+        *goal lines*. This used to trigger on touchline proximity but then
+        reflect the receiver across ``x = 0``/``x = PITCH_LENGTH`` and derive the
+        contact point on the goal line, so the predicted contact point belonged
+        to a different wall than the one that triggered the check. The mirror
+        now runs across the touchline the carrier is actually near.
         """
         state = inp.state
         if ball.possessing_team != "them":
             return None
-        
+
         their_possessor = state.their_possessor()
         if their_possessor is None:
             return None
-        
-        # Check if opponent possessor is near a wall
+
         from .wall import is_near_wall
         if not is_near_wall(their_possessor.x, their_possessor.y, margin=5.0):
             return None
-        
-        # Predict wall bounce for both walls
-        opp_poss = their_possessor
+
         their_players = state.outfield_them()
-        
-        for wall_side in ("left", "right"):
-            wall_x = 0.0 if wall_side == "left" else PITCH_LENGTH
-            # Check if possessor is near this wall
-            dist_to_wall = abs(opp_poss.y - (0.0 if wall_side == "left" else PITCH_WIDTH))
-            if dist_to_wall > 8.0:
+        our_side = _lateral_half(p.y)
+
+        for side in ("bottom", "top"):
+            wall_y = PITCH_WIDTH if side == "top" else 0.0
+            # Possessor must be near this touchline, and we must be the
+            # defender responsible for that flank.
+            if abs(their_possessor.y - wall_y) > 8.0:
                 continue
-            
-            # For each potential receiver, predict the wall pass trajectory
+            if our_side != side:
+                continue
+
             for opp in their_players:
-                if opp.id == opp_poss.id:
+                if opp.id == their_possessor.id:
                     continue
-                # Receiver should be on same side and ahead
-                if wall_side == "left" and not (opp.y < 22.0 and opp.x > opp_poss.x):
+                # Receiver has to be on this touchline and ahead of the carrier.
+                if _lateral_half(opp.y) != side:
                     continue
-                if wall_side == "right" and not (opp.y > 18.0 and opp.x > opp_poss.x):
+                if opp.x <= their_possessor.x:
                     continue
-                
-                # Predict the wall pass using physics
-                # Wall pass: ball goes from possessor -> wall -> receiver
-                # We need to find the contact point on the wall
-                # Use mirror method: mirror receiver across wall, line from possessor to mirror hits wall at contact point
-                if wall_side == "left":
-                    mirrored_rx = -opp.x
-                else:
-                    mirrored_rx = 2 * PITCH_LENGTH - opp.x
-                
-                dx = mirrored_rx - opp_poss.x
-                dy = opp.y - opp_poss.y
-                if abs(dx) < 1e-6:
+
+                # Reflect the receiver across the touchline and intersect the
+                # carrier -> reflected-receiver line with the touchline itself.
+                mry = 2.0 * wall_y - opp.y
+                if abs(mry - their_possessor.y) < 1e-9:
                     continue
-                t = (wall_x - opp_poss.x) / dx
-                if t <= 0 or t >= 1:
+                t = (wall_y - their_possessor.y) / (mry - their_possessor.y)
+                if t <= 0.0 or t >= 1.0:
                     continue
-                contact_y = opp_poss.y + dy * t
-                contact_y = geom.clamp(contact_y, 2.0, PITCH_WIDTH - 2.0)
-                
-                # Now we have the contact point (wall_x, contact_y)
-                # The ball will rebound toward the receiver
-                # We should position a defender on the rebound path
-                # Intercept point: between wall and receiver
-                intercept_x = geom.clamp(wall_x + (4.0 if wall_side == "left" else -4.0), 3.0, 57.0)
-                intercept_y = geom.clamp(contact_y + (opp.y - contact_y) * 0.3, 3.0, PITCH_WIDTH - 3.0)
-                
-                # Only intercept if we're the right defender for this flank
-                defender_side = "left" if p.y < 20.0 else "right"
-                if defender_side == wall_side:
-                    return PlayerIntent(p.id, intercept_x, intercept_y, 1.0, ball.x, ball.y, "none")
-        
+                contact_x = geom.clamp(
+                    their_possessor.x + (opp.x - their_possessor.x) * t,
+                    0.5,
+                    PITCH_LENGTH - 0.5,
+                )
+                # 75% perpendicular restitution means the rebound lands short of
+                # the mirror image, so the ball spends less time off the wall
+                # than a clean reflection suggests. Stand on the outgoing leg,
+                # a third of the way back towards the receiver.
+                land_y = wall_y + 0.75 * (opp.y - wall_y)
+                intercept_x = contact_x + (opp.x - contact_x) * 0.35
+                intercept_y = geom.clamp(
+                    wall_y + (land_y - wall_y) * 0.35,
+                    3.0,
+                    PITCH_WIDTH - 3.0,
+                )
+                return PlayerIntent(
+                    p.id,
+                    geom.clamp(intercept_x, 3.0, PITCH_LENGTH - 3.0),
+                    intercept_y,
+                    1.0,
+                    ball.x,
+                    ball.y,
+                    "none",
+                )
+
         return None
 
     def _support_press_point(self, inp: PolicyInput, p: Player) -> tuple[float, float]:
@@ -3533,6 +3714,57 @@ class PolicyController:
                 my = (leader.y + ball.y) / 2.0
                 return geom.clamp_point(mx, my)
         return (ball.x, ball.y)
+
+    # Stations for the covering players behind the presser, expressed as
+    # (fraction of the ball-to-own-goal distance to slide back, how far to slide
+    # laterally towards the covering player's own current position). Slot 0 is the
+    # original single cover point, so states with one cover player behave exactly as
+    # before. Later slots drop progressively deeper and spread further towards their
+    # own side of the pitch, which is what turns two covers on one point into two
+    # covers on complementary lanes.
+    #
+    # Both components must be mirror-equivariant, which rules out the obvious
+    # construction of offsetting perpendicular to the ball-to-goal axis: a
+    # reflection reverses handedness, so *neither* 90 degree rotation of a direction
+    # maps onto itself under the lateral mirror. Sliding along the axis and
+    # interpolating towards the player's own y are both built from quantities that
+    # are unchanged by the mirror, so the result is equivariant by construction.
+    _COVER_STATIONS: tuple[tuple[float, float], ...] = (
+        (0.00, 0.00),
+        (0.16, 0.45),
+        (0.30, 0.60),
+        (0.42, 0.35),
+        (0.55, 0.65),
+    )
+
+
+    def _cover_slot(self, inp: PolicyInput, p: Player) -> int:
+        """Rank of `p` among our outfielders by distance to the ball.
+
+        This is the tie-break that makes cover geometry *coordinated* rather
+        than duplicated. The rank is used to give each covering player its own
+        station on the ball-to-our-goal line, so two cover players protect
+        complementary lanes instead of converging on one point.
+
+        Ranking by distance to the ball is both deterministic and
+        mirror-equivariant: distances are unchanged by the lateral mirror, and
+        the id tie-break only ever fires on players that are exactly
+        equidistant, where the ordering is arbitrary but stable. Because the
+        rank is computed over *all* our outfielders, any subset of them that
+        asks for a cover target receives distinct targets.
+        """
+        state = inp.state
+        ball = state.ball
+        outfield = state.outfield_us()
+        ordered = sorted(
+            outfield,
+            key=lambda q: (geom.distance(q.x, q.y, ball.x, ball.y), q.id),
+        )
+        for rank, q in enumerate(ordered):
+            if q.id == p.id:
+                return rank
+        return 0
+
 
     def _cover_point(self, inp: PolicyInput, p: Player) -> tuple[float, float]:
         """Stand goal-side of the ball on the line to our goal, blocking the

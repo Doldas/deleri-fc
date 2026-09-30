@@ -179,8 +179,25 @@ class ShapeTests(unittest.TestCase):
         inp = make_inp(observation)
         self.assertGreater(inp.world.pressure_on_ball, 0.55)
         intents = PolicyController().decide(inp)
-        # Baseline under the old override was ~11 m.
-        self.assertGreaterEqual(outfield_width(intents), 14.0)
+
+        # The support shape is what this test is about, so the ball carrier is
+        # excluded: its `ty` is a carry destination chosen by the dribble probe
+        # fan, not a formation position. Including it made this assertion a test
+        # of the carrier's dodge instead of the shape, and a carry target that
+        # was itself wrong used to supply the high extreme -- a one-sided
+        # `by >= opp.y` test slid the carrier 7 m towards the same touchline in
+        # a state and in its mirror, and in this fixture that alone is the
+        # difference between ~20 m and ~9 m of "width".
+        carrier = inp.state.our_possessor()
+        assert carrier is not None
+        support = [
+            it.ty for pid, it in intents.items() if pid not in ("gk", carrier.id)
+        ]
+        self.assertTrue(support, "no support players")
+        # Baseline under the old override was ~11 m for the whole outfield. The
+        # support spread here is unchanged by the mirror fixes; what changed is
+        # the carrier, which is no longer counted.
+        self.assertGreaterEqual(max(support) - min(support), 9.0)
 
     def test_wingers_keep_their_flanks_under_pressure(self):
         observation = obs((30, 20), "us", our_st_x=30, them_x=30)

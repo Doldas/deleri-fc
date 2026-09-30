@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from . import geom
 from .config import DECISION_INTERVAL, REWARD_DEFAULTS
+from .geom import GOAL_CENTER_Y, GOAL_HIGH_Y, GOAL_LOW_Y
 from .evaluate import reward
 from .light import LIntent, LightEngine, PlanState, make_state
 from .runtime import RuntimeManager
@@ -337,7 +338,15 @@ class WallBot(OpponentController):
                 mates = [q for q in st.outfield(team) if q.pid != p.pid]
                 # Advance along the near wall; shoot inside the last 18 m.
                 if goal_x - p.x <= 18.0:
-                    out[(team, p.pid)] = LIntent(tx=p.x, ty=p.y, speed=0.4, act="shoot", action_target=(goal_x, 17.0 if p.y >= 20.0 else 23.0), power=0.95)
+                    # Mirror-equivariant shot target: far post from shooter's side.
+                    # At the exact centre line (y=20), aim for the centre of the goal.
+                    if p.y > GOAL_CENTER_Y:
+                        shot_y = GOAL_LOW_Y + 1.0
+                    elif p.y < GOAL_CENTER_Y:
+                        shot_y = GOAL_HIGH_Y - 1.0
+                    else:
+                        shot_y = GOAL_CENTER_Y
+                    out[(team, p.pid)] = LIntent(tx=p.x, ty=p.y, speed=0.4, act="shoot", action_target=(goal_x, shot_y), power=0.95)
                     continue
                 if mates:
                     t = max(mates, key=lambda q: q.x)

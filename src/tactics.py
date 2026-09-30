@@ -14,6 +14,7 @@ from itertools import permutations
 
 from . import geom
 from .config import BALL_CONTROL_RADIUS, TACKLE_MAX
+from .geom import GOAL_CENTER_Y, OPP_GOAL_X
 from .state import GameState, Player, WorldModel
 
 ROLE_DEFENDER = "DEFENDER"
@@ -149,12 +150,18 @@ class PressPlan:
 
 
 def _trigger_note(state: GameState, carrier: Player) -> str:
-    """Triggers are evaluated on the OPPONENT ball carrier, not our presser."""
+    """Triggers are evaluated on the OPPONENT ball carrier, not our presser.
+
+    Every trigger here is geometric: a distance, or the direction a player is
+    turned relative to the goal they defend. Nothing may depend on a one-sided
+    raw angle comparison, because a heading reported in [-pi, pi] expresses the
+    same physical direction twice and the pitch is laterally symmetric.
+    """
     ball = state.ball
     if carrier is None:
         return ""
     note = ""
-    if carrier.facing > math.pi / 2.0:
+    if geom.faces_toward_goal(carrier.x, carrier.y, carrier.facing, OPP_GOAL_X, GOAL_CENTER_Y):
         note += "facing_own_goal "
     if is_trap_near_wall(carrier):
         note += "near_wall "

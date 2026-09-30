@@ -10,7 +10,16 @@ import math
 from dataclasses import dataclass
 
 from . import geom
-from .geom import GOAL_HIGH_Y, GOAL_LOW_Y, OPP_GOAL_X, PITCH_LENGTH, PITCH_WIDTH, wall_bounce
+from .geom import (
+    GOAL_CENTER_Y,
+    GOAL_HALF,
+    GOAL_HIGH_Y,
+    GOAL_LOW_Y,
+    OPP_GOAL_X,
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+    wall_bounce,
+)
 from .config import (
     BALL_CONTROL_MAX_SPEED,
     BALL_CONTROL_SAFE_SPEED,
@@ -269,6 +278,25 @@ def _travel_before_control(speed: float) -> float:
 
 
 MIN_PASS_TRAVEL = _travel_before_control(KICK_MIN_SPEED)
+# Relative slack for comparisons against a derived threshold. A pass aimed at
+# exactly MIN_PASS_TRAVEL metres is legal, and the mirrored picture is the same
+# real distance computed from `40 - y` coordinates -- which `hypot` can land one
+# or two ULP below the original. A bare `<` then vetoed the pass in one state
+# and allowed it in its mirror. Anything within this relative band counts as
+# "on" the threshold, so decisions follow the geometry instead of the rounding
+# of the coordinates they were handed.
+THRESHOLD_REL_EPS = 1e-9
+
+
+def at_or_below(value: float, threshold: float) -> bool:
+    """`value <= threshold`, tolerant of floating-point noise at the boundary."""
+    return value <= threshold + abs(threshold) * THRESHOLD_REL_EPS
+
+
+def at_or_above(value: float, threshold: float) -> bool:
+    """`value >= threshold`, tolerant of floating-point noise at the boundary."""
+    return value >= threshold - abs(threshold) * THRESHOLD_REL_EPS
+
 # The ball leaves the kicker's control CONTROLLED_BALL_AHEAD metres in front of
 # them, so the useful band of pass distances is narrow: shorter overshoots the
 # receiver entirely, longer is a long ball nobody can collect.
@@ -342,12 +370,48 @@ def pick_shot_target(bx: float, by: float, gkx: float, gky: float, power: float 
     high = (base, GOAL_HIGH_Y - post_inset)
     d_low = geom.distance(gkx, gky, low[0], low[1])
     d_high = geom.distance(gkx, gky, high[0], high[1])
-    # Far corner relative to the shooter gives the worst GK angle.
-    side = -1.0 if by >= 20.0 else 1.0
-    far = (base, 20.0 + (3.0 - post_inset) * side)
-    d_far = geom.distance(gkx, gky, far[0], far[1])
-    candidates = [("low", low, d_low), ("high", high, d_high), ("far", far, d_far)]
-    _, target, reach = max(candidates, key=lambda c: c[2])
+    # Far corner relative to the shooter gives the worst GK angle. Which corner
+    # counts as "far" has to come from the sign of the shooter's lateral offset:
+    # under the lateral mirror a one-sided test like `by >= 20.0` becomes
+    # `by <= 20.0`, so a shooter on one flank and its mirror aimed at the *same*
+    # post rather than opposite ones.
+    #
+    # A shooter exactly on the centre line is the one case that needs no rule:
+    # y = GOAL_CENTER_Y is its own mirror image, so that state is identical to
+    # its own reflection and any deterministic choice is already equivariant.
+    # Adding a "far" candidate there would only invent a preference the picture
+    # does not support, so the two measured posts are left to compete.
+    offset = by - GOAL_CENTER_Y
+    if offset > 0.0:
+        far = (base, GOAL_CENTER_Y - (GOAL_HALF - post_inset))
+    elif offset < 0.0:
+        far = (base, GOAL_CENTER_Y + (GOAL_HALF - post_inset))
+    else:
+        far = None
+    if far is None:
+        candidates = [("low", low, d_low), ("high", high, d_high)]
+    else:
+        candidates = [
+            ("low", low, d_low),
+            ("high", high, d_high),
+            ("far", far, geom.distance(gkx, gky, far[0], far[1])),
+        ]
+    # Largest keeper reach wins, and an exact tie is broken towards the far
+    # post, which is the point of aiming away from the keeper. Both keys mirror
+    # with the pitch. `max` used to keep the first of three equidistant
+    # candidates and the far-post identity came from a one-sided comparison, so
+    # a state and its mirror could pick the same post for opposite reasons.
+    # Any remaining tie is between two candidates sharing a y, because the keys
+    # are functions of the post height and the shooter's own height, so the
+    # returned target is still unique.
+    _, target, reach = max(
+        candidates,
+        key=lambda c: (
+            c[2],
+            1.0 if c[0] == "far" else 0.0,
+            -abs(by - c[1][1]),
+        ),
+    )
     quality = clamp01(1.0 - (reach / 3.0) * 0.8)
     return ShotTarget(target[0], target[1], power, quality)
 
@@ -519,10 +583,22 @@ def wall_shot_target(
     # Try both side walls for a shot that bounces into the far corner
     post_inset = 0.6
     base = PITCH_LENGTH
-    far_y = GOAL_HIGH_Y - post_inset if by < 20.0 else GOAL_LOW_Y + post_inset
-    
+    # Same one-sided-comparison trap as `pick_shot_target`: `by < 20.0` becomes
+    # `by > 20.0` under the lateral mirror, so a shooter and its mirror aimed at
+    # the same post. Take the far post from the sign of the offset; exactly on
+    # the centre line the state is its own mirror, so leave the old convention
+    # rather than invent a preference the picture does not support.
+    offset = by - GOAL_CENTER_Y
+    if offset > 0.0:
+        far_y = GOAL_LOW_Y + post_inset
+    elif offset < 0.0:
+        far_y = GOAL_HIGH_Y - post_inset
+    else:
+        far_y = GOAL_LOW_Y + post_inset
+
     best = None
-    best_score = -1e9
+    best_key = None
+    tied: list[tuple[float, float]] = []
     for wall_side in ("left", "right"):
         # Mirror the goal target across the wall
         if wall_side == "left":
@@ -531,7 +607,7 @@ def wall_shot_target(
         else:
             contact_x = PITCH_LENGTH
             mirrored_goal_x = 2 * PITCH_LENGTH
-        
+
         # Estimate a contact point that gives good angle
         for contact_y in [6.0, 12.0, 28.0, 34.0]:
             # Check if lane from ball to contact is clear
@@ -541,15 +617,32 @@ def wall_shot_target(
             # Check lane from contact to goal
             if not pass_lane_clear(contact_x, contact_y, base, far_y, opponents_pos, margin=0.15):
                 continue
-            
+
             # Score based on GK coverage of the bounce
             bounce_vx = (base - contact_x) / geom.distance(contact_x, contact_y, base, far_y)
             bounce_vy = (far_y - contact_y) / geom.distance(contact_x, contact_y, base, far_y)
             d = geom.distance(gkx, gky, base, far_y)
             score = d * 0.5
-            if score > best_score:
-                best_score = score
-                best = (contact_x, contact_y, power)
+            # The candidate contact heights are mirror-symmetric about the
+            # centre line and the keeper's distance to the chosen far post is
+            # unchanged by the mirror, so the common case ties outright. A fixed
+            # scan order then sent a shooter and its mirror to the same wall
+            # height. Rank on the shooter's own lateral position, which mirrors,
+            # and average anything still tied -- the mirror of a mean is the mean
+            # of the mirrors, so that resolves exactly rather than by convention.
+            key = (score, -abs(by - contact_y))
+            if best_key is None or key > best_key:
+                best_key = key
+                tied = [(contact_x, contact_y)]
+            elif key == best_key:
+                tied.append((contact_x, contact_y))
+
+    if tied:
+        best = (
+            sum(cx for cx, _ in tied) / len(tied),
+            sum(cy for _, cy in tied) / len(tied),
+            power,
+        )
     
     if best:
         return best

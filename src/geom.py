@@ -68,6 +68,49 @@ def facing_diff(face: float, tx: float, ty: float, px: float, py: float) -> floa
     return abs(diff)
 
 
+def faces_toward_own_goal(x: float, y: float, facing: float) -> bool:
+    """True when a player standing at (x, y) with heading `facing` is turned
+    toward the goal they are defending.
+
+    The canonical frame puts our own goal at (OWN_GOAL_X, GOAL_CENTER_Y), so
+    this is the sign of the dot product between the heading vector and the
+    bearing to that goal. Two properties make this the right way to express
+    "facing own goal":
+
+    * It is wrap-safe. A raw ``facing > pi / 2`` test only recognises the
+      positive representation of a backward heading and silently misses the
+      equivalent negative one (``facing < -pi / 2``), because the engine may
+      report a heading anywhere in [-pi, pi].
+    * A dot product between two mirrored vectors is unchanged by the lateral
+      mirror, so the test is mirror-equivariant by construction. A one-sided
+      raw angle threshold is not, once the heading wraps.
+
+    Note the semantics are also strictly better than a raw x-sign test: a
+    player on the touchline facing ``(-1, 0)`` is facing the wall, not the
+    goal, and this returns False for them.
+    """
+    return faces_toward_goal(x, y, facing, OWN_GOAL_X, GOAL_CENTER_Y)
+
+
+def faces_toward_goal(
+    x: float, y: float, facing: float, goal_x: float, goal_y: float
+) -> bool:
+    """True when a player at (x, y) with heading `facing` is turned toward
+    the goal at (goal_x, goal_y).
+
+    This is the generalised version of `faces_toward_own_goal` that works for
+    either team. The test is mirror-equivariant: if both the player position
+    and facing are mirrored across the centre line, and the goal is also
+    mirrored, the result is unchanged.
+    """
+    gx = goal_x - x
+    gy = goal_y - y
+    norm = math.hypot(gx, gy)
+    if norm < 1e-9:
+        return False
+    return (math.cos(facing) * gx + math.sin(facing) * gy) / norm > 0.0
+
+
 def rotate(vx: float, vy: float, radians: float) -> tuple[float, float]:
     c = math.cos(radians)
     s = math.sin(radians)
