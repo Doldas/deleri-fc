@@ -3196,6 +3196,18 @@ class PolicyController:
         ball = state.ball
         role = inp.roles.get(p.id, ROLE_DEFENDER)
 
+        # A shot-followup plan owns off-ball movement while the shot is in
+        # flight. Route loose-ball teammates through the attacking coordinator
+        # even though there is no current possessor; otherwise recovery logic
+        # masks rebound, far-post and cutback targets.
+        if (team_plan is not None
+                and team_plan.phase == TeamPlanPhase.SHOT_FOLLOWUP
+                and team_plan.shot_committed):
+            shot_carrier = possessor or next(
+                (q for q in state.us if q.id == team_plan.carrier_id), p
+            )
+            return self._off_ball_attack(inp, p, shot_carrier, role, team_plan)
+
         if state.has_control() and possessor is not None:
             return self._off_ball_attack(inp, p, possessor, role, team_plan)
 
@@ -4280,4 +4292,3 @@ def config_uses_slap(inp: PolicyInput) -> bool:
 def _box_covered(inp: PolicyInput) -> bool:
     # At least one covered player goal-side of the ball before sliding.
     return len(inp.press_plan.cover) >= 1
-

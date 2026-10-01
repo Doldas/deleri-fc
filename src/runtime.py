@@ -7,8 +7,9 @@ Coordinate normalization:
 The engine always uses the same coordinate system (x=0..60, y=0..40) regardless
 of which side we spawn on. The "us" team in the observation is always the team
 we control, but our goalkeeper may be at x~6 (attacking +x) or x~54 (attacking -x).
-We detect our attacking direction once at kickoff and normalize all state to a
-canonical system where we always attack toward +x (OPP_GOAL_X = 60).
+We discover our attacking direction when our goalkeeper is observed in a
+defensive fifth, then normalize all state to a canonical system where we always
+attack toward +x (OPP_GOAL_X = 60). Discovery is explicitly unknown until then.
 """
 
 from __future__ import annotations
@@ -244,9 +245,12 @@ class MatchContext:
     # observation) rather than from the default. Guards the fallback adoption
     # below so a default can never masquerade as a real configuration.
     duration_known: bool = False
-    # Attack direction: +1 = we attack toward +x (engine goal at 60), -1 = we attack toward -x (engine goal at 0)
-    # Determined on first observation by our GK position.
+    # Attack direction: +1 = we attack toward +x (engine goal at 60), -1 = we
+    # attack toward -x (engine goal at 0). Until a keeper is observed in a
+    # defensive fifth, attack_sign is only a provisional transform; it does not
+    # mean orientation discovery has completed.
     attack_sign: int = 1
+    attack_direction_known: bool = False
 
     def assign_slots(self, state: GameState) -> None:
         if not self.roles and state.us:
@@ -339,16 +343,19 @@ class RuntimeManager:
         ctx = self.get_or_create(observation)
         state = GameState.from_observation(observation)
         
-        # Determine attack direction on first observation (or if not yet determined).
-        # Our GK at x < 30 means we attack +x (normal), x > 30 means we attack -x (mirrored).
-        if ctx.attack_sign == 1:
+        # Discover orientation only from a goalkeeper in a defensive fifth.
+        # The central region is deliberately inconclusive: an advanced/missing
+        # keeper must not be mistaken for evidence of which end we defend.
+        # Once known, orientation is match-stable even if the keeper advances.
+        if not ctx.attack_direction_known:
             our_gk = state.goalkeeper_us()
             if our_gk is not None:
-                gk_x = our_gk.x
-                # At kickoff, our GK is at x~6 (normal) or x~54 (mirrored).
-                # Use midpoint of pitch (30) as threshold.
-                if gk_x > PITCH_LENGTH / 2:
+                if our_gk.x <= PITCH_LENGTH * 0.2:
+                    ctx.attack_sign = 1
+                    ctx.attack_direction_known = True
+                elif our_gk.x >= PITCH_LENGTH * 0.8:
                     ctx.attack_sign = -1
+                    ctx.attack_direction_known = True
         
         # Normalize state to canonical coordinates (we always attack +x).
         norm_state = _normalize_state(state, ctx.attack_sign)
