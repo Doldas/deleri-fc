@@ -1976,6 +1976,29 @@ class PolicyController:
 
         # Use action-value evaluation for all attack decisions
         return self._evaluate_attack_actions(inp, p, team_plan)
+
+    def _apply_team_plan_alignment(self, value: float, intent: PlayerIntent, team_plan) -> float:
+        """Apply TeamPlan alignment bonus to a pass candidate's value.
+        
+        This is called at candidate creation time so the bonus can influence
+        which action wins the ranking, not just modify the value post-selection.
+        """
+        if team_plan is None or intent.action_type != "pass" or intent.receiver_id is None:
+            return value
+        if intent.action_target is None:
+            return value
+        for target in team_plan.targets:
+            if target.player_id == intent.receiver_id:
+                alignment = 1.0 - min(
+                    geom.distance(
+                        intent.action_target[0], intent.action_target[1],
+                        target.target_x, target.target_y
+                    ) / 10.0, 1.0
+                )
+                value += alignment * 2.0  # Small bonus for alignment
+                break
+        return value
+
     def _evaluate_attack_actions(self, inp: PolicyInput, p: Player, team_plan=None) -> PlayerIntent:
         """Evaluate all attack options and return the best one by expected value."""
         state = inp.state
@@ -2115,6 +2138,8 @@ class PolicyController:
                 cross_value = evcalc.ev_cross(p, (tx, ty), power, receiver_id)
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                       receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+                # Apply TeamPlan alignment bonus at candidate creation time
+                cross_value = self._apply_team_plan_alignment(cross_value, intent, team_plan)
                 candidates.append((cross_value, intent, "cross"))
         
         # ---- 3. CUTBACK FROM BYLINE ----
@@ -2125,6 +2150,7 @@ class PolicyController:
             cutback_value = evcalc.ev_cutback(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            cutback_value = self._apply_team_plan_alignment(cutback_value, intent, team_plan)
             candidates.append((cutback_value, intent, "cutback"))
 
         # ---- 4. THROUGH BALL ----
@@ -2134,6 +2160,7 @@ class PolicyController:
             through_value = evcalc.ev_through_ball(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            through_value = self._apply_team_plan_alignment(through_value, intent, team_plan)
             candidates.append((through_value, intent, "through_ball"))
         
         # ---- 5. WALL PASS ----
@@ -2143,6 +2170,7 @@ class PolicyController:
             wall_value = evcalc.ev_wall_pass(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            wall_value = self._apply_team_plan_alignment(wall_value, intent, team_plan)
             candidates.append((wall_value, intent, "wall_pass"))
         
         # ---- 6. SWITCH PLAY ----
@@ -2152,6 +2180,7 @@ class PolicyController:
             switch_value = evcalc.ev_switch_play(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            switch_value = self._apply_team_plan_alignment(switch_value, intent, team_plan)
             candidates.append((switch_value, intent, "switch_play"))
         
         # ---- 7. PULL BACK ----
@@ -2161,6 +2190,7 @@ class PolicyController:
             pullback_value = evcalc.ev_pullback(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            pullback_value = self._apply_team_plan_alignment(pullback_value, intent, team_plan)
             candidates.append((pullback_value, intent, "pullback"))
         
         # ---- 8. ONE-TWO (High Press Escape) ----
@@ -2170,6 +2200,7 @@ class PolicyController:
             onetwo_value = evcalc.ev_onetwo(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            onetwo_value = self._apply_team_plan_alignment(onetwo_value, intent, team_plan)
             candidates.append((onetwo_value, intent, "high_press_onetwo"))
         
         # ---- 9. THIRD MAN RUN ----
@@ -2179,6 +2210,7 @@ class PolicyController:
             third_value = evcalc.ev_third_man(p, (tx, ty), power, receiver_id)
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+            third_value = self._apply_team_plan_alignment(third_value, intent, team_plan)
             candidates.append((third_value, intent, "high_press_third_man"))
         
         # ---- 10. GK BYPASS (High Press) ----
@@ -2189,6 +2221,7 @@ class PolicyController:
                 bypass_value = evcalc.ev_gk_bypass(p, (tx, ty), power, receiver_id)
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                       receiver_id=receiver_id, collection_point=(collect_x, collect_y))
+                bypass_value = self._apply_team_plan_alignment(bypass_value, intent, team_plan)
                 candidates.append((bypass_value, intent, "high_press_gk_bypass"))
         
         # ---- 13. WALL SHOT ----
@@ -2295,24 +2328,8 @@ class PolicyController:
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_value, best_intent, reason = candidates[0]
             
-            # TEAM PLAN INTEGRATION: Boost EV for actions aligned with team plan
+            # TEAM PLAN INTEGRATION: Handle shot commitment and pending pass
             if team_plan is not None:
-                # Boost passes to team plan receivers
-                if best_intent.action_type == "pass" and best_intent.receiver_id is not None:
-                    for target in team_plan.targets:
-                        if target.player_id == best_intent.receiver_id:
-                            # Align pass with team plan target
-                            if best_intent.action_target is not None:
-                                alignment = 1.0 - min(
-                                    geom.distance(
-                                        best_intent.action_target[0], best_intent.action_target[1],
-                                        target.target_x, target.target_y
-                                    ) / 10.0, 1.0
-                                )
-                                best_value += alignment * 2.0  # Small bonus for alignment
-                            self._pending_pass_receiver = best_intent.receiver_id
-                            self._pending_pass_collection = best_intent.collection_point
-                
                 # Mark shot commitment for team coordination
                 if best_intent.action_type == "shoot":
                     team_plan.shot_committed = True
@@ -2326,13 +2343,11 @@ class PolicyController:
                             team_plan.far_post_target_y = GOAL_LOW_Y
                         else:
                             team_plan.far_post_target_y = GOAL_HIGH_Y
-            
-            # If the chosen action is a pass, use the pre-stored receiver and collection point
-            # (set at candidate creation time) so that _decide_off_ball can move the correct
-            # receiver toward the collection point.
-            if best_intent.action_type == "pass" and best_intent.receiver_id is not None:
-                self._pending_pass_receiver = best_intent.receiver_id
-                self._pending_pass_collection = best_intent.collection_point
+                
+                # If the chosen action is a pass, set pending receiver for coordinated off-ball movement
+                if best_intent.action_type == "pass" and best_intent.receiver_id is not None:
+                    self._pending_pass_receiver = best_intent.receiver_id
+                    self._pending_pass_collection = best_intent.collection_point
             
             log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": best_intent.action_type, "reason": reason, "value": best_value}
             self.log.record(log_entry)
@@ -3282,6 +3297,36 @@ class PolicyController:
             self._pending_pass_collection = None
             return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
         
+        # SHOT FOLLOWUP: If carrier is shooting or has shot, attackers move to rebound zones
+        # This MUST come before the general TeamPlan target check so shot coordination takes priority
+        if team_plan is not None and team_plan.shot_committed:
+            # Shot has been committed - enter SHOT_FOLLOWUP coordination
+            if team_plan.rebound_zone_x is not None and team_plan.rebound_zone_y is not None:
+                if role == ROLE_STRIKER or role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+                    # Primary/secondary attackers go for rebound / far post
+                    # Differentiate by team plan role assignment
+                    is_primary = (team_plan.primary_runner_id == p.id)
+                    is_secondary = (team_plan.secondary_runner_id == p.id)
+                    
+                    if is_primary or role == ROLE_STRIKER:
+                        # Primary runner / striker attacks rebound zone
+                        tx = team_plan.rebound_zone_x - 2.0
+                        ty = team_plan.rebound_zone_y
+                    elif is_secondary or team_plan.far_post_target_y is not None:
+                        # Secondary runner / winger attacks far post
+                        tx = team_plan.rebound_zone_x - 5.0
+                        ty = team_plan.far_post_target_y
+                    else:
+                        # Fallback: attack rebound
+                        tx = team_plan.rebound_zone_x - 3.0
+                        ty = team_plan.rebound_zone_y
+                    return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
+                elif role == ROLE_DEFENDER and team_plan.support_player_id == p.id:
+                    # Support player covers cutback zone
+                    tx = max(team_plan.rebound_zone_x - 10.0, 40.0)
+                    ty = GOAL_CENTER_Y
+                    return PlayerIntent(p.id, tx, ty, 0.8, tx, ty, "none")
+        
         # TEAM PLAN INTEGRATION:
         # If we have an active team plan with a target for this player, use it.
         # This coordinates off-ball movement with the carrier's intention.
@@ -3298,17 +3343,16 @@ class PolicyController:
                         face_x, face_y = ball.x, ball.y
                     return PlayerIntent(p.id, tx, ty, speed, face_x, face_y, "none")
         
-        # SHOT FOLLOWUP: If carrier is shooting, attackers should attack rebound zones
+        # PRE-SHOT ANTICIPATION: If shot is expected but not yet committed,
+        # attackers begin moving to anticipated rebound positions
         if team_plan is not None and team_plan.shot_expected and not team_plan.shot_committed:
-            # This is a shot followup phase - attackers move to rebound positions
             if team_plan.rebound_zone_x is not None and team_plan.rebound_zone_y is not None:
                 if role == ROLE_STRIKER or role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
-                    # Primary/secondary attackers go for rebound
-                    tx = team_plan.rebound_zone_x - 3.0  # Slightly behind shot target
+                    tx = team_plan.rebound_zone_x - 3.0
                     ty = team_plan.rebound_zone_y
-                    if team_plan.far_post_target_y is not None:
+                    if team_plan.far_post_target_y is not None and role != ROLE_STRIKER:
                         ty = team_plan.far_post_target_y
-                    return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
+                    return PlayerIntent(p.id, tx, ty, 0.8, tx, ty, "none")
         
         base = self._role_base(role)
         

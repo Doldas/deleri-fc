@@ -123,7 +123,26 @@ class TeamPlanManager:
         """Deterministic invalidation conditions."""
         plan = self.current_plan
         
-        # 1. Possession lost
+        # SHOT FOLLOWUP HANDLING: Check this FIRST before general possession loss
+        # If we're in SHOT_FOLLOWUP phase, allow it to persist for a few ticks
+        if self.current_plan is not None and self.current_plan.phase == TeamPlanPhase.SHOT_FOLLOWUP:
+            # But invalidate immediately if opponent gains possession
+            if ball.possessing_team == "them":
+                return True
+            ticks_since_shot = current_tick - self.current_plan.last_possession_tick
+            if ticks_since_shot <= 15:
+                return False  # Don't invalidate yet
+            else:
+                return True  # Shot followup expired
+        
+        # If shot just committed and ball became loose, transition to SHOT_FOLLOWUP
+        if self.current_plan is not None and self.current_plan.shot_committed and ball.possessing_team is None:
+            # Transition to shot followup phase instead of invalidating
+            self.current_plan.phase = TeamPlanPhase.SHOT_FOLLOWUP
+            self.current_plan.last_possession_tick = current_tick
+            return False  # Don't invalidate, let SHOT_FOLLOWUP run
+        
+        # 1. Possession lost (general case, not shot followup)
         if not inp.state.has_control():
             return True
         
@@ -149,24 +168,15 @@ class TeamPlanManager:
             if runner.x < ball.x - 5.0:  # Behind ball
                 return True
         
-        # 5. Loose ball began
-        if self.current_plan is not None and ball.possessing_team is None and self.current_plan.last_possession_tick > 0:
-            return True
-        
-        # 6. Shot occurred
-        if self.current_plan is not None and self.current_plan.shot_committed and ball.possessing_team is None:
-            # Transition to shot followup handled separately
-            return True
-        
-        # 7. Plan timeout
+        # 5. Plan timeout
         if self.current_plan is not None and current_tick - self.current_plan.created_tick > self.PLAN_TIMEOUT_TICKS:
             return True
         
-        # 8. Dangerous transition requires defensive priority
+        # 6. Dangerous transition requires defensive priority
         if self.current_plan is not None and self._high_transition_risk(inp):
             return True
         
-        # 9. Game phase changed significantly
+        # 7. Game phase changed significantly
         if self.current_plan is not None and self._phase_changed(inp, self.current_plan):
             return True
         
@@ -666,21 +676,28 @@ class TeamPlanManager:
         plan = self.current_plan
         state = inp.state
         
-        # Update ball position tracking
-        plan.last_ball_x = ball.x
-        plan.last_ball_y = ball.y
-        plan.last_possession_tick = current_tick
+        # Update ball position tracking (but not during SHOT_FOLLOWUP - last_possession_tick marks shot time)
+        if plan.phase != TeamPlanPhase.SHOT_FOLLOWUP:
+            plan.last_ball_x = ball.x
+            plan.last_ball_y = ball.y
+            plan.last_possession_tick = current_tick
+        else:
+            # During SHOT_FOLLOWUP, only update ball position for reference
+            plan.last_ball_x = ball.x
+            plan.last_ball_y = ball.y
         
-        # Update phase if progressed
-        new_phase = self._determine_phase(state, ball)
-        if new_phase != plan.phase:
-            plan.phase = new_phase
-            # Regenerate targets for new phase
-            primary = next((p for p in state.outfield_us() if p.id == plan.primary_runner_id), None)
-            secondary = next((p for p in state.outfield_us() if p.id == plan.secondary_runner_id), None)
-            support = next((p for p in state.outfield_us() if p.id == plan.support_player_id), None)
-            rest = next((p for p in state.outfield_us() if p.id == plan.rest_defender_id), None)
-            plan.targets = self._generate_targets(inp, possessor, primary, secondary, support, rest, new_phase)
+        # Don't auto-progress phase during SHOT_FOLLOWUP - it has its own lifecycle
+        if plan.phase != TeamPlanPhase.SHOT_FOLLOWUP:
+            # Update phase if progressed
+            new_phase = self._determine_phase(state, ball)
+            if new_phase != plan.phase:
+                plan.phase = new_phase
+                # Regenerate targets for new phase
+                primary = next((p for p in state.outfield_us() if p.id == plan.primary_runner_id), None)
+                secondary = next((p for p in state.outfield_us() if p.id == plan.secondary_runner_id), None)
+                support = next((p for p in state.outfield_us() if p.id == plan.support_player_id), None)
+                rest = next((p for p in state.outfield_us() if p.id == plan.rest_defender_id), None)
+                plan.targets = self._generate_targets(inp, possessor, primary, secondary, support, rest, new_phase)
         
         # Handle shot commitment
         # Check if carrier is about to shoot (high EV shot available)
@@ -689,7 +706,10 @@ class TeamPlanManager:
             if _shot_worth_taking(inp, possessor):
                 (tx, ty), power = _shot_geometry_target(inp, possessor)
                 ev = ExpectedValueCalculator(inp).ev_shot(possessor, (tx, ty), power)
-                if ev > 10.0:  # High-value shot
+                # Lower threshold: any shot worth taking that has positive EV
+                # or is inside the box (where followup value matters)
+                dist_goal = OPP_GOAL_X - possessor.x
+                if ev > 2.0 or dist_goal <= 11.0:  # Positive EV or inside box
                     plan.shot_expected = True
                     plan.rebound_zone_x = tx
                     plan.rebound_zone_y = ty

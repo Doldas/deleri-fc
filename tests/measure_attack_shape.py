@@ -112,6 +112,7 @@ class AttackMetrics:
     second_ball_recoveries_total: int = 0
     far_post_occupancy_sum: float = 0.0
     cutback_occupancy_sum: float = 0.0
+    attacking_width_snapshots: int = 0
     attacking_width_sum: float = 0.0
     shot_events: int = 0
     possessions: list[Possession] = field(default_factory=list)
@@ -187,7 +188,7 @@ class AttackMetrics:
             / max(1, self.total_possessions),
             "avg_far_post_occupancy_when_shot": self.far_post_occupancy_sum / max(1, self.shot_events),
             "avg_cutback_occupancy_when_shot": self.cutback_occupancy_sum / max(1, self.shot_events),
-            "avg_attacking_width": self.attacking_width_sum / max(1, self.total_possessions),
+            "avg_attacking_width": self.attacking_width_sum / max(1, self.attacking_width_snapshots),
         }
 
 
@@ -344,13 +345,13 @@ class AttackShapeMeasurer:
             if ticks_elapsed > 0:
                 self.metrics.ticks_to_box.append(ticks_elapsed)
 
-        # Check for positive EV shot opportunity
+        # Check for positive EV shot opportunity - count per possession, not per snapshot
         if carrier:
             ev = compute_ev_shot(build_policy_input(state), carrier.id)
             if ev > 5.0:  # EV_SHOT_WORTH threshold
-                possession.positive_ev_shots += 1
                 if not possession.had_positive_ev_shot:
                     possession.had_positive_ev_shot = True
+                    possession.positive_ev_shots += 1
                     possession.ticks_to_positive_ev_shot = step * 6 - possession.start_tick
                     if possession.ticks_to_positive_ev_shot > 0:
                         self.metrics.ticks_to_positive_ev_shot.append(possession.ticks_to_positive_ev_shot)
@@ -378,6 +379,12 @@ class AttackShapeMeasurer:
                 possession.cutback_occupancy_when_shot = 1.0 if cutback_occupied else 0.0
                 self.metrics.cutback_occupancy_sum += possession.cutback_occupancy_when_shot
 
+        # Check for goal events
+        if hasattr(plan_state, 'events'):
+            if "goal:us" in plan_state.events or "goal" in plan_state.events:
+                # Check if it's our goal
+                possession.goals += 1
+
         # Measure attacking width (y-spread of attacking players)
         attackers = [p for p in state.outfield_us() if p.x > 30.0]
         if len(attackers) >= 2:
@@ -385,9 +392,10 @@ class AttackShapeMeasurer:
             width = max(ys) - min(ys)
             possession.attacking_width = width
             self.metrics.attacking_width_sum += width
+            self.metrics.attacking_width_snapshots += 1
 
-        # Count duplicate targets (teammates with very similar targets)
-        # This would need policy intents - approximate with positions for now
+        # Count duplicate targets (teammates with very similar positions)
+        # This approximates duplicate targets using positions
         if len(state.outfield_us()) >= 2:
             positions = [(p.x, p.y) for p in state.outfield_us()]
             for i, (x1, y1) in enumerate(positions):
@@ -462,6 +470,9 @@ class AttackShapeMeasurer:
             self.metrics.players_ahead_of_carrier_total += possession.players_ahead_sum / possession.snapshot_count
             self.metrics.players_behind_carrier_total += possession.players_behind_sum / possession.snapshot_count
         
+        # Track goals (if any were scored in this possession)
+        self.metrics.goals_per_possession = sum(p.goals for p in self.metrics.possessions) / self.metrics.total_possessions
+        
         # Track turnovers by region
         # Simplified: check where possession ended
         if possession.snapshots:
@@ -485,7 +496,7 @@ class AttackShapeMeasurer:
 
 def main():
     print("=" * 60)
-    print("ATTACKING SHAPE MEASUREMENT - BEFORE TeamPlan")
+    print("ATTACKING SHAPE MEASUREMENT - AFTER TeamPlan fixes")
     print("=" * 60)
     
     measurer = AttackShapeMeasurer(seed=20261001, num_matches=20)
@@ -504,7 +515,7 @@ def main():
             print(f"  {key}: {value}")
     
     # Save to file
-    output_path = Path(__file__).parent / "attack_metrics_before.json"
+    output_path = Path(__file__).parent / "attack_metrics_after_v11.json"
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved to {output_path}")
