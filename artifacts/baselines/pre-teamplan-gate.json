@@ -1,0 +1,54 @@
+{
+  "kind": "baseline",
+  "label": "pre-teamplan-gate",
+  "recordedAtUtc": "2026-10-01T17:59:54Z",
+  "codeVersion": "1.1.0",
+  "engineVersion": "1.0",
+  "codeCommit": "e1217bfbdef9d0ce26b6b5ba6f3cb19b7c71b1a8",
+  "comparisonBaselineCommit": "ac6d644",
+  "image": "football-team-deleri-fc:dev",
+  "imageDigest": "sha256:750b8d8eba3af7ca489b89839b7069d445a18aa6078c5a60a263ede3e9ab6066",
+  "unitTests": {
+    "command": "python3 -m unittest discover -s tests",
+    "total": 331,
+    "failures": 1,
+    "skipped": 3,
+    "knownFailure": "test_opponents.GeneratedTeamTests.test_generated_teams_are_up_to_date",
+    "knownFailureReason": "scripts/build_opponent_teams.py references the pre-restructure paths null-pointers-fc/ and opponents/; pre-existing at HEAD and out of team scope (fix requires files outside My Teams/deleri-fc)"
+  },
+  "mirrorAudit": {
+    "command": "python3 .lab/mirror_audit.py 400",
+    "checks": 13200,
+    "failures": 0
+  },
+  "conformance": {
+    "command": "football-team validate --path . --skip-build",
+    "result": "PASS",
+    "fixtures": 25,
+    "replayedIdentically": true,
+    "decisionsMs": {"p50": 0.9, "p95": 1.2, "max": 16.6},
+    "startupMs": 266.9
+  },
+  "practiceGate": {
+    "command": "bash scripts/practice_gate.sh",
+    "seed": "gate-v1",
+    "gamesPerOpponent": 20,
+    "matchesPerOpponent": 40,
+    "opponents": {
+      "reference": {"winPct": 100.0, "goalsFor": 199, "goalsAgainst": 0, "floorWinPct": 90, "floorGpm": 3.0},
+      "reference-strikers": {"winPct": 100.0, "goalsFor": 120, "goalsAgainst": 0, "floorWinPct": 90},
+      "slapstick-united": {"winPct": 100.0, "goalsFor": 140, "goalsAgainst": 0, "floorWinPct": 90},
+      "counter-elite/Vanguard": {"winPct": 27.5, "goalsFor": 11, "goalsAgainst": 30, "concededPerMatch": 0.75, "floorWinPct": 20, "ceilingConceded": 1.45}
+    },
+    "result": "PASS"
+  },
+  "coverCoordination": {
+    "command": "python3 .lab/cover_check.py . AFTER 200",
+    "measuredAgainst": "ac6d644",
+    "defending": {"coverers": 292, "statesWith2PlusCovers": 92, "duplicateStates": 2, "minSeparation": 11.12, "goalSidePct": 99, "onLinePct": 57},
+    "loose": {"coverers": 425, "statesWith2PlusCovers": 101, "duplicateStates": 18, "minSeparation": 6.01, "goalSidePct": 88, "onLinePct": 58},
+    "possession": {"coverers": 359, "statesWith2PlusCovers": 104, "duplicateStates": 0, "minSeparation": 28.0, "goalSidePct": 43, "onLinePct": 52},
+    "note": "The 18 loose duplicate states are intentional loose-ball meeting-point runner convergence, a false positive of the cover metric. Defending duplicates fell from 62 at ac6d644 to 2; those 2 are close attackers in the deep-danger split (0.82 m / 0.63 m apart), not same-point."
+  },
+  "scope": "Pre-TeamPlan correctness and measurement gate. No TeamPlan, EV tuning, RL, or MCTS changes; attacking architecture preserved."
+}
