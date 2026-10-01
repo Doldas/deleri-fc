@@ -1,4 +1,4 @@
-# My Team FC
+# Deleri FC
 
 This team was created with the Football Babylon tactics builder. Open it again with
 `football-team create` to change the formation, roles, and tactical sliders in Basic mode.
