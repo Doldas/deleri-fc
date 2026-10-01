@@ -33,7 +33,7 @@ import statistics
 import sys
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]  # my-team-fc root
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # deleri-fc root
 sys.path.insert(0, str(ROOT))
 
 from src.opponents import REGISTRY  # noqa: E402

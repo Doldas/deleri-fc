@@ -1,7 +1,7 @@
 # Opponent pool: authoritative measurements
 
 All numbers from the real Babylon engine via `football-team simulate`, not from
-`LightEngine`. Our side is `my-team-fc` throughout; goals are written
+`LightEngine`. Our side is `deleri-fc` throughout; goals are written
 `us-them`.
 
 ## The pool is by far the hardest opposition in the kit

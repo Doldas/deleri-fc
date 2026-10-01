@@ -19,7 +19,7 @@ import random
 import sys
 import types
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]  # my-team-fc root
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # deleri-fc root
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

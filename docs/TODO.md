@@ -1,7 +1,7 @@
 # TODO — Big task list (mirrors ACTION_PLAN.md)
 
 Legend: `[ ]` open · `[x]` done · `[~]` in progress · `[w]` waiting/blocked
-Scope rule (AGENTS.md): only files inside `My Teams/my-team-fc/` may change.
+Scope rule (AGENTS.md): only files inside `My Teams/deleri-fc/` may change.
 
 ---
 

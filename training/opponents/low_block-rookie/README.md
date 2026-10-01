@@ -1,7 +1,7 @@
 # Blue Wall FC (rookie)
 
 Generated opponent for the Football Babylon kit. **Do not edit by hand** -- run
-`python scripts/build_opponent_teams.py` from `My Teams/my-team-fc/` after
+`python scripts/build_opponent_teams.py` from `My Teams/deleri-fc/` after
 changing `src/opponents/engine_brain.py` or the family's tuning table.
 
 * team id: `low_block-rookie`

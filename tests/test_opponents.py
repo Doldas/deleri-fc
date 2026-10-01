@@ -487,7 +487,7 @@ class SweepReportTests(unittest.TestCase):
 [candidate 4/6] 0-1 loss seed=simulation-0004 side=home
 [candidate 5/6] 0-1 loss seed=simulation-0005 side=home
 [candidate 6/6] 0-1 loss seed=simulation-0006 side=home
-candidate (football-team-my-team-fc:dev)
+candidate (football-team-deleri-fc:dev)
 Matches: 6/6 completed  W/D/L: 3/0/3  Win rate: 50.0 %
 Goals: 3-3  Average: 0.5-0.5  Difference: 0
 Clean sheets: 50.0 %  Possession: 58.9%  Shots: 18  Missed decisions: 0

@@ -35,9 +35,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-# The team directory was renamed my-team-fc -> deleri-fc, and the opponent
-# pool was moved under training/opponents. Both paths below used to be stale,
-# which made this gate resolve to nothing and silently exercise no matches.
+# The team directory is now deleri-fc, and the opponent pool lives under
+# training/opponents. Both paths below used to be stale, which made this gate
+# resolve to nothing and silently exercise no matches.
 TEAM="$ROOT/My Teams/deleri-fc"
 OPPONENTS="$TEAM/training/opponents"
 CLI="$ROOT/tools/team-cli/linux-x64/football-team"

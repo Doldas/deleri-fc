@@ -10,5 +10,5 @@ generated plan safely in `custom_strategy.py`; the builder never overwrites that
 football-team build
 football-team validate
 football-team practice --opponent reference
-football-team export --output my-team-fc.tar.zst
+football-team export --output deleri-fc.tar.zst
 ```

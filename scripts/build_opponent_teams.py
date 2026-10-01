@@ -25,7 +25,7 @@ import pathlib
 import pprint
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent  # My Teams/my-team-fc
+ROOT = pathlib.Path(__file__).resolve().parent.parent  # My Teams/deleri-fc
 REPO = ROOT.parent.parent  # repository root, which holds `opponents/`
 sys.path.insert(0, str(ROOT))
 
@@ -316,7 +316,7 @@ def render_readme(team_id: str, team_name: str, params: dict) -> str:
     return f"""# {team_name}
 
 Generated opponent for the Football Babylon kit. **Do not edit by hand** -- run
-`python scripts/build_opponent_teams.py` from `My Teams/my-team-fc/` after
+`python scripts/build_opponent_teams.py` from `My Teams/deleri-fc/` after
 changing `src/opponents/engine_brain.py` or the family's tuning table.
 
 * team id: `{team_id}`

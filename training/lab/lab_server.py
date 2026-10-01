@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]  # my-team-fc root
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # deleri-fc root
 REPO = ROOT.parent.parent  # repo root
 CLI = REPO / "football-team"
 OPPONENTS = ROOT / "training" / "opponents"
