@@ -80,6 +80,12 @@ When in doubt, re-read `docs/00-game-engine-rules.md`, `RULES.md`, and `protocol
 - If the internal model and the engine disagree, **fix the model**.
 - Every experiment records: seed, strategy hash, config hash, engine version,
   code version, results, metrics.
+- `artifacts/policies/candidate.json` is a generated artifact and its
+  `generatedAtUtc` is rewritten on every run. When a run has changed nothing in
+  it except `generatedAtUtc` (the genome, versions and every other field are
+  identical), that is timestamp churn, not a change: revert it
+  (`git checkout -- artifacts/policies/candidate.json`) rather than committing
+  it. Only commit `candidate.json` when a real field actually changed.
 
 ## 8. Testing gates (AISTRATEGI §51–53)
 
