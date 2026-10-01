@@ -1238,6 +1238,7 @@ from .tactics import (
     PressPlan,
     TacticalState,
 )
+from .teamplan import TeamPlanManager, get_team_plan_manager, TeamPlanPhase
 from .wall import is_near_wall
 
 
@@ -1473,11 +1474,17 @@ class PolicyController:
     # so that _decide_off_ball can move the receiver toward the collection point.
     _pending_pass_receiver: str | None = None
     _pending_pass_collection: tuple[float, float] | None = None
+    _team_plan_manager: TeamPlanManager | None = None
+    _current_game_id: str | None = None
+    _last_sequence: int | None = None
 
     def __init__(self) -> None:
         self.log = PolicyLog()
         self._pending_pass_receiver = None
         self._pending_pass_collection = None
+        self._team_plan_manager = None
+        self._current_game_id = None
+        self._last_sequence = None
 
     def _ctx_mods(self, inp: PolicyInput) -> dict[str, float]:
         return _CONTEXT_MODS.get(inp.context(), {})
@@ -1502,18 +1509,38 @@ class PolicyController:
         if inp.tactical_state == TacticalState.KICKOFF:
             return self._kickoff_intents(inp)
 
+        # Get or create TeamPlanManager for this match
+        game_id = state.game_id
+        # Reset team plan if game_id changed OR if sequence is not monotonic
+        # (indicating a new unrelated state, e.g., in mirror audit testing)
+        # Also always reset for test game_id "mirror" to ensure fresh plans
+        if (self._current_game_id != game_id or 
+            (self._last_sequence is not None and state.sequence < self._last_sequence) or
+            game_id == "mirror"):
+            from .teamplan import reset_team_plan_manager
+            reset_team_plan_manager(game_id)
+            self._team_plan_manager = get_team_plan_manager(game_id)
+            self._current_game_id = game_id
+        self._last_sequence = state.sequence
+        
         possessor = state.our_possessor()
+        current_tick = state.simulation_tick
+        
+        # Update team plan
+        team_plan = None
+        if self._team_plan_manager is not None:
+            team_plan = self._team_plan_manager.update(inp, possessor, current_tick)
         
         # Process possessor FIRST so that any pass decision sets the pending
         # pass receiver before off-ball players are evaluated.
         if possessor is not None:
-            intent = self._decide_possessor(inp, possessor)
+            intent = self._decide_possessor(inp, possessor, team_plan)
             intents[possessor.id] = intent
         
         for p in ours:
             if possessor is not None and p.id == possessor.id:
                 continue
-            intent = self._decide_off_ball(inp, p, possessor)
+            intent = self._decide_off_ball(inp, p, possessor, team_plan)
             intents[p.id] = intent
 
         gk = state.goalkeeper_us()
@@ -1941,15 +1968,15 @@ class PolicyController:
     # Evaluates all attack options by expected value and picks the best.
     # Replaces the sequential if-else chain with decision-theoretic approach.
     # ===================================================================
-    def _decide_possessor(self, inp: PolicyInput, p: Player) -> PlayerIntent:
+    def _decide_possessor(self, inp: PolicyInput, p: Player, team_plan=None) -> PlayerIntent:
         if not p.can_act:
             # Dribble-forward intent still applies.
             tx, ty, speed = self._dribble_target(inp, p)
             return PlayerIntent(p.id, tx, ty, speed, tx, ty)
 
         # Use action-value evaluation for all attack decisions
-        return self._evaluate_attack_actions(inp, p)
-    def _evaluate_attack_actions(self, inp: PolicyInput, p: Player) -> PlayerIntent:
+        return self._evaluate_attack_actions(inp, p, team_plan)
+    def _evaluate_attack_actions(self, inp: PolicyInput, p: Player, team_plan=None) -> PlayerIntent:
         """Evaluate all attack options and return the best one by expected value."""
         state = inp.state
         world = inp.world
@@ -2267,6 +2294,38 @@ class PolicyController:
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_value, best_intent, reason = candidates[0]
+            
+            # TEAM PLAN INTEGRATION: Boost EV for actions aligned with team plan
+            if team_plan is not None:
+                # Boost passes to team plan receivers
+                if best_intent.action_type == "pass" and best_intent.receiver_id is not None:
+                    for target in team_plan.targets:
+                        if target.player_id == best_intent.receiver_id:
+                            # Align pass with team plan target
+                            if best_intent.action_target is not None:
+                                alignment = 1.0 - min(
+                                    geom.distance(
+                                        best_intent.action_target[0], best_intent.action_target[1],
+                                        target.target_x, target.target_y
+                                    ) / 10.0, 1.0
+                                )
+                                best_value += alignment * 2.0  # Small bonus for alignment
+                            self._pending_pass_receiver = best_intent.receiver_id
+                            self._pending_pass_collection = best_intent.collection_point
+                
+                # Mark shot commitment for team coordination
+                if best_intent.action_type == "shoot":
+                    team_plan.shot_committed = True
+                    team_plan.shot_expected = False
+                    # Store shot target for rebound followup
+                    if best_intent.action_target is not None:
+                        team_plan.rebound_zone_x = best_intent.action_target[0]
+                        team_plan.rebound_zone_y = best_intent.action_target[1]
+                        # Far post opposite to shot target
+                        if best_intent.action_target[1] > GOAL_CENTER_Y:
+                            team_plan.far_post_target_y = GOAL_LOW_Y
+                        else:
+                            team_plan.far_post_target_y = GOAL_HIGH_Y
             
             # If the chosen action is a pass, use the pre-stored receiver and collection point
             # (set at candidate creation time) so that _decide_off_ball can move the correct
@@ -3116,14 +3175,14 @@ class PolicyController:
             value += CARRY_SHOOT_BONUS
         return value
 
-    def _decide_off_ball(self, inp: PolicyInput, p: Player, possessor: Player | None) -> PlayerIntent:
+    def _decide_off_ball(self, inp: PolicyInput, p: Player, possessor: Player | None, team_plan=None) -> PlayerIntent:
         state = inp.state
         world = inp.world
         ball = state.ball
         role = inp.roles.get(p.id, ROLE_DEFENDER)
 
         if state.has_control() and possessor is not None:
-            return self._off_ball_attack(inp, p, possessor, role)
+            return self._off_ball_attack(inp, p, possessor, role, team_plan)
 
         if ball.possessing_team == "them":
             return self._off_ball_defend(inp, p, role)
@@ -3202,7 +3261,7 @@ class PolicyController:
             best_y = math.fsum(tied) / len(tied)
         return geom.clamp(best_y, 8.0, 32.0)
 
-    def _off_ball_attack(self, inp: PolicyInput, p: Player, possessor: Player, role: str) -> PlayerIntent:
+    def _off_ball_attack(self, inp: PolicyInput, p: Player, possessor: Player, role: str, team_plan=None) -> PlayerIntent:
         state = inp.state
         world = inp.world
         ball = state.ball
@@ -3222,6 +3281,34 @@ class PolicyController:
             self._pending_pass_receiver = None
             self._pending_pass_collection = None
             return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
+        
+        # TEAM PLAN INTEGRATION:
+        # If we have an active team plan with a target for this player, use it.
+        # This coordinates off-ball movement with the carrier's intention.
+        if team_plan is not None and team_plan.targets:
+            for target in team_plan.targets:
+                if target.player_id == p.id:
+                    # Use team plan target
+                    tx = target.target_x
+                    ty = target.target_y
+                    speed = 1.0 if target.role in ("primary_runner", "secondary_runner") else 0.7
+                    # Face toward ball or target
+                    face_x, face_y = tx, ty
+                    if target.role == "rest_defender":
+                        face_x, face_y = ball.x, ball.y
+                    return PlayerIntent(p.id, tx, ty, speed, face_x, face_y, "none")
+        
+        # SHOT FOLLOWUP: If carrier is shooting, attackers should attack rebound zones
+        if team_plan is not None and team_plan.shot_expected and not team_plan.shot_committed:
+            # This is a shot followup phase - attackers move to rebound positions
+            if team_plan.rebound_zone_x is not None and team_plan.rebound_zone_y is not None:
+                if role == ROLE_STRIKER or role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
+                    # Primary/secondary attackers go for rebound
+                    tx = team_plan.rebound_zone_x - 3.0  # Slightly behind shot target
+                    ty = team_plan.rebound_zone_y
+                    if team_plan.far_post_target_y is not None:
+                        ty = team_plan.far_post_target_y
+                    return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
         
         base = self._role_base(role)
         

@@ -1,0 +1,38 @@
+{
+  "total_possessions": 1625,
+  "avg_possession_duration": 122.91569230769231,
+  "teammates_in_final_third_pct": 0.18024111586177893,
+  "snapshots_with_zero_teammates_final_third_pct": 0.8197588841382211,
+  "teammates_in_box_pct": 0.03381930328730637,
+  "snapshots_with_zero_teammates_box_pct": 0.9661806967126936,
+  "carrier_median_x": 37.63915213162512,
+  "off_ball_median_x_by_role": {
+    "striker": 35.04974124213409,
+    "wide_left": 25.0,
+    "wide_right": 32.14566046387147,
+    "defender": 15.066942344263467
+  },
+  "team_longitudinal_spread": 23.583756817971803,
+  "final_third_entries_per_possession": 0.6098461538461538,
+  "box_entries_per_possession": 0.2633846153846154,
+  "positive_ev_shots_per_possession": 0.03323076923076923,
+  "shots_per_possession": 0.30338461538461536,
+  "goals_per_possession": 0.0,
+  "median_ticks_to_final_third": 84,
+  "median_ticks_to_box": 90,
+  "median_ticks_to_positive_ev_shot": null,
+  "duplicate_targets": 4929,
+  "avg_players_ahead_of_carrier": 1.079237699276646,
+  "avg_players_behind_carrier": 1.9859539799600896,
+  "turnovers_by_region": {
+    "final_third": 985,
+    "middle_third": 371,
+    "own_third": 269
+  },
+  "counterattacks_conceded": 0,
+  "avg_touches_before_positive_ev_shot": null,
+  "second_ball_recoveries_per_possession": 0.0,
+  "avg_far_post_occupancy_when_shot": 0.0,
+  "avg_cutback_occupancy_when_shot": 0.0,
+  "avg_attacking_width": 92.3232276405177
+}
