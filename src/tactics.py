@@ -161,7 +161,7 @@ def _trigger_note(state: GameState, carrier: Player) -> str:
     if carrier is None:
         return ""
     note = ""
-    if geom.faces_toward_goal(carrier.x, carrier.y, carrier.facing, OPP_GOAL_X, GOAL_CENTER_Y):
+    if geom.faces_toward_own_goal(carrier.x, carrier.y, carrier.facing):
         note += "facing_own_goal "
     if is_trap_near_wall(carrier):
         note += "near_wall "

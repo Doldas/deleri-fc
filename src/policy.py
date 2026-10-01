@@ -136,6 +136,24 @@ def _touchline_side(y: float) -> str | None:
     return None
 
 
+def _closest_on_flank(
+    state: GameState, p: Player, side: str, ax: float, ay: float
+) -> bool:
+    """True when ``p`` is the nearest of our outfielders on ``side`` to (ax, ay).
+
+    Wall-lane blocking and wall-pass interception are single-defender jobs. If
+    every outfielder on the flank runs the same geometry they all converge on
+    one point, which is the same duplicate-target failure the cover geometry
+    had. Ordering by (distance, id) is unchanged by the lateral mirror, so the
+    chosen defender is mirror-equivariant.
+    """
+    same = [q for q in state.outfield_us() if _lateral_half(q.y) == side]
+    if not same:
+        return False
+    nearest = min(same, key=lambda q: (geom.distance(q.x, q.y, ax, ay), q.id))
+    return nearest.id == p.id
+
+
 from .geom import (
     GOAL_CENTER_Y,
     GOAL_HALF,
@@ -1197,6 +1215,7 @@ from .physics import (
     GK_DIVE_LATERAL_MIN,
     GK_LATERAL_REACH,
     MIN_PASS_TRAVEL,
+    at_or_above,
     pass_collection_point,
     pass_lane_clear,
     pick_shot_target,
@@ -1349,7 +1368,17 @@ def _detect_low_block(state: GameState) -> dict:
     # Determine which flank is weaker (fewer defenders)
     left_defenders = sum(1 for p in them if p.y < 20.0 and p.x > 30.0)
     right_defenders = sum(1 for p in them if p.y > 20.0 and p.x > 30.0)
-    weak_flank = "left" if left_defenders < right_defenders else "right"
+    # A tie has no weaker flank. Answering "left" (or "right") anyway names a
+    # side the picture does not distinguish, and since the answer is a *label*
+    # the lateral mirror cannot flip it: a symmetric block would be reported
+    # weak on the same side in both pictures, and the switch-play decision
+    # would act on that phantom weakness.
+    if left_defenders < right_defenders:
+        weak_flank = "left"
+    elif right_defenders < left_defenders:
+        weak_flank = "right"
+    else:
+        weak_flank = None
     
     # Find gaps between defenders
     left_gap = 20.0 - min((p.y for p in them if p.y < 20.0 and p.x > 30.0), default=0.0)
@@ -1463,7 +1492,6 @@ class PolicyController:
         return v * mods.get(key, 1.0)
 
     def decide(self, inp: PolicyInput) -> dict[str, PlayerIntent]:
-        print(f"DECIDE START: inp={id(inp)}", flush=True)
         state: GameState = inp.state
         intents: dict[str, PlayerIntent] = {}
         ours = state.outfield_us()
@@ -2227,8 +2255,11 @@ class PolicyController:
             reachable = []
             for value, intent, reason in candidates:
                 if intent.action_type == "pass" and intent.action_target is not None:
-                    if geom.distance(p.x, p.y, intent.action_target[0],
-                                     intent.action_target[1]) < MIN_PASS_TRAVEL:
+                    if not at_or_above(
+                        geom.distance(p.x, p.y, intent.action_target[0],
+                                      intent.action_target[1]),
+                        MIN_PASS_TRAVEL,
+                    ):
                         continue
                 reachable.append((value, intent, reason))
             candidates = reachable
@@ -2391,9 +2422,14 @@ class PolicyController:
         # Find opposite winger
         target_role = ROLE_WIDE_RIGHT if role == ROLE_WIDE_LEFT else ROLE_WIDE_LEFT
         if role not in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT):
-            # Central player - switch to weaker flank
+            # Central player - switch to weaker flank, but only when there is
+            # one. A balanced block has no weaker flank, so there is nothing to
+            # switch towards and the whole candidate is dropped.
             lb_info = _detect_low_block(state)
-            target_role = ROLE_WIDE_LEFT if lb_info.get("weak_flank") == "left" else ROLE_WIDE_RIGHT
+            weak = lb_info.get("weak_flank")
+            if weak is None:
+                return None
+            target_role = ROLE_WIDE_LEFT if weak == "left" else ROLE_WIDE_RIGHT
         
         for t in state.outfield_us():
             if inp.roles.get(t.id) == target_role and t.x > 25.0:
@@ -2900,22 +2936,36 @@ class PolicyController:
         return risk + (0.0 if my < 6.0 or my > 34.0 else 0.05)
 
     def _open_goal_y(self, state: GameState, bx: float, by: float) -> float:
-        """Aim for the goal side with the bigger angle and fewer bodies on it."""
+        """Aim for the goal side with the bigger angle and fewer bodies on it.
+
+        Every term of the score is mirror-invariant: the number of bodies in a
+        lane swaps with the lane's own mirror, and ``abs(cand - GOAL_CENTER_Y)``
+        is unchanged by the reflection. So exact ties really are ties in the
+        mirrored picture too, and a fixed scan order cannot break them without
+        pinning the answer to one touchline.
+
+        Ties are therefore resolved geometrically. Among the equally-scoring
+        candidates prefer the one nearest the carrier's own lateral position,
+        which is the near-post answer and mirrors because both the carrier's y
+        and the candidate's y are reflected. When the carrier is exactly on the
+        centre line that preference is itself a tie, so the equally-near
+        candidates are averaged -- the same resolution ``_pick_lateral_candidate``
+        uses, and the mirror of a mean is the mean of the mirrors.
+        """
         best_y, best_score = GOAL_CENTER_Y, -1e9
+        tied: list[float] = []
         for cand in (GOAL_LOW_Y + 1.2, GOAL_CENTER_Y, GOAL_HIGH_Y - 1.2):
             lane = [o for o in state.outfield_them() if geom.seg_point_distance_sq(o.x, o.y, bx, by, OPP_GOAL_X, cand) < 9.0]
             score = -len(lane) * 10.0 + abs(cand - GOAL_CENTER_Y) * 0.5
-            # Use mirror-equivariant tie-breaking: strict > means first candidate wins on tie.
-            # Candidates are ordered low->center->high, which is not mirror-equivariant.
-            # Use the candidate's distance from the carrier's lateral position as tie-break,
-            # which mirrors correctly (carrier's y mirrors, candidate's y mirrors).
             if score > best_score + _CHANNEL_TIE_EPS:
                 best_score, best_y = score, cand
+                tied = [cand]
             elif score >= best_score - _CHANNEL_TIE_EPS:
-                # Tie: prefer the candidate on the same side as the carrier
-                # This mirrors because both carrier y and candidate y mirror
-                if abs(by - cand) < abs(by - best_y):
-                    best_score, best_y = score, cand
+                tied.append(cand)
+        if len(tied) > 1:
+            nearest = min(abs(by - c) for c in tied)
+            closest = [c for c in tied if abs(by - c) <= nearest + _CHANNEL_TIE_EPS]
+            best_y = math.fsum(closest) / len(closest)
         return best_y
 
     def _dribble_target(self, inp: PolicyInput, p: Player) -> tuple[float, float, float]:
@@ -3004,8 +3054,17 @@ class PolicyController:
                     ty += ay / norm * 4.0
                 ahead = (opp.x - bx) * step / max(step, 1.0)
                 if 0.0 < ahead < 5.0 and abs(opp.y - by) < 3.0:
-                    side = 1.0 if by >= opp.y else -1.0
-                    ty += side * 7.0
+                    # Which way to slide is a comparison of the carrier's lateral
+                    # position against the marker's, and the reflection turns
+                    # `>=` into `<=`. The two agree on a strict inequality only,
+                    # so an exact tie (a marker directly in front, or a carrier
+                    # exactly on the centre line) has to take no side at all --
+                    # sliding to a named touchline there is the same one-sided
+                    # bias this invariant exists to rule out.
+                    if by > opp.y:
+                        ty += 7.0
+                    elif by < opp.y:
+                        ty -= 7.0
 
         # Stay off our own goal and inside the pitch.
         tx = geom.clamp(tx, 1.5, OPP_GOAL_X - 1.5)
@@ -3105,6 +3164,7 @@ class PolicyController:
         striker_y = GOAL_CENTER_Y if striker is None else striker.y
         best_y = GOAL_CENTER_Y
         best_key: tuple[float, ...] | None = None
+        tied: list[float] = []
         for center_y, y_min, y_max in bands:
             # 1. Opponents screening this channel in front of the striker.
             markers = sum(
@@ -3126,10 +3186,20 @@ class PolicyController:
             # 5. Canonical, value-neutral last resort. Only reached when every
             #    input above is symmetric, in which case the channels are
             #    provably equal in value and either is a correct answer.
-            key = (float(markers), ball_gap, float(own_load), striker_gap, center_y)
+            #    ``center_y`` itself must not appear in the key: it is the one
+            #    component the lateral mirror does *not* preserve, so ranking on
+            #    it silently pins every tie to the low-y touchline. Ties are
+            #    resolved below by averaging the tied centres, which maps onto
+            #    the mirrored centre under reflection.
+            key = (float(markers), ball_gap, float(own_load), striker_gap)
             if best_key is None or _lex_less(key, best_key):
                 best_key = key
                 best_y = center_y
+                tied = [center_y]
+            elif key == best_key:
+                tied.append(center_y)
+        if len(tied) > 1:
+            best_y = math.fsum(tied) / len(tied)
         return geom.clamp(best_y, 8.0, 32.0)
 
     def _off_ball_attack(self, inp: PolicyInput, p: Player, possessor: Player, role: str) -> PlayerIntent:
@@ -3402,7 +3472,12 @@ class PolicyController:
         my_assignment = assignments.get(p.id)
         
         # Man-mark their most advanced forward on deep transitions: two deepest
-        # teammates split the deepest two attackers goal-side.
+        # teammates split the deepest two attackers goal-side. Keying the mark
+        # to each defender's own rank (rather than sending both to the single
+        # most-advanced attacker) is what keeps the pair coordinated; before
+        # this, both defenders were ordered to the same point. The rank order
+        # uses x and id only, neither of which changes under the lateral mirror,
+        # so the split is mirror-equivariant.
         danger = _most_advanced(state, "them")
         if danger is not None and danger.x > 28.0:
             deepest = sorted(
@@ -3410,10 +3485,17 @@ class PolicyController:
                 key=lambda q: (q.x, q.id),
             )[:2]
             if p in deepest:
-                mark_y = danger.y
+                attackers = sorted(
+                    state.outfield_them(),
+                    key=lambda q: (q.x, q.id),
+                    reverse=True,
+                )
+                rank = deepest.index(p)
+                mark = attackers[min(rank, len(attackers) - 1)]
+                mark_y = mark.y
                 if inp.opp is not None:
                     mark_y = geom.clamp(mark_y + inp.opp.prefer_side() * 3.0, 3.0, PITCH_WIDTH - 3.0)
-                tx = geom.clamp((danger.x + 5.0) * 0.5, 6.0, ball.x)
+                tx = geom.clamp((mark.x + 5.0) * 0.5, 6.0, ball.x)
                 ty = geom.clamp(mark_y, 3.0, PITCH_WIDTH - 3.0)
                 return PlayerIntent(p.id, tx, ty, 1.0, ball.x, ball.y, "none")
 
@@ -3543,8 +3625,14 @@ class PolicyController:
             return None
         wall_y = PITCH_WIDTH if side == "top" else 0.0
 
-        # Only the defender already on that flank blocks it.
+        # Only the defender already on that flank blocks it, and only the one
+        # closest to the carrier: sending every outfielder on the flank to the
+        # same point stacked three players on one spot.
         if _lateral_half(p.y) != side:
+            return None
+        if not _closest_on_flank(
+            state, p, side, their_possessor.x, their_possessor.y
+        ):
             return None
 
         # Stand in the lane: half way between their carrier and the touchline,
@@ -3657,6 +3745,11 @@ class PolicyController:
                 continue
             if our_side != side:
                 continue
+            # Only the nearest defender on that flank intercepts the wall pass.
+            if not _closest_on_flank(
+                state, p, side, their_possessor.x, their_possessor.y
+            ):
+                continue
 
             for opp in their_players:
                 if opp.id == their_possessor.id:
@@ -3716,12 +3809,14 @@ class PolicyController:
         return (ball.x, ball.y)
 
     # Stations for the covering players behind the presser, expressed as
-    # (fraction of the ball-to-own-goal distance to slide back, how far to slide
-    # laterally towards the covering player's own current position). Slot 0 is the
-    # original single cover point, so states with one cover player behave exactly as
-    # before. Later slots drop progressively deeper and spread further towards their
-    # own side of the pitch, which is what turns two covers on one point into two
-    # covers on complementary lanes.
+    # (fraction of the ball-to-own-goal distance to slide *back towards our
+    # goal*, how much to interpolate the lateral coordinate back to the shared
+    # legacy line -- 0 keeps the player's own y, 1 returns to the line). Slot 0
+    # is the original single cover point (which is 0.45 of the way from the ball
+    # to our goal), so states with one cover player behave exactly as before.
+    # Later slots are strictly deeper than the legacy point and keep more of the
+    # player's own lateral position, which is what turns two covers on one point
+    # into two covers on complementary lanes.
     #
     # Both components must be mirror-equivariant, which rules out the obvious
     # construction of offsetting perpendicular to the ball-to-goal axis: a
@@ -3730,34 +3825,39 @@ class PolicyController:
     # interpolating towards the player's own y are both built from quantities that
     # are unchanged by the mirror, so the result is equivariant by construction.
     _COVER_STATIONS: tuple[tuple[float, float], ...] = (
-        (0.00, 0.00),
-        (0.16, 0.45),
-        (0.30, 0.60),
-        (0.42, 0.35),
-        (0.55, 0.65),
+        (0.45, 0.00),  # unused: slot 0 returns the legacy point directly
+        (0.58, 0.45),
+        (0.68, 0.40),
+        (0.78, 0.35),
+        (0.86, 0.30),
     )
 
 
     def _cover_slot(self, inp: PolicyInput, p: Player) -> int:
-        """Rank of `p` among our outfielders by distance to the ball.
+        """Rank of `p` among the players it is coordinating with.
 
         This is the tie-break that makes cover geometry *coordinated* rather
         than duplicated. The rank is used to give each covering player its own
         station on the ball-to-our-goal line, so two cover players protect
         complementary lanes instead of converging on one point.
 
-        Ranking by distance to the ball is both deterministic and
-        mirror-equivariant: distances are unchanged by the lateral mirror, and
-        the id tie-break only ever fires on players that are exactly
-        equidistant, where the ordering is arbitrary but stable. Because the
-        rank is computed over *all* our outfielders, any subset of them that
-        asks for a cover target receives distinct targets.
+        The rank is taken among the press plan's COVER assignments, so a state
+        with a single cover player keeps slot 0 and therefore the original
+        single-cover point. Players that reach ``_cover_point`` from the
+        loose-ball path are not cover assignments, so they rank among the whole
+        outfield instead, which is what spreads the non-running recover shape.
+        Ranking by distance to the ball is deterministic and mirror-equivariant:
+        distances are unchanged by the lateral mirror, and the id tie-break only
+        fires on players that are exactly equidistant.
         """
         state = inp.state
         ball = state.ball
-        outfield = state.outfield_us()
+        cover_ids = set(inp.press_plan.cover)
+        members = state.outfield_us()
+        if p.id in cover_ids:
+            members = [q for q in members if q.id in cover_ids]
         ordered = sorted(
-            outfield,
+            members,
             key=lambda q: (geom.distance(q.x, q.y, ball.x, ball.y), q.id),
         )
         for rank, q in enumerate(ordered):
@@ -3778,8 +3878,23 @@ class PolicyController:
         tx = max(4.0, tx)
         cx = geom.clamp(tx, 4.0, ball.x)
         cy = geom.clamp(ty, 3.0, PITCH_WIDTH - 3.0)
-        # Slight lane offset by our y-position to split two attackers.
-        return (cx, cy)
+
+        # Coordinate the cover players. ``_cover_slot`` ranks the player among
+        # the press plan's cover assignments by distance to the ball, so a lone
+        # cover keeps slot 0 (the point above, unchanged from the single-cover
+        # behaviour) and each additional cover slides further back down the
+        # ball-to-goal line and further towards its own side of the pitch.
+        # Without this every cover returned the identical (cx, cy), which is how
+        # two defenders ended up trying to occupy one point.
+        slot = self._cover_slot(inp, p)
+        if slot <= 0:
+            return (cx, cy)
+        station = self._COVER_STATIONS[min(slot, len(self._COVER_STATIONS) - 1)]
+        depth_frac, own_side_frac = station
+        span = geom.clamp(ball.x - gx, 0.0, PITCH_LENGTH)
+        sx = geom.clamp(gx + span * (1.0 - depth_frac), 4.0, ball.x)
+        sy = geom.lerp(p.y, cy, own_side_frac)
+        return (sx, geom.clamp(sy, 3.0, PITCH_WIDTH - 3.0))
 
     def _off_ball_recover(self, inp: PolicyInput, p: Player) -> PlayerIntent:
         """Loose ball: go where it will finally be slow enough to control.
@@ -3997,8 +4112,12 @@ class PolicyController:
                 ty = our_center_y - max_width_from_center
         
         speed = 0.85
-        # If attacker is making a run, match their speed
-        if attacker.vx > 2.0 or attacker.vy > 2.0:
+        # If attacker is making a run, match their speed. Both components are
+        # magnitudes: a run towards the y=0 touchline has vy < 0, so a signed
+        # `vy > 2.0` test would leave the defender jogging at a carrier
+        # sprinting at that touchline while the mirrored picture -- where the
+        # same run has vy > 0 -- produced a sprint.
+        if attacker.vx > 2.0 or abs(attacker.vy) > 2.0:
             speed = 1.0
         
         return PlayerIntent(defender.id, tx, ty, speed, ball.x, ball.y)

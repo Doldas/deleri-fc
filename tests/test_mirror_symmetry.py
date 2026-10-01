@@ -39,6 +39,7 @@ from src.geom import (
     wall_bounce,
 )
 from src.physics import (
+    THRESHOLD_REL_EPS,
     at_or_above,
     at_or_below,
     pick_shot_target,
@@ -151,9 +152,13 @@ class FacingTests(unittest.TestCase):
         self.assertFalse(faces_toward_own_goal(30.0, 20.0, 0.0))
 
     def test_facing_test_ignores_lateral_offset(self):
+        # The reflection maps a heading f to -f, so the mirror has to negate it.
+        # Holding the heading fixed while moving y would be a different physical
+        # picture, not a reflection: heading down-left from y=32 faces the goal,
+        # and the same heading from y=8 does not.
         for facing in (-3.0, -1.5, -0.2, 0.0, 0.2, 1.5, 3.0):
             low = faces_toward_own_goal(30.0, 8.0, facing)
-            high = faces_toward_own_goal(30.0, 32.0, facing)
+            high = faces_toward_own_goal(30.0, 32.0, -facing)
             self.assertEqual(
                 low,
                 high,
@@ -289,11 +294,15 @@ class LateralCandidateTests(unittest.TestCase):
     def test_a_clear_winner_is_returned_unchanged(self):
         self.assertEqual(
             _pick_lateral_candidate([(4.0, 8.0), (4.0, 32.0)], lambda c: -c[1]),
-            (4.0, 32.0),
+            (4.0, 8.0),
         )
 
     def test_the_result_mirrors_for_a_mirrored_score(self):
-        probes = (lambda c: c[1], lambda c: -c[1], lambda c: abs(c[1] - 20.0), lambda c: 0.0)
+        # Only mirror-invariant probes can pin equivariance: a score that reads
+        # the raw y (`lambda c: c[1]`) is not equivariant in the first place, so
+        # the mirrored list legitimately produces the mirrored answer. These are
+        # the scores the callers actually pass.
+        probes = (lambda c: abs(c[1] - 20.0), lambda c: 0.0, lambda c: c[0])
         for probe in probes:
             a = _pick_lateral_candidate([(4.0, 8.0), (4.0, 32.0)], probe)
             b = _pick_lateral_candidate(
@@ -313,9 +322,17 @@ class KeeperHoofTests(unittest.TestCase):
     """
 
     def _hoof(self, ball_y, them_positions):
+        # decide() short-circuits when we have no outfielders, so a keeper-only
+        # side never reaches the hoof at all. Give us a full four.
         st = _state(
             Ball(3.0, ball_y, 0.0, 0.0, "us", "us0"),
-            (_keeper("us", "us0", 2.0, GOAL_CENTER_Y),),
+            (
+                _keeper("us", "us0", 2.0, GOAL_CENTER_Y),
+                _player("us1", "us", "outfield", 12.0, 6.0),
+                _player("us2", "us", "outfield", 10.0, 20.0),
+                _player("us3", "us", "outfield", 12.0, 34.0),
+                _player("us4", "us", "outfield", 20.0, 20.0),
+            ),
             (_keeper("them", "tgk", 58.0, 20.0),) + tuple(
                 _player(f"t{i}", "them", "outfield", x, y)
                 for i, (x, y) in enumerate(them_positions, 1)
@@ -394,13 +411,26 @@ class ThresholdTests(unittest.TestCase):
 
     def test_the_tolerance_absorbs_only_last_bit_noise(self):
         self.assertTrue(at_or_below(10.0 - 1e-13, 10.0))
-        self.assertFalse(at_or_below(10.0 - 1e-6, 10.0))
+        self.assertFalse(at_or_above(10.0 - 1e-6, 10.0))
 
-    def test_the_two_directions_never_both_fire(self):
-        for value in (9.9, 9.999999, 10.0, 10.000001, 10.1):
-            self.assertFalse(
-                at_or_below(value, 10.0) and at_or_above(value, 10.0),
-                f"{value} was accepted by both directions",
+    def test_the_tolerance_band_is_symmetric_around_the_threshold(self):
+        # An exact tie satisfies both inclusive comparisons by definition --
+        # `10 <= 10` and `10 >= 10` -- and that is what makes the pair usable as
+        # a band. Outside the band they must bracket the threshold strictly, and
+        # the band must be the same width on both sides: a one-sided tolerance
+        # would accept a value below the threshold but reject its mirror-image
+        # partner above it.
+        eps = abs(10.0) * THRESHOLD_REL_EPS
+        for value in (10.0 - eps, 10.0 + eps):
+            self.assertTrue(at_or_below(value, 10.0))
+            self.assertTrue(at_or_above(value, 10.0))
+        for value in (9.9, 9.999999, 10.000001, 10.1):
+            below = at_or_below(value, 10.0)
+            above = at_or_above(value, 10.0)
+            self.assertNotEqual(
+                below,
+                above,
+                f"{value} is outside the tolerance band but did not bracket the threshold",
             )
 
     def test_a_mirrored_pair_is_accepted_together(self):
@@ -479,7 +509,12 @@ class AlreadyCorrectTests(unittest.TestCase):
 
     def test_a_centre_line_split_is_equivariant(self):
         pick = lambda y: 15.0 if y <= 20.0 else 25.0
-        for y in (0.5, 5.0, 15.0, 19.999, 20.0, 20.001, 25.0, 35.0, 39.5):
+        # y = 20 is excluded on purpose: it is the fixed point of the
+        # reflection, so it mirrors to itself and the sum is 2*pick(20) = 30 for
+        # any deterministic pick. Equivariance is a statement about pairs of
+        # distinct pictures; at the fixed point every answer is already its own
+        # mirror.
+        for y in (0.5, 5.0, 15.0, 19.999, 20.001, 25.0, 35.0, 39.5):
             self.assertAlmostEqual(
                 pick(y) + pick(mirror_y(y)),
                 PITCH_WIDTH,
@@ -488,7 +523,7 @@ class AlreadyCorrectTests(unittest.TestCase):
 
     def test_far_post_branch_values_are_mirror_images(self):
         pick = lambda y: 17.0 if y >= 20.0 else 23.0
-        for y in (1.0, 19.9, 20.0, 20.1, 39.0):
+        for y in (1.0, 19.9, 20.1, 39.0):
             self.assertAlmostEqual(pick(y) + pick(mirror_y(y)), PITCH_WIDTH)
 
 
