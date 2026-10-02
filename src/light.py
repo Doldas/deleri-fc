@@ -100,6 +100,7 @@ class LIntent:
     act: str = "none"
     action_target: tuple[float, float] | None = None
     power: float | None = None
+    face_target: tuple[float, float] | None = None
 
 
 def make_state(
@@ -172,8 +173,10 @@ class LightEngine:
             p.can_act = True
             if intent is None:
                 continue
-            # Turn immediately toward target.
-            p.facing = geom.angle_to(p.x, p.y, intent.tx, intent.ty)
+            # Turn immediately toward the explicit face point when supplied;
+            # legacy simulator intents continue to face their movement target.
+            face_x, face_y = intent.face_target or (intent.tx, intent.ty)
+            p.facing = geom.angle_to(p.x, p.y, face_x, face_y)
             possessing = st.ball.possessing_team == p.team and st.ball.possessing_player == p.pid
             top = MAX_DRIBBLE_SPEED if possessing else MAX_RUN_SPEED
             speed = min(1.0, max(0.0, intent.speed)) * top

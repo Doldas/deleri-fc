@@ -16,10 +16,10 @@ from dataclasses import dataclass, field
 from . import geom
 from .config import DECISION_INTERVAL
 from .geom import OPP_GOAL_X
-from .light import LIntent, LightEngine, PlanState, make_state
+from .light import LIntent, LightEngine, PlanState
 from .physics import pick_shot_target
 from .policy import PlayerIntent, PolicyInput
-from .state import GameState
+from .search_state import SearchState
 from .wall import is_near_wall
 
 # Tactical action labels (AISTRATEGI §28 subset used by the first experiment).
@@ -49,16 +49,8 @@ class _Node:
 
 
 def _to_plan(inp: PolicyInput) -> PlanState:
-    state: GameState = inp.state
-    us = [(p.id, p.role, p.x, p.y) for p in state.us]
-    them = [(p.id, p.role, p.x, p.y) for p in state.them]
-    ball = (state.ball.x, state.ball.y)
-    bv = (state.ball.vx, state.ball.vy)
-    possess = None
-    if state.ball.possessing_team is not None:
-        possess = (state.ball.possessing_team, state.ball.possessing_player or "")
-    plan = make_state(us, them, ball=ball, ball_v=bv, possess=possess, score=(state.score_us, state.score_them))
-    return plan
+    """Compatibility adapter to the shared branch-owned simulation snapshot."""
+    return SearchState.from_policy_input(inp).plan
 
 
 def _to_light(intents: dict[str, PlayerIntent], team: str) -> dict[tuple[str, str], LIntent]:
@@ -71,6 +63,7 @@ def _to_light(intents: dict[str, PlayerIntent], team: str) -> dict[tuple[str, st
             act=it.action_type,
             action_target=it.action_target,
             power=it.action_power,
+            face_target=(it.face_x, it.face_y),
         )
     return out
 
