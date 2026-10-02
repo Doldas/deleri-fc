@@ -2013,7 +2013,11 @@ class PolicyController:
             p: Player,
             candidates: list[ActionCandidate],
     ) -> list[ActionCandidate]:
-        """Remove attacking candidates that are physically impossible to execute."""
+        """Remove attacking candidates that are physically impossible to execute.
+
+        Pass reachability follows the production physics boundary: every legal
+        kick travels at least ``MIN_PASS_TRAVEL`` before it can be controlled.
+        """
 
         reachable: list[ActionCandidate] = []
 
@@ -2054,6 +2058,7 @@ class PolicyController:
             p: Player,
             team_plan=None,
     ) -> list[ActionCandidate]:
+        """Describe available attacking decisions without selecting or committing one."""
         state = inp.state
         world = inp.world
         ball = state.ball
@@ -2333,42 +2338,35 @@ class PolicyController:
             candidates.append(
                 ActionCandidate(pass_value, intent, f"safe_pass_to_{best}")
             )
-        # ---- Select best candidate ----
-        # Veto physically impossible passes.
-        #
-        # A kick leaves at KICK_MIN_SPEED (12 m/s) no matter how little power is
-        # asked for, and nobody may touch the ball again until it has slowed to
-        # 5 m/s, so it unavoidably rolls MIN_PASS_TRAVEL (~15.6 m). A pass aimed
-        # at a point closer than that cannot be collected where it was aimed; it
-        # sails past and becomes a turnover. The lead-pass generator already
-        # models this (see `_lead_pass_options`, which rejects an overshoot over
-        # 2.5 m), but the ten other pass helpers below aim at a receiver's
-        # current position without checking it.
-        #
-        # Measured over 24 traced matches (186 executed passes):
-        #   * 66.7% were aimed inside MIN_PASS_TRAVEL, median aim distance 8.8 m
-        #     and p10/p25 of 0.00 m / 0.21 m -- aimed at a point on top of the
-        #     passer itself;
-        #   * median overshoot past the aim point was 14.1 m;
-        #   * power sat at the floor (median 0.006) in 68.8% of them, i.e. the
-        #     code asked for the shortest legal kick at a target it could not
-        #     reach;
-        #   * an opponent was closer to the landing point than any teammate in
-        #     58.1% of passes, and 59.1% were intercepted outright.
-        #
-        # So this is the mechanism behind the loose-ball state: 51% of every
-        # loose ball in a match is a pass of ours, 97.1% of our possessions end
-        # with our own kick, and 67.8% of recoveries are re-lost within 0.5 s.
-        # Winning the ball is not the problem -- we win it with the ball at a
-        # median 0.00 m/s -- and then immediately launch it out of reach.
-        #
-        # Dropping these candidates is the secure-control state: with no
-        # physically reachable pass on the board, the carry keeps the ball
-        # glued to the carrier instead of handing it to the press.
-        candidates = self._filter_attack_candidates(p, candidates)
-        candidates = self._rank_attack_candidates(candidates)
-
         return candidates
+
+    def _commit_attack_candidate(
+            self,
+            inp: PolicyInput,
+            p: Player,
+            candidate: ActionCandidate,
+            team_plan=None,
+    ) -> PlayerIntent:
+        """Apply effects for the selected (and own-goal-vetted) candidate only."""
+        intent = self._veto_own_goal(inp, p, candidate.intent)
+
+        if team_plan is not None:
+            if intent.action_type == "shoot":
+                team_plan.shot_committed = True
+                team_plan.shot_expected = False
+                if intent.action_target is not None:
+                    team_plan.rebound_zone_x = intent.action_target[0]
+                    team_plan.rebound_zone_y = intent.action_target[1]
+                    if intent.action_target[1] > GOAL_CENTER_Y:
+                        team_plan.far_post_target_y = GOAL_LOW_Y
+                    else:
+                        team_plan.far_post_target_y = GOAL_HIGH_Y
+
+            if intent.action_type == "pass" and intent.receiver_id is not None:
+                self._pending_pass_receiver = intent.receiver_id
+                self._pending_pass_collection = intent.collection_point
+
+        return intent
 
     def _evaluate_attack_actions(
             self,
@@ -2378,6 +2376,8 @@ class PolicyController:
     ) -> PlayerIntent:
         """Evaluate all attack options and return the best one by expected value."""
         candidates = self._build_attack_candidates(inp, p, team_plan)
+        candidates = self._filter_attack_candidates(p, candidates)
+        candidates = self._rank_attack_candidates(candidates)
 
         if candidates:
             best = candidates[0]
@@ -2385,26 +2385,9 @@ class PolicyController:
             best_intent = best.intent
             reason = best.reason
 
-            # TEAM PLAN INTEGRATION: Handle shot commitment and pending pass
-            if team_plan is not None:
-                if best_intent.action_type == "shoot":
-                    team_plan.shot_committed = True
-                    team_plan.shot_expected = False
-                    if best_intent.action_target is not None:
-                        team_plan.rebound_zone_x = best_intent.action_target[0]
-                        team_plan.rebound_zone_y = best_intent.action_target[1]
-                        if best_intent.action_target[1] > GOAL_CENTER_Y:
-                            team_plan.far_post_target_y = GOAL_LOW_Y
-                        else:
-                            team_plan.far_post_target_y = GOAL_HIGH_Y
-
-                if best_intent.action_type == "pass" and best_intent.receiver_id is not None:
-                    self._pending_pass_receiver = best_intent.receiver_id
-                    self._pending_pass_collection = best_intent.collection_point
-
             log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": best_intent.action_type, "reason": reason, "value": best_value}
             self.log.record(log_entry)
-            return self._veto_own_goal(inp, p, best_intent)
+            return self._commit_attack_candidate(inp, p, best, team_plan)
 
         # Fallback
         tx, ty, speed = self._dribble_target(inp, p)

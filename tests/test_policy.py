@@ -1,3 +1,5 @@
+import copy
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -22,6 +24,7 @@ from src.state import GameState, WorldModel
 from src import geom
 from src.geom import PITCH_LENGTH, PITCH_WIDTH, GOAL_CENTER_Y, OPP_GOAL_X
 from src.physics import shot_beats_keeper, MIN_PASS_TRAVEL
+from src.teamplan import TeamPlan
 
 SLOTS = [
     {"id": "defender", "role": "defender", "position": {"x": 14, "y": 20}},
@@ -649,6 +652,145 @@ class AttackCandidatePipelineTests(unittest.TestCase):
             [candidate.reason for candidate in ranked],
             ["first", "second", "lower"],
         )
+
+    def test_candidate_generation_is_deterministic_and_structurally_valid(self):
+        controller = PolicyController()
+        inp = make_inp(obs((52, 20), "us", our_st_x=52, them_x=10))
+        carrier = inp.state.our_possessor()
+        assert carrier is not None
+
+        first = controller._build_attack_candidates(inp, carrier)
+        second = controller._build_attack_candidates(inp, carrier)
+
+        self.assertTrue(first)
+        self.assertEqual(first, second)
+        for candidate in first:
+            self.assertIsInstance(candidate, ActionCandidate)
+            self.assertTrue(math.isfinite(candidate.value))
+            self.assertIsInstance(candidate.intent, PlayerIntent)
+            self.assertEqual(candidate.intent.pid, carrier.id)
+            self.assertIn(candidate.intent.action_type, {"none", "pass", "shoot"})
+            self.assertTrue(candidate.reason.strip())
+            for value in (
+                candidate.intent.tx,
+                candidate.intent.ty,
+                candidate.intent.speed,
+                candidate.intent.face_x,
+                candidate.intent.face_y,
+            ):
+                self.assertTrue(math.isfinite(value))
+            if candidate.intent.action_target is not None:
+                self.assertTrue(all(math.isfinite(value) for value in candidate.intent.action_target))
+            if candidate.intent.action_power is not None:
+                self.assertTrue(math.isfinite(candidate.intent.action_power))
+
+    def test_generation_does_not_commit_shots_or_pending_passes(self):
+        controller = PolicyController()
+        shot_input = make_inp(obs((52, 20), "us", our_st_x=52, them_x=10))
+        shot_carrier = shot_input.state.our_possessor()
+        assert shot_carrier is not None
+        plan = TeamPlan(
+            shot_expected=True,
+            rebound_zone_x=47.0,
+            rebound_zone_y=18.0,
+            far_post_target_y=22.0,
+        )
+        plan_before = copy.deepcopy(plan)
+        state_before = copy.deepcopy(shot_input.state)
+        world_before = copy.deepcopy(shot_input.world)
+        log_before = copy.deepcopy(controller.log)
+
+        shot_board = controller._build_attack_candidates(shot_input, shot_carrier, plan)
+
+        self.assertTrue(any(candidate.intent.action_type == "shoot" for candidate in shot_board))
+        self.assertEqual(plan, plan_before)
+        self.assertFalse(plan.shot_committed)
+        self.assertEqual(shot_input.state, state_before)
+        self.assertEqual(shot_input.world, world_before)
+        self.assertIsNone(controller._pending_pass_receiver)
+        self.assertIsNone(controller._pending_pass_collection)
+        self.assertEqual(controller.log, log_before)
+
+        selected = controller._evaluate_attack_actions(shot_input, shot_carrier, plan)
+        self.assertEqual(selected.action_type, "shoot")
+        assert selected.action_target is not None
+        self.assertTrue(plan.shot_committed)
+        self.assertFalse(plan.shot_expected)
+        self.assertEqual(plan.rebound_zone_x, selected.action_target[0])
+        self.assertEqual(plan.rebound_zone_y, selected.action_target[1])
+
+        pass_input = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        pass_carrier = pass_input.state.our_possessor()
+        assert pass_carrier is not None
+        pass_board = controller._build_attack_candidates(pass_input, pass_carrier)
+        self.assertTrue(
+            any(candidate.intent.action_type == "pass" for candidate in pass_board),
+            "fixture must include an available pass to verify it is not scheduled",
+        )
+        self.assertIsNone(controller._pending_pass_receiver)
+        self.assertIsNone(controller._pending_pass_collection)
+
+    def test_raw_board_flows_through_filter_and_rank_without_mutation(self):
+        controller = PolicyController()
+        inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        carrier = inp.state.our_possessor()
+        assert carrier is not None
+
+        candidates = controller._build_attack_candidates(inp, carrier)
+        original = list(candidates)
+        filtered = controller._filter_attack_candidates(carrier, candidates)
+        filtered_original = list(filtered)
+        ranked = controller._rank_attack_candidates(filtered)
+
+        self.assertTrue(ranked)
+        self.assertEqual(candidates, original)
+        self.assertEqual(filtered, filtered_original)
+        self.assertIsNot(ranked, filtered)
+        self.assertEqual(
+            [candidate.value for candidate in ranked],
+            sorted((candidate.value for candidate in filtered), reverse=True),
+        )
+        self.assertEqual(
+            ranked,
+            controller._rank_attack_candidates(
+                controller._filter_attack_candidates(
+                    carrier, controller._build_attack_candidates(inp, carrier)
+                )
+            ),
+        )
+
+    def test_own_goal_veto_prevents_commitment_to_replaced_pass(self):
+        controller = PolicyController()
+        inp = make_inp(obs((25, 20), "us", our_st_x=25, them_x=10))
+        carrier = inp.state.our_possessor()
+        assert carrier is not None
+        plan = TeamPlan()
+        invalid_pass = ActionCandidate(
+            1.0,
+            PlayerIntent(
+                pid=carrier.id,
+                tx=5.0,
+                ty=20.0,
+                speed=0.4,
+                face_x=5.0,
+                face_y=20.0,
+                action_type="pass",
+                action_target=(5.0, 20.0),
+                action_power=0.5,
+                receiver_id="w",
+                collection_point=(7.0, 20.0),
+            ),
+            "invalid_own_goal_pass",
+        )
+
+        selected_intent = controller._commit_attack_candidate(
+            inp, carrier, invalid_pass, plan
+        )
+
+        self.assertEqual(selected_intent.action_type, "none")
+        self.assertIsNone(controller._pending_pass_receiver)
+        self.assertIsNone(controller._pending_pass_collection)
+        self.assertFalse(plan.shot_committed)
 
 if __name__ == "__main__":
     unittest.main()
