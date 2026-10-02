@@ -437,7 +437,11 @@ class LightEngine:
             gk = st.gk(team)
             if gk is None:
                 continue
-            own_fifth = gk.x <= PITCH_LENGTH * 0.2
+            own_fifth = (
+                gk.x <= PITCH_LENGTH * 0.2
+                if team == "us"
+                else gk.x >= PITCH_LENGTH * 0.8
+            )
             if not own_fifth:
                 continue
             if st.ball.possessing_team == team:
@@ -471,7 +475,13 @@ class LightEngine:
             return
         out = st.outfield(owner_gk.team)
         wide = [q for q in out if q.y <= PITCH_WIDTH * 0.25 or q.y >= PITCH_WIDTH * 0.75]
-        target = max(wide or out, key=lambda q: (q.x, q.pid)) if out else None
+        if out:
+            target = max(
+                wide or out,
+                key=lambda q: ((q.x if owner_gk.team == "us" else -q.x), q.pid),
+            )
+        else:
+            target = None
         if target is not None:
             dx = target.x - owner_gk.x
             dy = target.y - owner_gk.y

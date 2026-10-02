@@ -36,13 +36,15 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("score_us", res.summary())
         self.assertGreaterEqual(res.shots, 0)
 
-    def test_champion_converts_final_third_and_one_v_one(self):
+    def test_champion_handles_final_third_and_converts_one_v_one(self):
         lab = [("final_third", "defensive"), ("one_v_one_gk", "defensive")]
         results, fitness = evaluate_scenarios(default_genome(), random.Random(33), lab)
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].name, "final_third")
-        self.assertGreater(results[0].score_us, 0)  # shot converts to a goal
-        self.assertGreater(results[0].shots, 0)
+        # The away goalkeeper now handles balls in its own (right-side) fifth;
+        # the packed final-third scenario can be held without a goal or shot.
+        self.assertEqual(results[0].score_them, 0)
+        self.assertGreater(results[0].possession_ours, 0.0)
         self.assertEqual(results[1].score_us, 1)
         self.assertGreater(fitness, 0.0)
 

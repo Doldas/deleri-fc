@@ -132,6 +132,12 @@ class MCTSCoreTests(unittest.TestCase):
                 else player
                 for player in inp.state.us
             ),
+            them=tuple(
+                replace(player, y=38.0)
+                if player.role == "goalkeeper"
+                else player
+                for player in inp.state.them
+            ),
             ball=replace(
                 inp.state.ball,
                 x=55.0,

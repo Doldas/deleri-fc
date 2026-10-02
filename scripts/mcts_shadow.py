@@ -30,6 +30,7 @@ from src.shadow import (
     candidate_signature,
     evaluate_shadow,
 )
+from src.search_opponent import OPPONENT_RESPONSE_MODEL
 from src.sim import BASE_LINEUP, OPPONENTS, mirrored_lineup, plan_to_obs
 from src.scenarios import SCENARIOS
 from src.state import GameState, WorldModel
@@ -325,9 +326,11 @@ def run_shadow_sample(
             "max": max(steps) if steps else 0,
         },
         "ineligible_by_reason": dict(sorted(skip_reasons.items())),
-        "opponent_model": (
-            "MCTS assumes stationary opposing players (optimistic, not adversarial); "
-            "disagreement is not evidence of improvement."
+        "opponent_model": OPPONENT_RESPONSE_MODEL,
+        "opponent_model_description": (
+            "Branch-local deterministic PressBot carrier pressure, physics-based "
+            "loose-ball/pass pursuit, and goal-side outfield shape; LightEngine "
+            "retains goalkeeper control. This is not adversarial minimax."
         ),
     }
     return {

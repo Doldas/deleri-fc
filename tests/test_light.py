@@ -74,6 +74,13 @@ class LightEngineTests(unittest.TestCase):
     def test_goal_restart_gives_conceding_team_kickoff(self):
         eng = LightEngine(seed=8)
         st = make_state(team(), mirror(team()), ball=(58.0, 20.0), possess=("us", "st"))
+        away_keeper = st.player("them", "gk")
+        assert away_keeper is not None
+        away_keeper.y = 39.0
+        st.base_positions = [
+            (team, pid, role, x, 39.0 if team == "them" and pid == "gk" else y)
+            for team, pid, role, x, y in st.base_positions
+        ]
         for _ in range(40):
             st = eng.step(
                 st,
@@ -101,6 +108,40 @@ class LightEngineTests(unittest.TestCase):
                 break
         self.assertTrue(distributed)
         self.assertIsNone(st.ball.possessing_team)
+
+    def test_away_goalkeeper_handles_ball_in_its_defensive_fifth(self):
+        eng = LightEngine(seed=10)
+        st = make_state(
+            team(),
+            mirror(team()),
+            ball=(55.5, 20.0),
+            possess=None,
+        )
+
+        handled = eng.step(st, {})
+
+        self.assertEqual(handled.ball.possessing_team, "them")
+        self.assertEqual(handled.ball.possessing_player, "gk")
+
+    def test_away_goalkeeper_auto_distribution_goes_toward_its_attacking_goal(self):
+        eng = LightEngine(seed=11)
+        st = make_state(
+            team(),
+            mirror(team()),
+            ball=(55.0, 20.0),
+            possess=("them", "gk"),
+        )
+
+        distributed = False
+        for _ in range(20):
+            st = eng.step(st, {})
+            if "gk:distribution" in st.events:
+                distributed = True
+                break
+
+        self.assertTrue(distributed)
+        self.assertIsNone(st.ball.possessing_team)
+        self.assertLess(st.ball.vx, 0.0)
 
     def test_tackle_close_strips_ball(self):
         eng = LightEngine(seed=4)

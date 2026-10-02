@@ -15,6 +15,7 @@ from typing import Any
 
 from .mcts import MCTSPlanner
 from .policy import ActionCandidate, PolicyController, PolicyInput
+from .search_opponent import OPPONENT_RESPONSE_MODEL
 from .teamplan import TeamPlan
 
 DEFAULT_BUDGETS = (4, 12, 32)
@@ -129,7 +130,7 @@ def _ineligible(inp: PolicyInput, reason: str) -> ShadowResult:
     possessor = inp.state.our_possessor()
     return ShadowResult(
         schema_version=1,
-        opponent_model="stationary_opponents_optimistic",
+        opponent_model=OPPONENT_RESPONSE_MODEL,
         eligible=False,
         skip_reason=reason,
         mcts_ran=False,
@@ -353,7 +354,7 @@ def evaluate_shadow(
 
     return ShadowResult(
         schema_version=1,
-        opponent_model="stationary_opponents_optimistic",
+        opponent_model=OPPONENT_RESPONSE_MODEL,
         eligible=True,
         skip_reason=None,
         mcts_ran=True,

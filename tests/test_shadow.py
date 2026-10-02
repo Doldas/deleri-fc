@@ -13,6 +13,7 @@ from src.mcts import RootActionStats, SearchDiagnostics
 from src.opponent import OpponentModel
 from src.policy import ActionCandidate, PlayerIntent, PolicyController, PolicyInput
 from src.shadow import candidate_action_type, candidate_signature, evaluate_shadow
+from src.search_opponent import OPPONENT_RESPONSE_MODEL
 from src.state import GameState, WorldModel
 from src.tactics import PressPlan, TacticalState, assign_roles
 from src.teamplan import TeamPlan, TeamPlanManager
@@ -267,7 +268,7 @@ class ShadowEvaluationTests(unittest.TestCase):
         second = evaluate_shadow(inp, budgets=(2, 5))
         self.assertEqual(first, second)
         self.assertEqual(first.to_dict(), second.to_dict())
-        self.assertEqual(first.opponent_model, "stationary_opponents_optimistic")
+        self.assertEqual(first.opponent_model, OPPONENT_RESPONSE_MODEL)
 
     def test_ineligible_and_empty_boards_fail_closed(self):
         inp = build_input()

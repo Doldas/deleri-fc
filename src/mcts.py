@@ -2,7 +2,8 @@
 
 Search owns only ``SearchState`` snapshots and branch-local policy context. It
 does not call ``PolicyController.decide``: hypothetical attack boards are
-created with the same production build/filter/rank methods, without committing
+created with the same production build/filter/rank methods, while deterministic
+opponent response intents are simulated through LightEngine without committing
 actions, logging, or changing live controller memory.
 """
 
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from .config import DECISION_INTERVAL
 from .policy import ActionCandidate, PlayerIntent, PolicyController, PolicyInput
 from .search_state import SearchState, advance_search_state, is_within_pitch, transition_candidate
+from .search_opponent import branch_opponent_intents
 from .state import Ball, GameState, Player, WorldModel
 from .teamplan import TeamPlan, TeamPlanManager
 
@@ -380,14 +382,9 @@ class MCTSPlanner:
         inp: PolicyInput,
         team_plan: TeamPlan | None,
         candidate: ActionCandidate | None = None,
+        search_state: SearchState | None = None,
     ) -> dict[tuple[str, str], PlayerIntent]:
-        """Get production off-ball movement using a fresh branch-local controller.
-
-        The opposing side receives no invented policy intent: its players hold
-        position while LightEngine still applies automatic control/goalkeeper
-        behavior. This deterministic stationary-opponent response is deliberately
-        optimistic and is not an adversarial model.
-        """
+        """Get our branch-local off-ball intents and deterministic opponent responses."""
         branch_controller = PolicyController()
         possessor = inp.state.our_possessor()
         if (
@@ -415,6 +412,8 @@ class MCTSPlanner:
             intents[("us", goalkeeper.id)] = branch_controller._decide_goalkeeper(
                 inp, goalkeeper
             )
+        branch_state = search_state or SearchState.from_policy_input(inp)
+        intents.update(branch_opponent_intents(branch_state, candidate))
         return intents
 
     def _advance_until_decision(
@@ -451,7 +450,7 @@ class MCTSPlanner:
             if advanced >= available_advances:
                 break
             background = self._background_intents(
-                policy_input, manager.current_plan
+                policy_input, manager.current_plan, search_state=state
             )
             state = advance_search_state(state, background)
             advanced += 1
@@ -471,7 +470,10 @@ class MCTSPlanner:
                 node.state, root_input, node.steps_from_root
             )
             background = self._background_intents(
-                policy_input, node.team_plan_manager.current_plan, candidate
+                policy_input,
+                node.team_plan_manager.current_plan,
+                candidate,
+                node.state,
             )
             try:
                 child_state = transition_candidate(
@@ -582,7 +584,7 @@ class MCTSPlanner:
             candidate = board[0]  # _production_candidates is EV-ranked.
             policy_input = self._policy_input(state, root_input, steps_from_root)
             background = self._background_intents(
-                policy_input, manager.current_plan, candidate
+                policy_input, manager.current_plan, candidate, state
             )
             try:
                 state = transition_candidate(
