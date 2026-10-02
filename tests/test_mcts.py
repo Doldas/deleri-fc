@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 import random
+from dataclasses import replace
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -24,7 +25,8 @@ from src.search_state import (
     is_within_pitch,
     transition_candidate,
 )
-from src.teamplan import TeamPlan
+from src.teamplan import TeamPlan, TeamPlanManager
+from src.opponent import OpponentModel
 from src.physics import MIN_PASS_TRAVEL
 
 SLOTS = [
@@ -117,6 +119,331 @@ class MCTSTests(unittest.TestCase):
         base = PolicyController().decide(inp)
         result = planner.choose(inp, base)
         self.assertTrue(result is None or isinstance(result, dict))
+
+
+class MCTSCoreTests(unittest.TestCase):
+    def _goal_position_input(self):
+        inp = build_inp()
+        inp.state = replace(
+            inp.state,
+            us=tuple(
+                replace(player, x=55.0, y=20.0)
+                if player.id == "am"
+                else player
+                for player in inp.state.us
+            ),
+            ball=replace(
+                inp.state.ball,
+                x=55.0,
+                y=20.0,
+                possessing_team="us",
+                possessing_player="am",
+            ),
+        )
+        inp.world = WorldModel.build(inp.state)
+        return inp
+
+    def test_root_board_and_result_are_original_production_candidates(self):
+        inp = build_inp()
+        controller = PolicyController()
+        carrier = inp.state.our_possessor()
+        assert carrier is not None
+        expected = controller._rank_attack_candidates(
+            controller._filter_attack_candidates(
+                carrier,
+                controller._build_attack_candidates(inp, carrier),
+            )
+        )
+
+        planner = MCTSPlanner(iterations=8)
+        selected = planner.search(inp, controller)
+
+        self.assertEqual(planner.root_candidates, tuple(expected))
+        self.assertTrue(any(selected is candidate for candidate in planner.root_candidates))
+        self.assertIn(selected, expected)
+        self.assertEqual(
+            tuple(stat.candidate for stat in planner.stats.root_actions),
+            tuple(expected),
+        )
+
+    def test_controlling_production_candidate_board_controls_mcts_actions(self):
+        class NarrowBoardController(PolicyController):
+            def _build_attack_candidates(self, inp, p, team_plan=None):
+                return super()._build_attack_candidates(inp, p, team_plan)[:1]
+
+        inp = build_inp()
+        controller = NarrowBoardController()
+        planner = MCTSPlanner(iterations=4)
+
+        selected = planner.search(inp, controller)
+
+        self.assertEqual(len(planner.root_candidates), 1)
+        self.assertIs(selected, planner.root_candidates[0])
+        self.assertEqual(planner.stats.root_actions[0].candidate, selected)
+
+    def test_deep_search_uses_candidate_pipeline_at_future_states(self):
+        class RecordingController(PolicyController):
+            def __init__(self):
+                super().__init__()
+                self.observed = []
+
+            def _build_attack_candidates(self, inp, p, team_plan=None):
+                self.observed.append((inp.state.ball.x, inp.state.ball.possessing_team))
+                return super()._build_attack_candidates(inp, p, team_plan)
+
+        inp = build_inp()
+        controller = RecordingController()
+        planner = MCTSPlanner(iterations=12, max_decision_depth=3)
+
+        selected = planner.search(inp, controller)
+
+        self.assertIsNotNone(selected)
+        self.assertGreater(planner.stats.max_depth, 1)
+        self.assertGreater(len(controller.observed), 1)
+        self.assertTrue(
+            any(abs(ball_x - inp.state.ball.x) > 1e-6 for ball_x, _ in controller.observed[1:]),
+            "deeper production candidate generation must observe simulated positions",
+        )
+
+    def test_expanded_sibling_states_and_team_plans_are_isolated(self):
+        inp = build_inp()
+        controller = PolicyController()
+        team_plan = TeamPlan(shot_expected=True, rebound_zone_x=48.0, rebound_zone_y=17.0)
+        team_plan_before = copy.deepcopy(team_plan)
+        state_before = copy.deepcopy(inp.state)
+        world_before = copy.deepcopy(inp.world)
+        planner = MCTSPlanner(iterations=4)
+
+        planner.search(inp, controller, team_plan=team_plan)
+
+        root = planner._root
+        assert root is not None
+        self.assertGreaterEqual(len(root.children), 2)
+        siblings = [root.children[index] for index in sorted(root.children)[:2]]
+        root_before = copy.deepcopy(root.state.plan)
+        sibling_before = copy.deepcopy(siblings[1].state.plan)
+        branch_plan_a = siblings[0].team_plan_manager.current_plan
+        branch_plan_b = siblings[1].team_plan_manager.current_plan
+        if branch_plan_a is None:
+            branch_plan_a = TeamPlan(rebound_zone_x=48.0)
+            siblings[0].team_plan_manager.current_plan = branch_plan_a
+        if branch_plan_b is None:
+            branch_plan_b = TeamPlan(rebound_zone_x=49.0)
+            siblings[1].team_plan_manager.current_plan = branch_plan_b
+        mutated_player = siblings[0].state.plan.player("us", "am")
+        assert mutated_player is not None
+        mutated_player.x += 2.0
+        siblings[0].state.plan.ball.x += 1.0
+        branch_plan_a.rebound_zone_x = 3.0
+
+        self.assertEqual(root.state.plan, root_before)
+        self.assertEqual(siblings[1].state.plan, sibling_before)
+        self.assertNotEqual(
+            branch_plan_a.rebound_zone_x,
+            branch_plan_b.rebound_zone_x,
+        )
+        self.assertEqual(inp.state, state_before)
+        self.assertEqual(inp.world, world_before)
+        self.assertEqual(team_plan, team_plan_before)
+
+    def test_same_input_and_budget_have_identical_search_and_statistics(self):
+        inp = build_inp()
+        first = MCTSPlanner(iterations=12, horizon=1.0, cpuct=1.1)
+        second = MCTSPlanner(iterations=12, horizon=1.0, cpuct=1.1)
+
+        first_choice = first.search(inp, PolicyController())
+        second_choice = second.search(inp, PolicyController())
+
+        self.assertEqual(first_choice, second_choice)
+        self.assertEqual(first.stats, second.stats)
+
+    def test_uct_handles_unvisited_exploration_and_stable_ties(self):
+        unvisited = MCTSPlanner._uct_score(4, 0, 0.0, 1.4)
+        low_parent = MCTSPlanner._uct_score(1, 1, 0.0, 1.0)
+        high_parent = MCTSPlanner._uct_score(16, 1, 0.0, 1.0)
+        self.assertTrue(math.isfinite(unvisited))
+        self.assertTrue(math.isfinite(low_parent))
+        self.assertTrue(math.isfinite(high_parent))
+        self.assertGreater(high_parent, low_parent)
+
+        planner = MCTSPlanner(iterations=2)
+        planner.search(build_inp(), PolicyController())
+        root = planner._root
+        assert root is not None and len(root.children) >= 2
+        first_index, second_index = sorted(root.children)[:2]
+        first_child, second_child = root.children[first_index], root.children[second_index]
+        first_child.visits = 1
+        second_child.visits = 0
+        first_child.value = 1e6
+        root.visits = 8
+        self.assertIs(planner._select(root), second_child)
+        first_child.visits = second_child.visits = 1
+        first_child.value = second_child.value = 0.5
+        root.visits = 2
+        self.assertIs(planner._select(root), first_child)
+        self.assertIs(planner._select(root), first_child)
+
+    def test_backpropagation_updates_every_ancestor_once(self):
+        planner = MCTSPlanner(iterations=8)
+        planner.search(build_inp(), PolicyController())
+        root = planner._root
+        assert root is not None
+
+        leaf = next(
+            node
+            for child in root.children.values()
+            for node in (child, *child.children.values())
+            if node.depth >= 2
+        )
+        path = []
+        current = leaf
+        while current is not None:
+            path.append(current)
+            current = current.parent
+        path.reverse()
+        for node in path:
+            node.visits = 0
+            node.value = 0.0
+
+        planner._backpropagate(path, 0.75)
+
+        for node in path:
+            self.assertEqual(node.visits, 1)
+            self.assertEqual(node.value, 0.75)
+
+    def test_loose_ball_no_possessor_empty_board_and_no_opponent_terminate(self):
+        loose = build_inp()
+        loose.state = replace(
+            loose.state,
+            ball=replace(
+                loose.state.ball,
+                possessing_team=None,
+                possessing_player=None,
+                vx=12.0,
+            ),
+        )
+        loose.world = WorldModel.build(loose.state)
+        planner = MCTSPlanner(iterations=6, max_advance_steps=3)
+        self.assertIsNone(planner.search(loose, PolicyController()))
+        self.assertEqual(planner.stats.iterations, 0)
+
+        no_possessor = build_inp()
+        no_possessor.state = replace(
+            no_possessor.state,
+            ball=replace(
+                no_possessor.state.ball,
+                possessing_team="them",
+                possessing_player="am",
+            ),
+        )
+        no_possessor.world = WorldModel.build(no_possessor.state)
+        self.assertIsNone(planner.search(no_possessor, PolicyController()))
+
+        class EmptyBoardController(PolicyController):
+            def _build_attack_candidates(self, inp, p, team_plan=None):
+                return []
+
+        self.assertIsNone(planner.search(build_inp(), EmptyBoardController()))
+
+        empty_them = build_inp()
+        empty_them.state = replace(empty_them.state, them=())
+        empty_them.world = WorldModel.build(empty_them.state)
+        self.assertIsNotNone(planner.search(empty_them, PolicyController()))
+        self.assertLessEqual(planner.stats.simulated_steps, planner.iterations * planner.max_simulated_steps)
+
+    def test_goal_future_beats_non_goal_future_in_real_lightengine_branches(self):
+        inp = self._goal_position_input()
+        planner = MCTSPlanner(iterations=2, horizon=0.2, max_advance_steps=1)
+
+        selected = planner.search(inp, PolicyController())
+
+        root = planner._root
+        assert root is not None
+        goal_child = next(
+            child for child in root.children.values()
+            if child.candidate is not None and child.candidate.intent.action_type == "shoot"
+        )
+        non_goal_child = next(
+            child for child in root.children.values()
+            if child.candidate is not None and child.candidate.intent.action_type != "shoot"
+        )
+        self.assertEqual(goal_child.state.plan.score_us, inp.su + 1)
+        self.assertEqual(non_goal_child.state.plan.score_us, inp.su)
+        self.assertIs(selected, goal_child.candidate)
+        self.assertGreater(goal_child.value / goal_child.visits, non_goal_child.value / non_goal_child.visits)
+
+    def test_conceding_is_strictly_worse_than_comparable_non_conceding_state(self):
+        root = SearchState.from_policy_input(build_inp())
+        safe = root.clone()
+        conceded = root.clone()
+        conceded.plan.score_them += 1
+
+        self.assertGreater(MCTSPlanner._evaluate(safe, root), MCTSPlanner._evaluate(conceded, root))
+
+    def test_search_has_no_live_policy_state_side_effects(self):
+        inp = build_inp()
+        inp.opp = OpponentModel(samples=4, side_bias=1.5, press_samples=2.0, press_accum=5.0)
+        controller = PolicyController()
+        controller._pending_pass_receiver = "live_receiver"
+        controller._pending_pass_collection = (12.0, 8.0)
+        controller.log.record({"existing": "entry"})
+        team_plan = TeamPlan(
+            shot_expected=True,
+            rebound_zone_x=48.0,
+            rebound_zone_y=17.0,
+            far_post_target_y=23.0,
+        )
+        controller._team_plan_manager = TeamPlanManager()
+        controller._team_plan_manager.current_plan = copy.deepcopy(team_plan)
+        state_before = copy.deepcopy(inp.state)
+        world_before = copy.deepcopy(inp.world)
+        opponent_before = copy.deepcopy(inp.opp)
+        log_before = copy.deepcopy(controller.log)
+        plan_before = copy.deepcopy(team_plan)
+        manager_before = copy.deepcopy(controller._team_plan_manager)
+        pending_before = (
+            controller._pending_pass_receiver,
+            controller._pending_pass_collection,
+        )
+
+        planner = MCTSPlanner(iterations=10)
+        planner.search(inp, controller, team_plan)
+
+        self.assertEqual(inp.state, state_before)
+        self.assertEqual(inp.world, world_before)
+        self.assertEqual(inp.opp, opponent_before)
+        self.assertEqual(controller.log, log_before)
+        self.assertEqual(team_plan, plan_before)
+        self.assertEqual(
+            controller._team_plan_manager.current_plan,
+            manager_before.current_plan,
+        )
+        self.assertEqual(
+            controller._team_plan_manager.previous_plan,
+            manager_before.previous_plan,
+        )
+        self.assertEqual(
+            (controller._pending_pass_receiver, controller._pending_pass_collection),
+            pending_before,
+        )
+
+    def test_diagnostics_prove_strict_bounded_search_work(self):
+        planner = MCTSPlanner(
+            iterations=10,
+            horizon=0.8,
+            max_decision_depth=2,
+            max_advance_steps=3,
+        )
+
+        planner.search(build_inp(), PolicyController())
+
+        self.assertEqual(planner.stats.iterations, 10)
+        self.assertLessEqual(planner.stats.nodes_created, 1 + planner.iterations)
+        self.assertLessEqual(planner.stats.max_depth, planner.max_decision_depth)
+        self.assertLessEqual(
+            planner.stats.simulated_steps,
+            planner.iterations * planner.max_simulated_steps,
+        )
 
 
 class SearchStateBoundaryTests(unittest.TestCase):

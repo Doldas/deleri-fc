@@ -1,262 +1,611 @@
-"""MCTSPlanner — Monte Carlo Tree Search over tactical TeamActions.
+"""Bounded deterministic MCTS over production ``ActionCandidate`` boards.
 
-Implements the first-experiment scope from AISTRATEGI §61: a small action
-abstraction (pass / shoot / dribble / wall_pass / press), a 2 s horizon, UCT
-with a tactical prior, rollouts through the internal LightEngine, and shaped
-rewards. Offline this feeds policy distillation; at runtime it stays optional
-and budget-limited (AISTRATEGI §26–30, §40).
+Search owns only ``SearchState`` snapshots and branch-local policy context. It
+does not call ``PolicyController.decide``: hypothetical attack boards are
+created with the same production build/filter/rank methods, without committing
+actions, logging, or changing live controller memory.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import random
 from dataclasses import dataclass, field
 
-from . import geom
 from .config import DECISION_INTERVAL
-from .geom import OPP_GOAL_X
-from .light import LIntent, LightEngine, PlanState
-from .physics import pick_shot_target
-from .policy import PlayerIntent, PolicyInput
-from .search_state import SearchState
-from .wall import is_near_wall
-
-# Tactical action labels (AISTRATEGI §28 subset used by the first experiment).
-ACTION_POLICY = "POLICY"
-ACTION_SHOOT = "SHOOT"
-ACTION_PASS_FORWARD = "PASS_FORWARD"
-ACTION_PASS_WIDE = "PASS_WIDE"
-ACTION_PASS_SUPPORT = "PASS_SUPPORT"
-ACTION_DRIBBLE_FORWARD = "DRIBBLE_FORWARD"
-ACTION_WALL_PASS = "WALL_PASS"
+from .policy import ActionCandidate, PlayerIntent, PolicyController, PolicyInput
+from .search_state import SearchState, advance_search_state, is_within_pitch, transition_candidate
+from .state import Ball, GameState, Player, WorldModel
+from .teamplan import TeamPlan, TeamPlanManager
 
 
-@dataclass
-class Candidate:
-    label: str
-    intents: dict[str, PlayerIntent]
-    prior: float
+@dataclass(frozen=True)
+class RootActionStats:
+    """Visits and backed-up value for one original production root candidate."""
+
+    candidate: ActionCandidate
+    visits: int
+    value: float
+
+    @property
+    def mean_value(self) -> float:
+        return self.value / self.visits if self.visits else 0.0
+
+
+@dataclass(frozen=True)
+class SearchDiagnostics:
+    iterations: int = 0
+    nodes_created: int = 0
+    max_depth: int = 0
+    simulated_steps: int = 0
+    root_actions: tuple[RootActionStats, ...] = ()
 
 
 @dataclass
 class _Node:
-    label: str
-    prior: float
-    n: int = 0
-    w: float = 0.0
-    children: dict[str, "_Node"] = field(default_factory=dict)
-
-
-def _to_plan(inp: PolicyInput) -> PlanState:
-    """Compatibility adapter to the shared branch-owned simulation snapshot."""
-    return SearchState.from_policy_input(inp).plan
-
-
-def _to_light(intents: dict[str, PlayerIntent], team: str) -> dict[tuple[str, str], LIntent]:
-    out: dict[tuple[str, str], LIntent] = {}
-    for pid, it in intents.items():
-        out[(team, pid)] = LIntent(
-            tx=it.tx,
-            ty=it.ty,
-            speed=it.speed,
-            act=it.action_type,
-            action_target=it.action_target,
-            power=it.action_power,
-            face_target=(it.face_x, it.face_y),
-        )
-    return out
+    state: SearchState
+    parent: _Node | None
+    candidate: ActionCandidate | None
+    depth: int
+    steps_from_root: int
+    team_plan_manager: TeamPlanManager
+    candidates: list[ActionCandidate]
+    unexpanded: list[int]
+    children: dict[int, _Node] = field(default_factory=dict)
+    visits: int = 0
+    value: float = 0.0
 
 
 class MCTSPlanner:
+    """A small UCT planner whose root and descendant actions are production options.
+
+    ``search`` is the standalone API and returns an original root
+    ``ActionCandidate``. ``choose`` retains the old opt-in runtime API by
+    replacing only the possessor's intent in a copy of the supplied intent map.
+    The runtime remains opt-in through its existing MCTS configuration gate.
+    """
+
     def __init__(
         self,
-        genome: dict[str, float],
-        weights: dict[str, float],
-        rng: random.Random,
-        iterations: int = 40,
-        horizon: float = 2.0,
+        genome: dict[str, float] | None = None,
+        weights: dict[str, float] | None = None,
+        rng: random.Random | None = None,
+        iterations: int = 24,
+        horizon: float = 1.5,
         cpuct: float = 1.4,
-    ):
-        self.genome = genome
-        self.weights = weights
-        self.rng = rng
-        self.iterations = iterations
-        self.horizon = horizon
-        self.cpuct = cpuct
-        self.engine = LightEngine(seed=47)
+        *,
+        max_decision_depth: int = 3,
+        max_advance_steps: int = 8,
+    ) -> None:
+        # Keep the old constructor shape for explicitly opt-in callers. Search
+        # is deterministic and does not consume this RNG or use reward weights.
+        self.genome = copy.deepcopy(genome or {})
+        self.weights = copy.deepcopy(weights or {})
+        self.rng = rng or random.Random(0)
+        self.iterations = max(0, int(iterations))
+        configured_horizon = float(horizon)
+        self.horizon = (
+            max(0.0, configured_horizon)
+            if math.isfinite(configured_horizon)
+            else 1.5
+        )
+        configured_cpuct = float(cpuct)
+        self.cpuct = (
+            max(0.0, configured_cpuct)
+            if math.isfinite(configured_cpuct)
+            else 1.4
+        )
+        self.max_decision_depth = max(1, int(max_decision_depth))
+        self.max_advance_steps = max(0, int(max_advance_steps))
+        self.max_simulated_steps = max(
+            1, int(math.ceil(self.horizon / DECISION_INTERVAL))
+        )
+        self.stats = SearchDiagnostics()
+        self.root_candidates: tuple[ActionCandidate, ...] = ()
+        self._root: _Node | None = None
 
-    def choose(self, inp: PolicyInput, base_intents: dict[str, PlayerIntent]) -> dict[str, PlayerIntent] | None:
-        """Run a shallow UCT tree whose root children are tactical candidates.
-        Returns the best intent set, or None when there is nothing to decide
-        over (caller keeps its base intents)."""
-        candidates = self._candidates(inp, base_intents)
-        if len(candidates) <= 1:
+    def search(
+        self,
+        inp: PolicyInput,
+        controller: PolicyController | None = None,
+        team_plan: TeamPlan | None = None,
+    ) -> ActionCandidate | None:
+        """Search from ``inp`` and return one of its production root candidates.
+
+        Candidate generation calls only ``_build_attack_candidates``,
+        ``_filter_attack_candidates`` and ``_rank_attack_candidates``. Passing
+        the live controller is safe: those methods are read-only; simulated
+        team-plan managers and movement-policy controllers are branch-local.
+        """
+        controller = controller or PolicyController()
+        possessor = inp.state.our_possessor()
+        if (
+            possessor is None
+            or not possessor.can_act
+            or inp.state.phase != "openPlay"
+            or inp.tr <= 0.0
+        ):
+            self._reset_search(())
             return None
 
-        base = _to_plan(inp)
-        root = _Node("root", 1.0)
-        for label, c in candidates.items():
-            root.children[label] = _Node(label=label, prior=max(c.prior, 0.01))
+        manager = self._initial_team_plan_manager(inp, controller, team_plan)
+        candidates = self._production_candidates(inp, controller, manager.current_plan)
+        if not candidates:
+            self._reset_search(())
+            return None
 
-        visits: dict[str, int] = {label: 0 for label in candidates}
-        values: dict[str, float] = {label: 0.0 for label in candidates}
-        total = 0.0
+        candidates = tuple(candidates)
+        self._reset_search(candidates)
+        root_state = SearchState.from_policy_input(inp)
+        root = _Node(
+            state=root_state,
+            parent=None,
+            candidate=None,
+            depth=0,
+            steps_from_root=0,
+            team_plan_manager=manager,
+            candidates=list(candidates),
+            unexpanded=list(range(len(candidates))),
+        )
+        self._root = root
+
+        if self.iterations == 0:
+            return candidates[0]
+
+        completed_iterations = 0
+        nodes_created = 1
+        max_depth = 0
+        simulated_steps = 0
+
         for _ in range(self.iterations):
-            total += 1.0
-            label = max(root.children, key=lambda lb: self._ucb(root, root.children[lb], total, visits, values))
-            visits[label] += 1
-            values[label] += self._rollout(base, candidates[label].intents)
+            path = [root]
+            node = root
 
-        best_label = max(candidates, key=lambda lb: values[lb] / max(1, visits[lb]))
-        return candidates[best_label].intents
+            while (
+                node.depth < self.max_decision_depth
+                and node.steps_from_root < self.max_simulated_steps
+                and node.candidates
+            ):
+                if node.unexpanded:
+                    child, added_steps = self._expand(node, inp, controller)
+                    simulated_steps += added_steps
+                    if child is not None:
+                        node = child
+                        path.append(node)
+                        nodes_created += 1
+                        max_depth = max(max_depth, node.depth)
+                    break
+                if not node.children:
+                    break
+                node = self._select(node)
+                path.append(node)
 
-    def _ucb(self, root: _Node, node: _Node, total: float, visits: dict[str, int], values: dict[str, float]) -> float:
-        n = visits[node.label]
-        if n == 0:
-            return 1e9 + node.prior
-        # Mean value Q = W/N (values dict stores accumulated W)
-        q = values[node.label] / n
-        # PUCT: Q + c_puct * prior * sqrt(ln(N)/n)
-        return q + node.prior * self.cpuct * math.sqrt(math.log(total + 1.0) / n)
+            leaf_state, rollout_steps, rollout_depth = self._rollout(
+                node, inp, controller
+            )
+            simulated_steps += rollout_steps
+            max_depth = max(max_depth, rollout_depth)
+            value = self._evaluate(leaf_state, root_state)
+            self._backpropagate(path, value)
+            completed_iterations += 1
 
-    def _rollout(self, state: PlanState, our_intents: dict[str, PlayerIntent]) -> float:
-        st = state
-        our_light = _to_light(our_intents, "us")
-        them_light = self._opponent_intents(st)
-        total_reward = 0.0
-        gamma = 1.0
-        steps = max(1, int(round(self.horizon / DECISION_INTERVAL)))
-        for _ in range(steps):
-            merged = dict(our_light)
-            merged.update(them_light)
-            st = self.engine.step(st, merged)
-            total_reward += gamma * self._reward(st)
-            gamma *= 0.97
-            if any(e.startswith("goal") for e in st.events):
-                break
-        return total_reward
+        root_stats = tuple(
+            RootActionStats(
+                candidate=candidate,
+                visits=(root.children[index].visits if index in root.children else 0),
+                value=(root.children[index].value if index in root.children else 0.0),
+            )
+            for index, candidate in enumerate(candidates)
+        )
+        self.stats = SearchDiagnostics(
+            iterations=completed_iterations,
+            nodes_created=nodes_created,
+            max_depth=max_depth,
+            simulated_steps=simulated_steps,
+            root_actions=root_stats,
+        )
 
-    def _reward(self, st: PlanState) -> float:
-        w = self.weights
-        r = 0.0
-        for e in st.events:
-            if e == "goal":
-                r += w["goal"]
-            elif e == "goal_conceded":
-                r += w["goal_conceded"]
-            elif e == "kick:shoot":
-                r += w["shot_quality"] * 0.05
-            elif e in ("tackle:win", "slap:down"):
-                r += w["counterpress_recovery"] * 0.5
-        if st.ball.possessing_team == "us":
-            r += (st.ball.x - 30.0) * w["territorial_progression"]
-        return r
+        # Conventional final rule: most visits, then highest mean value, then
+        # original production ranking order. Candidate.reason is never consulted.
+        best_index = max(
+            range(len(candidates)),
+            key=lambda index: (
+                root_stats[index].visits,
+                root_stats[index].mean_value,
+                -index,
+            ),
+        )
+        return candidates[best_index]
 
-    def _opponent_intents(self, st: PlanState) -> dict[tuple[str, str], LIntent]:
-        # Nearest opponent presses the ball; the rest hold a compact shape.
-        out: dict[tuple[str, str], LIntent] = {}
-        bx, by = st.ball.x, st.ball.y
-        for p in st.outfield("them"):
-            if geom.distance(p.x, p.y, bx, by) < 6.0:
-                out[("them", p.pid)] = LIntent(tx=bx, ty=by, speed=0.9)
-            else:
-                tx = geom.clamp(p.x + (bx - p.x) * 0.3, 0.0, OPP_GOAL_X * 0.5)
-                ty = geom.clamp(p.y + (by - p.y) * 0.3, 0.0, 40.0)
-                out[("them", p.pid)] = LIntent(tx=tx, ty=ty, speed=0.6)
-        gk = st.gk("them")
-        if gk is not None:
-            # Opponent GK defends x=60, their defensive fifth starts at x=48
-            # Move GK toward center of their defensive fifth (x=54)
-            target_gkx = 54.0
-            gkx = gk.x + (target_gkx - gk.x) * 0.5
-            out[("them", gk.pid)] = LIntent(tx=gkx, ty=gk.y, speed=0.6)
-        return out
+    def choose(
+        self,
+        inp: PolicyInput,
+        base_intents: dict[str, PlayerIntent],
+        controller: PolicyController | None = None,
+        team_plan: TeamPlan | None = None,
+    ) -> dict[str, PlayerIntent] | None:
+        """Compatibility wrapper for the existing explicitly enabled runtime.
 
-    def _candidates(self, inp: PolicyInput, base_intents: dict[str, PlayerIntent]) -> dict[str, Candidate]:
-        cand: dict[str, Candidate] = {}
-        cand[ACTION_POLICY] = Candidate(ACTION_POLICY, dict(base_intents), 0.6)
+        The standalone planner API is ``search``. This wrapper preserves the
+        previous mapping return shape for the opt-in runtime path only.
+        """
+        selected = self.search(inp, controller=controller, team_plan=team_plan)
+        if selected is None:
+            return None
+        result = dict(base_intents)
+        result[selected.intent.pid] = selected.intent
+        return result
 
+    def _reset_search(self, candidates: tuple[ActionCandidate, ...]) -> None:
+        self.root_candidates = candidates
+        self._root = None
+        self.stats = SearchDiagnostics()
+
+    @staticmethod
+    def _production_candidates(
+        inp: PolicyInput,
+        controller: PolicyController,
+        team_plan: TeamPlan | None,
+    ) -> list[ActionCandidate]:
         possessor = inp.state.our_possessor()
-        if possessor is None:
-            return cand
-
-        # Forward-pass variants onto the most advanced receivers.
-        receivers = _rank_receivers(inp, possessor)
-        for idx in range(min(2, len(receivers))):
-            pid = receivers[idx][0]
-            label = f"{ACTION_PASS_FORWARD}_{pid}"
-            cand[label] = Candidate(label, self._with_pass(inp, base_intents, possessor.id, pid), 0.5 - idx * 0.1)
-
-        # Wide pass.
-        widers = [p for p in inp.state.outfield_us() if p.id != possessor.id and (p.y <= 8.0 or p.y >= 32.0)]
-        if widers:
-            w0 = widers[0].id
-            cand[ACTION_PASS_WIDE] = Candidate(ACTION_PASS_WIDE, self._with_pass(inp, base_intents, possessor.id, w0), 0.4)
-
-        # Keep driving forward.
-        cand[ACTION_DRIBBLE_FORWARD] = Candidate(ACTION_DRIBBLE_FORWARD, self._with_dribble(inp, base_intents, possessor.id), 0.45)
-
-        # Immediate shot opportunity.
-        if OPP_GOAL_X - possessor.x < 20.0:
-            cand[ACTION_SHOOT] = Candidate(ACTION_SHOOT, self._with_shot(inp, base_intents, possessor.id), 0.35)
-
-        # Wall pass near touchlines.
-        if is_near_wall(possessor.x, possessor.y, margin=6.0):
-            cand[ACTION_WALL_PASS] = Candidate(ACTION_WALL_PASS, self._with_wall(inp, base_intents, possessor.id), 0.4)
-        return cand
-
-    # -- candidate builders ------------------------------------------------
-    @staticmethod
-    def _with_pass(inp: PolicyInput, base: dict[str, PlayerIntent], src: str, dst: str) -> dict[str, PlayerIntent]:
-        out = dict(base)
-        src_it = out.get(src)
-        dst_p = next((p for p in inp.state.outfield_us() if p.id == dst), None)
-        if src_it is not None and dst_p is not None:
-            tx, ty = dst_p.x, dst_p.y
-            out[src] = PlayerIntent(src, src_it.tx, src_it.ty, 0.4, tx, ty, "pass", (tx, ty), 0.5)
-            out[dst] = PlayerIntent(dst, dst_p.x, dst_p.y, 0.7, inp.state.ball.x, inp.state.ball.y)
-        return out
+        if possessor is None or not possessor.can_act:
+            return []
+        generated = controller._build_attack_candidates(inp, possessor, team_plan)
+        filtered = controller._filter_attack_candidates(possessor, generated)
+        ranked = controller._rank_attack_candidates(filtered)
+        return [
+            candidate
+            for candidate in ranked
+            if math.isfinite(candidate.value)
+        ]
 
     @staticmethod
-    def _with_dribble(inp: PolicyInput, base: dict[str, PlayerIntent], src: str) -> dict[str, PlayerIntent]:
-        out = dict(base)
-        it = out.get(src)
-        p = next((q for q in inp.state.outfield_us() if q.id == src), None)
-        if it is not None and p is not None:
-            tx = min(p.x + 6.0, 58.0)
-            out[src] = PlayerIntent(src, tx, p.y, 0.8, tx, p.y)
-        return out
+    def _initial_team_plan_manager(
+        inp: PolicyInput,
+        controller: PolicyController,
+        team_plan: TeamPlan | None,
+    ) -> TeamPlanManager:
+        live_manager = getattr(controller, "_team_plan_manager", None)
+        manager = copy.deepcopy(live_manager) if live_manager is not None else TeamPlanManager()
+        if team_plan is not None:
+            manager.current_plan = copy.deepcopy(team_plan)
+        return manager
 
     @staticmethod
-    def _with_shot(inp: PolicyInput, base: dict[str, PlayerIntent], src: str) -> dict[str, PlayerIntent]:
-        out = dict(base)
-        it = out.get(src)
-        gk = inp.state.goalkeeper_them()
-        gkx = gk.x if gk else 58.0
-        gky = gk.y if gk else 20.0
-        if it is not None:
-            t = pick_shot_target(inp.state.ball.x, inp.state.ball.y, gkx, gky)
-            out[src] = PlayerIntent(src, it.tx, it.ty, 0.4, t.x, t.y, "shoot", (t.x, t.y), t.power)
-        return out
+    def _policy_input(
+        state: SearchState,
+        root: PolicyInput,
+        steps_from_root: int,
+    ) -> PolicyInput:
+        """Rebuild only observable production-policy inputs from a search state.
+
+        Cooldowns and other hidden engine timers are whatever LightEngine
+        modeled; no observation-only fields are fabricated. Root tactical and
+        match context is copied forward because SearchState does not contain it.
+        """
+        plan = state.plan
+        game_state = GameState(
+            protocol_version=root.state.protocol_version,
+            game_id=root.state.game_id,
+            sequence=root.state.sequence + steps_from_root,
+            simulation_tick=root.state.simulation_tick + steps_from_root,
+            apply_at_tick=root.state.apply_at_tick + steps_from_root,
+            time_remaining=state.time_remaining,
+            phase=root.state.phase,
+            score_us=plan.score_us,
+            score_them=plan.score_them,
+            ball=Ball(
+                x=plan.ball.x,
+                y=plan.ball.y,
+                vx=plan.ball.vx,
+                vy=plan.ball.vy,
+                possessing_team=plan.ball.possessing_team,
+                possessing_player=plan.ball.possessing_player,
+            ),
+            us=tuple(
+                Player(
+                    id=p.pid,
+                    team="us",
+                    role="goalkeeper" if p.role == "goalkeeper" else "outfield",
+                    x=p.x,
+                    y=p.y,
+                    vx=p.vx,
+                    vy=p.vy,
+                    facing=p.facing,
+                    can_act=p.can_act,
+                )
+                for p in plan.players
+                if p.team == "us"
+            ),
+            them=tuple(
+                Player(
+                    id=p.pid,
+                    team="them",
+                    role="goalkeeper" if p.role == "goalkeeper" else "outfield",
+                    x=p.x,
+                    y=p.y,
+                    vx=p.vx,
+                    vy=p.vy,
+                    facing=p.facing,
+                    can_act=p.can_act,
+                )
+                for p in plan.players
+                if p.team == "them"
+            ),
+        )
+        return PolicyInput(
+            state=game_state,
+            world=WorldModel.build(game_state),
+            config=copy.deepcopy(root.config),
+            tactical_state=root.tactical_state,
+            press_plan=copy.deepcopy(root.press_plan),
+            roles=dict(root.roles),
+            their_possession_ticks=root.their_possession_ticks,
+            opp=copy.deepcopy(root.opp),
+            time_remaining=state.time_remaining,
+            score_us=plan.score_us,
+            score_them=plan.score_them,
+            counter_press_active=root.counter_press_active,
+            match_duration=root.match_duration,
+        )
 
     @staticmethod
-    def _with_wall(inp: PolicyInput, base: dict[str, PlayerIntent], src: str) -> dict[str, PlayerIntent]:
-        """Wall pass: play a firm pass into the wall ahead and follow it up."""
-        out = dict(base)
-        it = out.get(src)
-        p = next((q for q in inp.state.outfield_us() if q.id == src), None)
-        if it is not None and p is not None:
-            from .wall import direction_to_wall
-            dx, dy = direction_to_wall(p.x, p.y)
-            tx = geom.clamp(p.x + dx * 4.0, 0.1, OPP_GOAL_X - 0.1)
-            ty = geom.clamp(p.y + dy * 4.0, 0.1, 39.9)
-            out[src] = PlayerIntent(src, tx, ty, 0.8, tx, ty, "pass", (tx, ty), 0.6)
-        return out
+    def _refresh_team_plan(
+        manager: TeamPlanManager,
+        inp: PolicyInput,
+    ) -> None:
+        manager.update(inp, inp.state.our_possessor(), inp.state.simulation_tick)
 
+    @staticmethod
+    def _background_intents(
+        inp: PolicyInput,
+        team_plan: TeamPlan | None,
+        candidate: ActionCandidate | None = None,
+    ) -> dict[tuple[str, str], PlayerIntent]:
+        """Get production off-ball movement using a fresh branch-local controller.
 
-def _rank_receivers(inp: PolicyInput, possessor) -> list[tuple[str, float]]:
-    """(player-id, forward x) sorted by progression for candidate generation."""
-    rows = [(t.id, t.x) for t in inp.state.outfield_us() if t.id != possessor.id]
-    rows.sort(key=lambda r: r[1], reverse=True)
-    return rows
+        The opposing side receives no invented policy intent: its players hold
+        position while LightEngine still applies automatic control/goalkeeper
+        behavior. This deterministic stationary-opponent response is deliberately
+        optimistic and is not an adversarial model.
+        """
+        branch_controller = PolicyController()
+        possessor = inp.state.our_possessor()
+        if (
+            candidate is not None
+            and candidate.intent.action_type == "pass"
+            and candidate.intent.receiver_id is not None
+        ):
+            branch_controller._pending_pass_receiver = candidate.intent.receiver_id
+            branch_controller._pending_pass_collection = candidate.intent.collection_point
+
+        intents: dict[tuple[str, str], PlayerIntent] = {}
+        for player in inp.state.outfield_us():
+            if possessor is not None and player.id == possessor.id:
+                if not possessor.can_act:
+                    intents[("us", player.id)] = branch_controller._decide_possessor(
+                        inp, possessor, team_plan
+                    )
+                continue
+            intents[("us", player.id)] = branch_controller._decide_off_ball(
+                inp, player, possessor, team_plan
+            )
+
+        goalkeeper = inp.state.goalkeeper_us()
+        if goalkeeper is not None:
+            intents[("us", goalkeeper.id)] = branch_controller._decide_goalkeeper(
+                inp, goalkeeper
+            )
+        return intents
+
+    def _advance_until_decision(
+        self,
+        state: SearchState,
+        manager: TeamPlanManager,
+        root_input: PolicyInput,
+        controller: PolicyController,
+        steps_from_root: int,
+    ) -> tuple[SearchState, TeamPlanManager, int, list[ActionCandidate]]:
+        """Boundedly advance restarts, loose balls and unavailable decisions."""
+        available_advances = min(
+            self.max_advance_steps,
+            max(0, self.max_simulated_steps - steps_from_root),
+        )
+        advanced = 0
+        for _ in range(available_advances + 1):
+            if (
+                state.time_remaining <= 0.0
+                or not is_within_pitch(state)
+            ):
+                return state, manager, advanced, []
+
+            policy_input = self._policy_input(state, root_input, steps_from_root + advanced)
+            self._refresh_team_plan(manager, policy_input)
+            possessor = policy_input.state.our_possessor()
+            if possessor is not None and possessor.can_act:
+                board = self._production_candidates(
+                    policy_input, controller, manager.current_plan
+                )
+                if board:
+                    return state, manager, advanced, board
+
+            if advanced >= available_advances:
+                break
+            background = self._background_intents(
+                policy_input, manager.current_plan
+            )
+            state = advance_search_state(state, background)
+            advanced += 1
+
+        return state, manager, advanced, []
+
+    def _expand(
+        self,
+        node: _Node,
+        root_input: PolicyInput,
+        controller: PolicyController,
+    ) -> tuple[_Node | None, int]:
+        while node.unexpanded:
+            candidate_index = node.unexpanded.pop(0)
+            candidate = node.candidates[candidate_index]
+            policy_input = self._policy_input(
+                node.state, root_input, node.steps_from_root
+            )
+            background = self._background_intents(
+                policy_input, node.team_plan_manager.current_plan, candidate
+            )
+            try:
+                child_state = transition_candidate(
+                    node.state, candidate, background_intents=background
+                )
+            except ValueError:
+                # The board is production-owned; still fail closed if a future
+                # candidate becomes unusable after adaptation to simulated data.
+                continue
+
+            child_steps = node.steps_from_root + 1
+            child_manager = copy.deepcopy(node.team_plan_manager)
+            child_state, child_manager, waited, child_candidates = (
+                self._advance_until_decision(
+                    child_state,
+                    child_manager,
+                    root_input,
+                    controller,
+                    child_steps,
+                )
+            )
+            child_steps += waited
+            child = _Node(
+                state=child_state,
+                parent=node,
+                candidate=candidate,
+                depth=node.depth + 1,
+                steps_from_root=child_steps,
+                team_plan_manager=child_manager,
+                candidates=child_candidates,
+                unexpanded=list(range(len(child_candidates))),
+            )
+            node.children[candidate_index] = child
+            return child, 1 + waited
+        return None, 0
+
+    @staticmethod
+    def _uct_score(
+        parent_visits: int,
+        child_visits: int,
+        child_value: float,
+        exploration_constant: float,
+    ) -> float:
+        if child_visits <= 0:
+            return 0.0
+        if not math.isfinite(child_value) or not math.isfinite(exploration_constant):
+            return -1e9
+        mean_value = child_value / child_visits
+        exploration = exploration_constant * math.sqrt(
+            math.log(max(1, parent_visits)) / child_visits
+        )
+        score = mean_value + exploration
+        return score if math.isfinite(score) else -1e9
+
+    def _select(self, node: _Node) -> _Node:
+        """Select the highest UCT child; sorted keys provide stable tie-breaking."""
+        unvisited = [
+            node.children[index]
+            for index in sorted(node.children)
+            if node.children[index].visits == 0
+        ]
+        if unvisited:
+            return unvisited[0]
+        best_child: _Node | None = None
+        best_score = -math.inf
+        for index in sorted(node.children):
+            child = node.children[index]
+            score = self._uct_score(
+                node.visits, child.visits, child.value, self.cpuct
+            )
+            if score > best_score:
+                best_child = child
+                best_score = score
+        if best_child is None:
+            raise ValueError("cannot select from a node without children")
+        return best_child
+
+    def _rollout(
+        self,
+        start: _Node,
+        root_input: PolicyInput,
+        controller: PolicyController,
+    ) -> tuple[SearchState, int, int]:
+        """Roll out the highest production-ranked candidate deterministically."""
+        state = start.state
+        manager = copy.deepcopy(start.team_plan_manager)
+        steps_from_root = start.steps_from_root
+        added_steps = 0
+        depth = start.depth
+        while (
+            depth < self.max_decision_depth
+            and steps_from_root < self.max_simulated_steps
+            and state.time_remaining > 0.0
+            and is_within_pitch(state)
+        ):
+            state, manager, waited, board = self._advance_until_decision(
+                state,
+                manager,
+                root_input,
+                controller,
+                steps_from_root,
+            )
+            steps_from_root += waited
+            added_steps += waited
+            if not board or steps_from_root >= self.max_simulated_steps:
+                break
+
+            candidate = board[0]  # _production_candidates is EV-ranked.
+            policy_input = self._policy_input(state, root_input, steps_from_root)
+            background = self._background_intents(
+                policy_input, manager.current_plan, candidate
+            )
+            try:
+                state = transition_candidate(
+                    state, candidate, background_intents=background
+                )
+            except ValueError:
+                break
+            steps_from_root += 1
+            added_steps += 1
+            depth += 1
+            # No random rollout policy: ties and repeated states remain fully
+            # reproducible for the same input and planner configuration.
+
+        return state, added_steps, depth
+
+    @staticmethod
+    def _evaluate(state: SearchState, root: SearchState) -> float:
+        """Small bounded leaf value from our perspective; goals dominate shape."""
+        plan = state.plan
+        root_plan = root.plan
+        goal_difference = (
+            (plan.score_us - root_plan.score_us)
+            - (plan.score_them - root_plan.score_them)
+        )
+        value = 2.0 * goal_difference
+
+        progress = (plan.ball.x - root_plan.ball.x) / 60.0
+        value += 0.12 * progress
+        if plan.ball.possessing_team == "us":
+            value += 0.08 + 0.06 * (plan.ball.x / 60.0)
+        elif plan.ball.possessing_team == "them":
+            value -= 0.08 + 0.06 * (1.0 - plan.ball.x / 60.0)
+
+        if not math.isfinite(value):
+            return -2.0
+        return max(-2.5, min(2.5, value))
+
+    @staticmethod
+    def _backpropagate(path: list[_Node], value: float) -> None:
+        if not math.isfinite(value):
+            value = -2.0
+        for node in path:
+            node.visits += 1
+            node.value += value

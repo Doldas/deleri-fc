@@ -486,7 +486,18 @@ class RuntimeManager:
             )
             if high_value:
                 ctx.mcts_planner.genome = adapted_genome
-                best = ctx.mcts_planner.choose(inp, intents)
+                team_plan_manager = ctx.policy._team_plan_manager
+                team_plan = (
+                    team_plan_manager.current_plan
+                    if team_plan_manager is not None
+                    else None
+                )
+                best = ctx.mcts_planner.choose(
+                    inp,
+                    intents,
+                    controller=ctx.policy,
+                    team_plan=team_plan,
+                )
                 if best is not None:
                     intents = best
                     # MCTS returns engine-coordinate intents (it operates on normalized state
