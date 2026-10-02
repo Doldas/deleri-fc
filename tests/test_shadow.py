@@ -143,10 +143,21 @@ class ShadowEvaluationTests(unittest.TestCase):
         result = self._controlled(inp)
 
         self.assertTrue(result.eligible)
+        self.assertEqual(result.schema_version, 2)
         self.assertEqual(len(ControlledPlanner.seen_boards), 2)
         first_board, second_board = ControlledPlanner.seen_boards
         self.assertIs(first_board, second_board)
         self.assertEqual(result.root_candidate_count, len(first_board))
+        self.assertTrue(
+            all(
+                "branch_outcome" in row
+                and "score_delta_us" in row
+                and "goal_terminal" in row
+                and "root_mean_value" in row
+                and "root_visits" in row
+                for row in result.candidate_board
+            )
+        )
         self.assertEqual(result.production_signature, candidate_signature(first_board[0]))
         self.assertIs(first_board[0], first_board[result.production_index])
         self.assertIs(first_board[result.mcts_index], first_board[0])

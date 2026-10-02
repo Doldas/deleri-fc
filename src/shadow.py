@@ -129,7 +129,7 @@ class ShadowResult:
 def _ineligible(inp: PolicyInput, reason: str) -> ShadowResult:
     possessor = inp.state.our_possessor()
     return ShadowResult(
-        schema_version=1,
+        schema_version=2,
         opponent_model=OPPONENT_RESPONSE_MODEL,
         eligible=False,
         skip_reason=reason,
@@ -348,12 +348,56 @@ def evaluate_shadow(
     root_stats = headline_planner.stats.root_actions
     root_visits = tuple(stat.visits for stat in root_stats)
     root_means = tuple(_rounded(stat.mean_value) or 0.0 for stat in root_stats)
+    candidate_rows = tuple(
+        {
+            **row,
+            "root_visits": (
+                root_stats[index].visits if index < len(root_stats) else 0
+            ),
+            "root_mean_value": (
+                _rounded(root_stats[index].mean_value)
+                if index < len(root_stats)
+                else None
+            ),
+            "score_delta_us": (
+                root_stats[index].score_delta_us
+                if index < len(root_stats)
+                else None
+            ),
+            "score_delta_them": (
+                root_stats[index].score_delta_them
+                if index < len(root_stats)
+                else None
+            ),
+            "goal_scored": (
+                root_stats[index].goal_scored
+                if index < len(root_stats)
+                else None
+            ),
+            "goal_conceded": (
+                root_stats[index].goal_conceded
+                if index < len(root_stats)
+                else None
+            ),
+            "goal_terminal": (
+                root_stats[index].goal_terminal
+                if index < len(root_stats)
+                else None
+            ),
+            "branch_outcome": (
+                root_stats[index].branch_outcome
+                if index < len(root_stats)
+                else "not_simulated"
+            ),
+        }
+        for index, row in enumerate(candidate_rows)
+    )
     mcts_preference = None
     if mcts_index is not None and mcts_index < len(root_means):
         mcts_preference = _rounded(root_means[mcts_index] - root_means[0])
 
     return ShadowResult(
-        schema_version=1,
+        schema_version=2,
         opponent_model=OPPONENT_RESPONSE_MODEL,
         eligible=True,
         skip_reason=None,

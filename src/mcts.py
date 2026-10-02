@@ -24,11 +24,22 @@ from .teamplan import TeamPlan, TeamPlanManager
 
 @dataclass(frozen=True)
 class RootActionStats:
-    """Visits and backed-up value for one original production root candidate."""
+    """Visits/value plus the expanded successor outcome for one root candidate.
+
+    ``branch_outcome`` describes the successor after the root action and its
+    bounded advance to the next decision. ``value`` and ``visits`` include the
+    later deterministic rollout/search continuation from that successor.
+    """
 
     candidate: ActionCandidate
     visits: int
     value: float
+    score_delta_us: int = 0
+    score_delta_them: int = 0
+    goal_scored: bool = False
+    goal_conceded: bool = False
+    goal_terminal: bool = False
+    branch_outcome: str = "not_simulated"
 
     @property
     def mean_value(self) -> float:
@@ -210,14 +221,38 @@ class MCTSPlanner:
             self._backpropagate(path, value)
             completed_iterations += 1
 
-        root_stats = tuple(
-            RootActionStats(
-                candidate=candidate,
-                visits=(root.children[index].visits if index in root.children else 0),
-                value=(root.children[index].value if index in root.children else 0.0),
+        root_stats_list: list[RootActionStats] = []
+        for index, candidate in enumerate(candidates):
+            child = root.children.get(index)
+            visits = child.visits if child is not None else 0
+            value = child.value if child is not None else 0.0
+            if child is None:
+                score_delta_us = score_delta_them = 0
+                goal_scored = goal_conceded = goal_terminal = False
+                branch_outcome = "not_simulated"
+            else:
+                (
+                    score_delta_us,
+                    score_delta_them,
+                    goal_scored,
+                    goal_conceded,
+                    goal_terminal,
+                    branch_outcome,
+                ) = self._root_branch_outcome(candidate, child.state, root_state)
+            root_stats_list.append(
+                RootActionStats(
+                    candidate=candidate,
+                    visits=visits,
+                    value=value,
+                    score_delta_us=score_delta_us,
+                    score_delta_them=score_delta_them,
+                    goal_scored=goal_scored,
+                    goal_conceded=goal_conceded,
+                    goal_terminal=goal_terminal,
+                    branch_outcome=branch_outcome,
+                )
             )
-            for index, candidate in enumerate(candidates)
-        )
+        root_stats = tuple(root_stats_list)
         self.stats = SearchDiagnostics(
             iterations=completed_iterations,
             nodes_created=nodes_created,
@@ -621,6 +656,69 @@ class MCTSPlanner:
         if not math.isfinite(value):
             return -2.0
         return max(-2.5, min(2.5, value))
+
+    @staticmethod
+    def _root_branch_outcome(
+        candidate: ActionCandidate,
+        state: SearchState,
+        root: SearchState,
+    ) -> tuple[int, int, bool, bool, bool, str]:
+        """Describe the expanded root successor without affecting its value.
+
+        The successor may already have advanced through a goal restart. Scores
+        survive that reset, while step events do not, so score deltas are the
+        authoritative goal evidence. ``goal_terminal`` stays false because
+        MCTS continues a goal branch through the bounded post-restart horizon.
+        """
+        plan = state.plan
+        root_plan = root.plan
+        score_delta_us = plan.score_us - root_plan.score_us
+        score_delta_them = plan.score_them - root_plan.score_them
+        if score_delta_us and score_delta_them:
+            outcome = "score_exchange"
+        elif score_delta_us:
+            outcome = "goal"
+        elif score_delta_them:
+            outcome = "conceded_goal"
+        elif plan.ball.possessing_team in {"us", "them"}:
+            holder = plan.player(
+                plan.ball.possessing_team,
+                plan.ball.possessing_player or "",
+            )
+            if holder is not None and holder.role == "goalkeeper":
+                outcome = (
+                    "goalkeeper_catch_after_shot"
+                    if candidate.intent.action_type == "shoot"
+                    else "goalkeeper_control"
+                )
+            elif candidate.intent.action_type == "shoot":
+                outcome = (
+                    "attacking_control_after_shot"
+                    if plan.ball.possessing_team == "us"
+                    else "opponent_control_after_shot"
+                )
+            else:
+                outcome = (
+                    "us_control"
+                    if plan.ball.possessing_team == "us"
+                    else "opponent_control"
+                )
+        elif candidate.intent.action_type == "shoot":
+            # A loose ball can be a miss, rebound, or still be in flight. The
+            # current LightEngine exposes no narrower event for those cases.
+            outcome = "loose_after_shot"
+        elif candidate.intent.action_type == "pass":
+            outcome = "loose_after_pass"
+        else:
+            outcome = "loose_ball"
+        return (
+            score_delta_us,
+            score_delta_them,
+            score_delta_us > 0,
+            score_delta_them > 0,
+            False,
+            outcome,
+        )
 
     @staticmethod
     def _backpropagate(path: list[_Node], value: float) -> None:

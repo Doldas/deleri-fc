@@ -375,16 +375,127 @@ class MCTSCoreTests(unittest.TestCase):
         )
         self.assertEqual(goal_child.state.plan.score_us, inp.su + 1)
         self.assertEqual(non_goal_child.state.plan.score_us, inp.su)
+        goal_stat = next(
+            stat for stat in planner.stats.root_actions
+            if stat.candidate is goal_child.candidate
+        )
+        self.assertEqual(goal_stat.score_delta_us, 1)
+        self.assertTrue(goal_stat.goal_scored)
+        self.assertFalse(goal_stat.goal_terminal)
+        self.assertEqual(goal_stat.branch_outcome, "goal")
+        self.assertGreater(
+            MCTSPlanner._evaluate(goal_child.state, root.state),
+            MCTSPlanner._evaluate(non_goal_child.state, root.state),
+        )
         self.assertIs(selected, goal_child.candidate)
         self.assertGreater(goal_child.value / goal_child.visits, non_goal_child.value / non_goal_child.visits)
 
     def test_conceding_is_strictly_worse_than_comparable_non_conceding_state(self):
         root = SearchState.from_policy_input(build_inp())
-        safe = root.clone()
-        conceded = root.clone()
-        conceded.plan.score_them += 1
+        shooter = root.plan.player("them", "st")
+        assert shooter is not None
+        shooter.x, shooter.y = 2.0, 20.0
+        root.plan.ball.x, root.plan.ball.y = 2.6, 20.0
+        root.plan.ball.possessing_team = "them"
+        root.plan.ball.possessing_player = "st"
+        shot = PlayerIntent(
+            pid="st",
+            tx=2.0,
+            ty=20.0,
+            speed=0.0,
+            face_x=0.0,
+            face_y=20.0,
+            action_type="shoot",
+            action_target=(0.0, 20.0),
+            action_power=1.0,
+        )
 
-        self.assertGreater(MCTSPlanner._evaluate(safe, root), MCTSPlanner._evaluate(conceded, root))
+        conceded = advance_search_state(root, {("them", "st"): shot})
+        self.assertEqual(conceded.plan.score_them, root.plan.score_them + 1)
+        self.assertIn("goal_conceded", conceded.plan.events)
+        self.assertIn("kickoff", conceded.plan.events)
+        after_restart = advance_search_state(conceded)
+        self.assertNotIn("goal_conceded", after_restart.plan.events)
+        self.assertEqual(after_restart.plan.score_them, root.plan.score_them + 1)
+
+        comparable = after_restart.clone()
+        comparable.plan.score_them = root.plan.score_them
+        self.assertGreater(
+            MCTSPlanner._evaluate(comparable, root),
+            MCTSPlanner._evaluate(after_restart, root),
+        )
+
+    def _search_shot_outcome(self, target, *, goalkeeper_y=20.0):
+        inp = build_inp()
+        possessor = inp.state.our_possessor()
+        assert possessor is not None
+        inp.state = replace(
+            inp.state,
+            us=tuple(
+                replace(player, x=55.0, y=20.0)
+                if player.id == possessor.id
+                else player
+                for player in inp.state.us
+            ),
+            them=tuple(
+                replace(player, x=58.0, y=goalkeeper_y)
+                if player.role == "goalkeeper"
+                else player
+                for player in inp.state.them
+            ),
+            ball=replace(
+                inp.state.ball,
+                x=55.6,
+                y=20.0,
+                possessing_team="us",
+                possessing_player=possessor.id,
+            ),
+        )
+        inp.world = WorldModel.build(inp.state)
+        intent = PlayerIntent(
+            pid=possessor.id,
+            tx=55.0,
+            ty=20.0,
+            speed=0.0,
+            face_x=target[0],
+            face_y=target[1],
+            action_type="shoot",
+            action_target=target,
+            action_power=1.0,
+        )
+        candidate = ActionCandidate(0.0, intent, "outcome_trace_shot")
+        planner = MCTSPlanner(
+            iterations=1,
+            horizon=0.5,
+            max_decision_depth=1,
+            max_advance_steps=4,
+        )
+        planner.search(inp, root_candidates=[candidate])
+        return planner.stats.root_actions[0]
+
+    def test_shot_goal_keeper_catch_and_loose_outcomes_are_distinct(self):
+        goal = self._search_shot_outcome((60.0, 20.0), goalkeeper_y=38.0)
+        saved = self._search_shot_outcome((60.0, 20.0), goalkeeper_y=20.0)
+        missed_or_in_flight = self._search_shot_outcome((60.0, 5.0), goalkeeper_y=20.0)
+
+        self.assertEqual(goal.branch_outcome, "goal")
+        self.assertEqual(goal.score_delta_us, 1)
+        self.assertTrue(goal.goal_scored)
+        self.assertFalse(goal.goal_terminal)
+
+        self.assertEqual(saved.branch_outcome, "goalkeeper_catch_after_shot")
+        self.assertEqual(saved.score_delta_us, 0)
+        self.assertEqual(saved.score_delta_them, 0)
+
+        self.assertEqual(missed_or_in_flight.branch_outcome, "loose_after_shot")
+        self.assertEqual(missed_or_in_flight.score_delta_us, 0)
+        self.assertEqual(missed_or_in_flight.score_delta_them, 0)
+
+    def test_same_scoring_shot_has_identical_outcome_diagnostics(self):
+        first = self._search_shot_outcome((60.0, 20.0), goalkeeper_y=38.0)
+        second = self._search_shot_outcome((60.0, 20.0), goalkeeper_y=38.0)
+
+        self.assertEqual(first, second)
 
     def test_search_has_no_live_policy_state_side_effects(self):
         inp = build_inp()
