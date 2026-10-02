@@ -46,7 +46,15 @@ SLOT_ROLES = {
 }
 
 
-def _policy_input(state, game_id: str, step: int, genome: dict[str, float]) -> PolicyInput:
+def _policy_input(
+    state,
+    game_id: str,
+    step: int,
+    genome: dict[str, float],
+    *,
+    enable_mcts: bool = False,
+    mcts_iterations: int = 8,
+) -> PolicyInput:
     observation = plan_to_obs(state, game_id, step)
     game_state = GameState.from_observation(observation)
     world = WorldModel.build(game_state)
@@ -58,7 +66,11 @@ def _policy_input(state, game_id: str, step: int, genome: dict[str, float]) -> P
     return PolicyInput(
         state=game_state,
         world=world,
-        config=RuntimeConfig(genome=dict(genome)),
+        config=RuntimeConfig(
+            genome=dict(genome),
+            enable_mcts=enable_mcts,
+            mcts_iterations=mcts_iterations,
+        ),
         tactical_state=tactical,
         press_plan=PressPlan(),
         roles=dict(SLOT_ROLES),
@@ -351,12 +363,282 @@ def run_shadow_sample(
     }
 
 
+def _run_active_ab_match(
+    *, seed: int, opponent: str, decisions: int, scenario: str,
+    active_mcts: bool, iterations: int,
+) -> dict:
+    """Run one seeded baseline or active-selector LightEngine scenario."""
+    rng = random.Random(seed)
+    engine = LightEngine(seed=rng.randint(0, 2**31 - 1))
+    state = (
+        SCENARIOS[scenario](rng)
+        if scenario != "match_start"
+        else make_state(
+            list(BASE_LINEUP), mirrored_lineup(), ball=(30.0, 20.0),
+            possess=("us", "st"),
+        )
+    )
+    if scenario == "down_a_goal_late":
+        state.time = 240.0
+    opponent_controller = OPPONENTS[opponent](rng)
+    controller = PolicyController()
+    game_id = f"active-ab-{scenario}-{seed}-{'mcts' if active_mcts else 'baseline'}"
+    controller._current_game_id = game_id
+    controller._team_plan_manager = TeamPlanManager()
+    controller._last_sequence = None
+
+    counts: Counter[str] = Counter()
+    mcts_actions: Counter[str] = Counter()
+    fallback_reasons: Counter[str] = Counter()
+    eligible = disagreements = fallbacks = nodes_total = steps_total = 0
+    candidates_total = depth_total = 0
+    nodes_max = steps_max = candidates_max = depth_max = 0
+    shots = passes = completed_passes = our_possession_ticks = 0
+    shots_conceded = turnovers = 0
+    decision_diagnostics: list[dict] = []
+
+    for step in range(decisions):
+        state.time += DECISION_INTERVAL
+        if state.ball.possessing_team == "us":
+            our_possession_ticks += 1
+        inp = _policy_input(
+            state,
+            game_id,
+            step,
+            default_genome(),
+            enable_mcts=active_mcts,
+            mcts_iterations=iterations,
+        )
+        intents = controller.decide(inp)
+        diagnostic = dict(controller.last_mcts_diagnostics)
+        if active_mcts:
+            decision_diagnostics.append(copy.deepcopy(diagnostic))
+        for intent in intents.values():
+            if state.ball.possessing_team == "us" and intent.pid == state.ball.possessing_player:
+                counts[intent.action_type] += 1
+                shots += intent.action_type == "shoot"
+                passes += intent.action_type == "pass"
+
+        if diagnostic.get("mcts_ran"):
+            eligible += 1
+            disagreements += diagnostic.get("agreement") is False
+            action_type = diagnostic.get("mcts_action_type")
+            if action_type:
+                mcts_actions[str(action_type)] += 1
+            nodes_value = diagnostic.get("nodes_created", 0)
+            steps_value = diagnostic.get("simulated_steps", 0)
+            candidates_value = diagnostic.get("candidate_count", 0)
+            depth_value = diagnostic.get("max_depth_reached", 0)
+            nodes = nodes_value if isinstance(nodes_value, int) else 0
+            simulated = steps_value if isinstance(steps_value, int) else 0
+            candidate_count = candidates_value if isinstance(candidates_value, int) else 0
+            depth = depth_value if isinstance(depth_value, int) else 0
+            nodes_total += nodes
+            steps_total += simulated
+            candidates_total += candidate_count
+            depth_total += depth
+            nodes_max = max(nodes_max, nodes)
+            steps_max = max(steps_max, simulated)
+            candidates_max = max(candidates_max, candidate_count)
+            depth_max = max(depth_max, depth)
+            fallback = diagnostic.get("fallback_reason")
+            if fallback:
+                fallbacks += 1
+                fallback_reasons[str(fallback)] += 1
+
+        merged = _to_light_intents(intents)
+        opponent_intents = opponent_controller.decide(state, "them")
+        if (
+            state.ball.possessing_team == "them"
+            and any(intent.act == "shoot" for intent in opponent_intents.values())
+        ):
+            shots_conceded += 1
+        merged.update(opponent_intents)
+        previous_possession = state.ball.possessing_team
+        state = engine.step(state, merged)
+        if previous_possession is None and state.ball.possessing_team == "us":
+            completed_passes += 1
+        if previous_possession == "us" and state.ball.possessing_team == "them":
+            turnovers += 1
+
+    score_us, score_them = state.score_us, state.score_them
+    return {
+        "score_us": score_us,
+        "score_them": score_them,
+        "goal_diff": score_us - score_them,
+        "result": "win" if score_us > score_them else "loss" if score_us < score_them else "draw",
+        "shots": shots,
+        "shots_conceded": shots_conceded,
+        "passes": passes,
+        "completed_passes": completed_passes,
+        "turnovers": turnovers,
+        "possession%": round(100.0 * our_possession_ticks / max(1, decisions), 1),
+        "possessor_action_counts": dict(sorted(counts.items())),
+        "mcts": {
+            "eligible_decisions": eligible,
+            "disagreements": disagreements,
+            "average_candidate_count": round(candidates_total / max(1, eligible), 3),
+            "max_candidate_count": candidates_max,
+            "action_type_counts": dict(sorted(mcts_actions.items())),
+            "fallback_count": fallbacks,
+            "fallback_reasons": dict(sorted(fallback_reasons.items())),
+            "average_nodes": round(nodes_total / max(1, eligible), 3),
+            "max_nodes": nodes_max,
+            "average_simulated_steps": round(steps_total / max(1, eligible), 3),
+            "max_simulated_steps": steps_max,
+            "average_depth": round(depth_total / max(1, eligible), 3),
+            "max_depth": depth_max,
+            "decision_diagnostics": decision_diagnostics,
+        },
+    }
+
+
+def run_active_ab_sample(
+    *,
+    seed: int = 7,
+    opponent: str = "possession",
+    decisions: int = 40,
+    iterations: int = 8,
+    scenarios: tuple[str, ...] = ("match_start", "final_third", "one_v_one_gk"),
+) -> dict:
+    """Compare paired ordinary and active-MCTS LightEngine runs."""
+    if not 1 <= decisions <= 5000 or decisions * len(scenarios) > 5000:
+        raise ValueError("active A/B decisions are capped at 5000 total")
+    if not 1 <= iterations <= 64:
+        raise ValueError("active MCTS iterations must be between 1 and 64")
+    if opponent not in OPPONENTS:
+        raise ValueError(f"unknown simulator opponent: {opponent}")
+    if not scenarios or any(
+        scenario != "match_start" and scenario not in SCENARIOS
+        for scenario in scenarios
+    ):
+        raise ValueError("scenarios must be match_start or a registered practice scenario")
+
+    paired = []
+    for scenario_index, scenario in enumerate(scenarios):
+        match_seed = seed + scenario_index
+        baseline = _run_active_ab_match(
+            seed=match_seed, opponent=opponent, decisions=decisions,
+            scenario=scenario, active_mcts=False, iterations=iterations,
+        )
+        active = _run_active_ab_match(
+            seed=match_seed, opponent=opponent, decisions=decisions,
+            scenario=scenario, active_mcts=True, iterations=iterations,
+        )
+        paired.append(
+            {
+                "seed": match_seed,
+                "scenario": scenario,
+                "baseline": baseline,
+                "active_mcts": active,
+                "goal_diff_delta": active["goal_diff"] - baseline["goal_diff"],
+            }
+        )
+
+    def aggregate(mode: str) -> dict:
+        rows = [pair[mode] for pair in paired]
+        mcts_rows = [row["mcts"] for row in rows]
+        eligible_count = sum(int(row["eligible_decisions"]) for row in mcts_rows)
+        return {
+            "matches": len(rows),
+            "runs": len(rows),
+            "wins": sum(row["result"] == "win" for row in rows),
+            "draws": sum(row["result"] == "draw" for row in rows),
+            "losses": sum(row["result"] == "loss" for row in rows),
+            "goals_for": sum(row["score_us"] for row in rows),
+            "goals_against": sum(row["score_them"] for row in rows),
+            "shots": sum(row["shots"] for row in rows),
+            "shots_conceded": sum(row["shots_conceded"] for row in rows),
+            "passes": sum(row["passes"] for row in rows),
+            "completed_passes": sum(row["completed_passes"] for row in rows),
+            "turnovers": sum(row["turnovers"] for row in rows),
+            "average_possession_percent": round(
+                statistics.mean(row["possession%"] for row in rows), 3
+            ),
+            "mcts_decisions": {
+                "eligible": eligible_count,
+                "disagreements": sum(row["disagreements"] for row in mcts_rows),
+                "average_candidate_count": round(
+                    sum(
+                        float(row["average_candidate_count"]) * int(row["eligible_decisions"])
+                        for row in mcts_rows
+                    )
+                    / max(1, eligible_count),
+                    3,
+                ),
+                "max_candidate_count": max(
+                    (row["max_candidate_count"] for row in mcts_rows), default=0
+                ),
+                "action_type_counts": dict(
+                    sorted(sum_counters(row["action_type_counts"] for row in mcts_rows).items())
+                ),
+                "fallback_count": sum(row["fallback_count"] for row in mcts_rows),
+                "fallback_reasons": dict(
+                    sorted(
+                        sum_counters(row["fallback_reasons"] for row in mcts_rows).items()
+                    )
+                ),
+                "average_nodes": round(
+                    sum(
+                        float(row["average_nodes"]) * int(row["eligible_decisions"])
+                        for row in mcts_rows
+                    )
+                    / max(1, eligible_count),
+                    3,
+                ),
+                "max_nodes": max((row["max_nodes"] for row in mcts_rows), default=0),
+                "average_simulated_steps": round(
+                    sum(
+                        float(row["average_simulated_steps"]) * int(row["eligible_decisions"])
+                        for row in mcts_rows
+                    )
+                    / max(1, eligible_count),
+                    3,
+                ),
+                "max_simulated_steps": max(
+                    (row["max_simulated_steps"] for row in mcts_rows), default=0
+                ),
+                "average_depth": round(
+                    sum(
+                        float(row["average_depth"]) * int(row["eligible_decisions"])
+                        for row in mcts_rows
+                    )
+                    / max(1, eligible_count),
+                    3,
+                ),
+                "max_depth": max((row["max_depth"] for row in mcts_rows), default=0),
+            },
+        }
+
+    return {
+        "kind": "mcts_active_ab",
+        "seed": seed,
+        "seeds": [pair["seed"] for pair in paired],
+        "opponent": opponent,
+        "scenarios": list(scenarios),
+        "decisions_per_match": decisions,
+        "mcts_iterations": iterations,
+        "baseline": aggregate("baseline"),
+        "active_mcts": aggregate("active_mcts"),
+        "paired_runs": paired,
+    }
+
+
+def sum_counters(rows) -> Counter[str]:
+    total: Counter[str] = Counter()
+    for row in rows:
+        total.update(row)
+    return total
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("shadow", "active-ab"), default="shadow")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--opponent", choices=sorted(OPPONENTS), default="possession")
     parser.add_argument("--decisions", type=int, default=120)
     parser.add_argument("--budgets", type=int, nargs="+", default=list(DEFAULT_BUDGETS))
+    parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument(
         "--scenario",
         choices=("match_start", *sorted(SCENARIOS)),
@@ -366,25 +648,46 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ARTIFACT_DIR / "mcts_shadow.ndjson",
+        default=None,
         help="append one aggregate/replay NDJSON record (use '-' for stdout only)",
     )
     args = parser.parse_args()
-    report = run_shadow_sample(
-        seed=args.seed,
-        opponent=args.opponent,
-        decisions=args.decisions,
-        budgets=tuple(args.budgets),
-        scenarios=tuple(args.scenario) if args.scenario else None,
-    )
-    if str(args.output) == "-":
+    if args.mode == "active-ab":
+        report = run_active_ab_sample(
+            seed=args.seed,
+            opponent=args.opponent,
+            decisions=args.decisions,
+            iterations=args.iterations,
+            scenarios=(
+                tuple(args.scenario)
+                if args.scenario
+                else ("match_start", "final_third", "one_v_one_gk")
+            ),
+        )
+        report_summary = {
+            "baseline": report["baseline"],
+            "active_mcts": report["active_mcts"],
+        }
+        default_output = ARTIFACT_DIR / "mcts_active_ab.ndjson"
+    else:
+        report = run_shadow_sample(
+            seed=args.seed,
+            opponent=args.opponent,
+            decisions=args.decisions,
+            budgets=tuple(args.budgets),
+            scenarios=tuple(args.scenario) if args.scenario else None,
+        )
+        report_summary = report["summary"]
+        default_output = ARTIFACT_DIR / "mcts_shadow.ndjson"
+    output = args.output or default_output
+    if str(output) == "-":
         print(json.dumps(report, sort_keys=True, indent=2))
     else:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("a", encoding="utf-8") as handle:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
-        print(json.dumps(report["summary"], sort_keys=True, indent=2))
-        print(f"Report appended to {args.output}")
+        print(json.dumps(report_summary, sort_keys=True, indent=2))
+        print(f"Report appended to {output}")
 
 
 if __name__ == "__main__":

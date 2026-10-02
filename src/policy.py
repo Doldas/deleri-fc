@@ -24,6 +24,7 @@ from .config import (
     KICK_MAX_SPEED,
     KICK_MIN_SPEED,
     MAX_RUN_SPEED,
+    MAX_RUNTIME_MCTS_ITERATIONS,
     SLAP_CLEAN,
     SLAP_FACING_DEG,
     TACKLE_CLOSE,
@@ -1486,6 +1487,7 @@ class PolicyController:
     _team_plan_manager: TeamPlanManager | None = None
     _current_game_id: str | None = None
     _last_sequence: int | None = None
+    last_mcts_diagnostics: dict[str, object]
 
     def __init__(self) -> None:
         self.log = PolicyLog()
@@ -1494,6 +1496,7 @@ class PolicyController:
         self._team_plan_manager = None
         self._current_game_id = None
         self._last_sequence = None
+        self.last_mcts_diagnostics = {}
 
     def _ctx_mods(self, inp: PolicyInput) -> dict[str, float]:
         return _CONTEXT_MODS.get(inp.context(), {})
@@ -1511,6 +1514,31 @@ class PolicyController:
         state: GameState = inp.state
         intents: dict[str, PlayerIntent] = {}
         ours = state.outfield_us()
+        self.last_mcts_diagnostics = {
+            "enabled": inp.config.enable_mcts,
+            "eligible": False,
+            "mcts_ran": False,
+            "skip_reason": "no_attacking_decision",
+            "iteration_budget": inp.config.mcts_iterations,
+            "candidate_count": 0,
+            "production_candidate_index": None,
+            "production_action_type": None,
+            "production_value": None,
+            "mcts_candidate_index": None,
+            "mcts_action_type": None,
+            "mcts_value": None,
+            "selected_candidate_index": None,
+            "selected_action_type": None,
+            "selected_value": None,
+            "agreement": None,
+            "root_visits": [],
+            "root_mean_values": [],
+            "nodes_created": 0,
+            "simulated_steps": 0,
+            "max_depth": 0,
+            "max_depth_reached": 0,
+            "fallback_reason": None,
+        }
 
         if not ours:
             return intents
@@ -2368,6 +2396,112 @@ class PolicyController:
 
         return intent
 
+    def _select_attack_candidate(
+        self,
+        inp: PolicyInput,
+        p: Player,
+        candidates: list[ActionCandidate],
+        team_plan=None,
+    ) -> ActionCandidate:
+        """Select from the ranked production board; never constructs actions."""
+        production = candidates[0]
+        diagnostics = self.last_mcts_diagnostics
+        diagnostics.update(
+            {
+                "candidate_count": len(candidates),
+                "production_candidate_index": 0,
+                "production_action_type": production.intent.action_type,
+                "production_value": production.value,
+                "selected_candidate_index": 0,
+                "selected_action_type": production.intent.action_type,
+                "selected_value": production.value,
+            }
+        )
+
+        if not inp.config.enable_mcts:
+            diagnostics["skip_reason"] = "mcts_disabled"
+            return production
+
+        possessor = inp.state.our_possessor()
+        if inp.state.phase != "openPlay":
+            skip_reason = "not_open_play"
+        elif possessor is None or possessor.id != p.id:
+            skip_reason = "not_our_possession"
+        elif possessor.role == "goalkeeper" or not possessor.can_act:
+            skip_reason = "no_valid_outfield_possessor"
+        elif inp.tr <= 0.0:
+            skip_reason = "match_time_expired"
+        elif len(candidates) < 2 or not any(
+            candidate.intent != production.intent for candidate in candidates[1:]
+        ):
+            skip_reason = "no_meaningful_choice"
+        else:
+            skip_reason = ""
+
+        budget = min(
+            MAX_RUNTIME_MCTS_ITERATIONS,
+            max(0, int(inp.config.mcts_iterations)),
+        )
+        diagnostics["iteration_budget"] = budget
+        if skip_reason:
+            diagnostics["skip_reason"] = skip_reason
+            return production
+        if budget <= 0:
+            diagnostics["skip_reason"] = "non_positive_budget"
+            return production
+
+        diagnostics["eligible"] = True
+        diagnostics["skip_reason"] = None
+        # Local import keeps the production-policy -> selector dependency
+        # one-way; MCTS itself still uses ActionCandidate and policy helpers.
+        from .mcts import MCTSPlanner
+
+        planner = MCTSPlanner(iterations=budget)
+        selected = planner.search(
+            inp,
+            controller=self,
+            team_plan=team_plan,
+            root_candidates=candidates,
+        )
+        stats = planner.stats
+        diagnostics.update(
+            {
+                "mcts_ran": True,
+                "root_visits": [row.visits for row in stats.root_actions],
+                "root_mean_values": [row.mean_value for row in stats.root_actions],
+                "nodes_created": stats.nodes_created,
+                "simulated_steps": stats.simulated_steps,
+                "max_depth": stats.max_depth,
+                "max_depth_reached": stats.max_depth,
+            }
+        )
+
+        selected_index = next(
+            (index for index, candidate in enumerate(candidates) if candidate is selected),
+            None,
+        )
+        if selected is None or selected_index is None:
+            diagnostics["fallback_reason"] = (
+                "search_returned_no_candidate"
+                if selected is None
+                else "candidate_not_in_root_board"
+            )
+            diagnostics["skip_reason"] = "search_unavailable"
+            return production
+
+        diagnostics.update(
+            {
+                "mcts_candidate_index": selected_index,
+                "mcts_action_type": selected.intent.action_type,
+                "mcts_value": selected.value,
+                "selected_candidate_index": selected_index,
+                "selected_action_type": selected.intent.action_type,
+                "selected_value": selected.value,
+                "agreement": selected_index == 0,
+            }
+        )
+        return selected
+
     def _evaluate_attack_actions(
             self,
             inp: PolicyInput,
@@ -2380,7 +2514,7 @@ class PolicyController:
         candidates = self._rank_attack_candidates(candidates)
 
         if candidates:
-            best = candidates[0]
+            best = self._select_attack_candidate(inp, p, candidates, team_plan)
             best_value = best.value
             best_intent = best.intent
             reason = best.reason
@@ -2390,6 +2524,13 @@ class PolicyController:
             return self._commit_attack_candidate(inp, p, best, team_plan)
 
         # Fallback
+        self.last_mcts_diagnostics.update(
+            {
+                "candidate_count": 0,
+                "skip_reason": "empty_candidate_board",
+                "fallback_reason": "empty_candidate_board",
+            }
+        )
         tx, ty, speed = self._dribble_target(inp, p)
         log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": "dribble", "reason": "fallback_carry"}
         self.log.record(log_entry)

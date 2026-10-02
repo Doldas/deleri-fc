@@ -425,6 +425,92 @@ class MCTSCoreTests(unittest.TestCase):
             MCTSPlanner._evaluate(after_restart, root),
         )
 
+    def test_control_and_unresolved_ball_evaluation_ordering(self):
+        root = SearchState.from_policy_input(build_inp())
+        us_control = root.clone()
+        loose = root.clone()
+        opponent_control = root.clone()
+        goalkeeper_catch = root.clone()
+        for branch in (us_control, loose, opponent_control, goalkeeper_catch):
+            branch.plan.ball.x = 45.0
+            branch.plan.ball.y = 20.0
+
+        us_control.plan.ball.possessing_team = "us"
+        us_control.plan.ball.possessing_player = "am"
+        loose.plan.ball.possessing_team = None
+        loose.plan.ball.possessing_player = None
+        opponent_control.plan.ball.possessing_team = "them"
+        opponent_control.plan.ball.possessing_player = "st"
+        goalkeeper_catch.plan.ball.possessing_team = "them"
+        goalkeeper_catch.plan.ball.possessing_player = "tgk"
+
+        controlled_value = MCTSPlanner._evaluate(us_control, root)
+        loose_value = MCTSPlanner._evaluate(loose, root)
+        opponent_value = MCTSPlanner._evaluate(opponent_control, root)
+        keeper_value = MCTSPlanner._evaluate(goalkeeper_catch, root)
+
+        self.assertGreater(
+            controlled_value,
+            loose_value,
+            "forward ball movement is not credited as completed progression before recovery",
+        )
+        self.assertGreater(
+            loose_value,
+            opponent_value,
+            "unresolved possession remains neutral rather than being treated as opponent control",
+        )
+        self.assertEqual(
+            keeper_value,
+            opponent_value,
+            "a goalkeeper catch is controlled possession for the opposing team",
+        )
+
+    def test_unresolved_lightengine_pass_is_not_credited_as_our_progress(self):
+        inp = build_inp()
+        root = SearchState.from_policy_input(inp)
+        possessor = inp.state.our_possessor()
+        assert possessor is not None
+        intent = PlayerIntent(
+            pid=possessor.id,
+            tx=possessor.x,
+            ty=possessor.y,
+            speed=0.0,
+            face_x=55.0,
+            face_y=20.0,
+            action_type="pass",
+            action_target=(55.0, 20.0),
+            action_power=0.0,
+        )
+        candidate = ActionCandidate(0.0, intent, "opaque_pass_reason")
+
+        loose = transition_candidate(root, candidate)
+        self.assertIn("kick:pass", loose.plan.events)
+        self.assertIsNone(loose.plan.ball.possessing_team)
+        self.assertEqual(
+            MCTSPlanner._root_branch_outcome(candidate, loose, root)[-1],
+            "loose_after_pass",
+        )
+        recovered = loose.clone()
+        recovered.plan.ball.possessing_team = "us"
+        recovered.plan.ball.possessing_player = possessor.id
+
+        self.assertGreater(
+            MCTSPlanner._evaluate(recovered, root),
+            MCTSPlanner._evaluate(loose, root),
+        )
+
+    def test_leaf_evaluation_is_deterministic_for_identical_states(self):
+        root = SearchState.from_policy_input(build_inp())
+        state = root.clone()
+        state.plan.ball.x += 7.0
+        state.plan.ball.possessing_team = None
+        state.plan.ball.possessing_player = None
+
+        self.assertEqual(
+            MCTSPlanner._evaluate(state, root),
+            MCTSPlanner._evaluate(state.clone(), root.clone()),
+        )
+
     def _search_shot_outcome(self, target, *, goalkeeper_y=20.0):
         inp = build_inp()
         possessor = inp.state.our_possessor()

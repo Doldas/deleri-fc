@@ -7,6 +7,7 @@ the runtime policy share the same schema.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from .geom import clamp
@@ -49,6 +50,7 @@ KICK_MAX_SPEED = 26.0
 DECISION_INTERVAL = 0.1
 ENGINE_TICKS_PER_SECOND = 60
 DECISION_HARD_MS = 100
+MAX_RUNTIME_MCTS_ITERATIONS = 64
 
 
 def kick_speed(power: float) -> float:
@@ -201,12 +203,31 @@ class RuntimeConfig:
     reward_weights: dict[str, float] = field(
         default_factory=lambda: dict(REWARD_DEFAULTS)
     )
-    enable_mcts: bool = False  # runtime-limited MCTS override (off by default)
-    mcts_iterations: int = 30
+    enable_mcts: bool = False  # optional active selector (off by default)
+    mcts_iterations: int = 8
     mcts_horizon: float = 2.0
     log_explanations: bool = False
     force_seed: int | None = None  # set for reproducible tournament decisions
     recycle_count: int = 0  # consecutive backward passes to force forward play
+
+    def __post_init__(self) -> None:
+        self.mcts_iterations = max(
+            0, min(MAX_RUNTIME_MCTS_ITERATIONS, int(self.mcts_iterations))
+        )
+
+    @classmethod
+    def from_environment(cls) -> RuntimeConfig:
+        """Load the opt-in practice switch without affecting normal defaults."""
+        enabled_raw = os.environ.get("DELERI_MCTS_ENABLED", "0").strip().lower()
+        if enabled_raw not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError("DELERI_MCTS_ENABLED must be a boolean value")
+        enabled = enabled_raw in {"1", "true", "yes", "on"}
+        iterations_raw = os.environ.get("DELERI_MCTS_ITERATIONS", "8")
+        try:
+            iterations = int(iterations_raw)
+        except ValueError as error:
+            raise ValueError("DELERI_MCTS_ITERATIONS must be an integer") from error
+        return cls(enable_mcts=enabled, mcts_iterations=iterations)
 
     def style_key(self) -> str:
         return genome_hash(self.genome)

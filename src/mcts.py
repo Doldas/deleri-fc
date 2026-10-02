@@ -168,7 +168,14 @@ class MCTSPlanner:
 
         candidates = tuple(candidates)
         self._reset_search(candidates)
-        root_state = SearchState.from_policy_input(inp)
+        try:
+            root_state = SearchState.from_policy_input(inp)
+        except (TypeError, ValueError, OverflowError):
+            self._reset_search(())
+            return None
+        if not is_within_pitch(root_state):
+            self._reset_search(())
+            return None
         root = _Node(
             state=root_state,
             parent=None,
@@ -646,9 +653,11 @@ class MCTSPlanner:
         )
         value = 2.0 * goal_difference
 
-        progress = (plan.ball.x - root_plan.ball.x) / 60.0
-        value += 0.12 * progress
         if plan.ball.possessing_team == "us":
+            # Territorial progress is credited only after our team controls the
+            # ball. A loose forward pass is unresolved, not completed progress.
+            progress = (plan.ball.x - root_plan.ball.x) / 60.0
+            value += 0.12 * progress
             value += 0.08 + 0.06 * (plan.ball.x / 60.0)
         elif plan.ball.possessing_team == "them":
             value -= 0.08 + 0.06 * (1.0 - plan.ball.x / 60.0)

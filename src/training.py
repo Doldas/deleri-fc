@@ -376,7 +376,7 @@ def collect_mcts_demos(
         ball=(30.0, 20.0),
         possess=("us", "am"),
     )
-    base_mgr = RuntimeManager()
+    base_mgr = RuntimeManager(runtime_config=RuntimeConfig(enable_mcts=False))
     base_mgr.genome_base = dict(base_mgr.genome_base)
     mcts_mgr = RuntimeManager(runtime_config=RuntimeConfig(enable_mcts=True, mcts_iterations=max_iterations))
     opponent_ctrl = OPPONENTS[opponent](rng)

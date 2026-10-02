@@ -17,6 +17,7 @@ from src.search_opponent import OPPONENT_RESPONSE_MODEL
 from src.state import GameState, WorldModel
 from src.tactics import PressPlan, TacticalState, assign_roles
 from src.teamplan import TeamPlan, TeamPlanManager
+from scripts.mcts_shadow import run_active_ab_sample
 
 SLOTS = [
     {"id": "defender", "role": "defender", "position": {"x": 14, "y": 20}},
@@ -321,6 +322,23 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertEqual(candidate_action_type(stationary, inp), "none")
         with self.assertRaises(ValueError):
             evaluate_shadow(inp, budgets=(257,))
+
+    def test_active_ab_harness_is_paired_and_reproducible(self):
+        kwargs = {
+            "seed": 5,
+            "opponent": "possession",
+            "decisions": 2,
+            "iterations": 1,
+            "scenarios": ("final_third",),
+        }
+        first = run_active_ab_sample(**kwargs)
+        second = run_active_ab_sample(**kwargs)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["seeds"], [5])
+        self.assertEqual(first["paired_runs"][0]["scenario"], "final_third")
+        self.assertEqual(first["baseline"]["mcts_decisions"]["eligible"], 0)
+        self.assertGreater(first["active_mcts"]["mcts_decisions"]["eligible"], 0)
 
 
 if __name__ == "__main__":

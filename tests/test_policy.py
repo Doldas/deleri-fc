@@ -2,7 +2,9 @@ import copy
 import math
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
@@ -791,6 +793,398 @@ class AttackCandidatePipelineTests(unittest.TestCase):
         self.assertIsNone(controller._pending_pass_receiver)
         self.assertIsNone(controller._pending_pass_collection)
         self.assertFalse(plan.shot_committed)
+
+
+class ActiveMCTSIntegrationTests(unittest.TestCase):
+    class FixedBoardController(PolicyController):
+        def __init__(self, board):
+            super().__init__()
+            self.board = board
+            self.commits = 0
+
+        def _build_attack_candidates(self, inp, p, team_plan=None):
+            return self.board
+
+        def _commit_attack_candidate(self, inp, p, candidate, team_plan=None):
+            self.commits += 1
+            return super()._commit_attack_candidate(inp, p, candidate, team_plan)
+
+    def _input_and_board(self, descriptions):
+        inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        inp.config.enable_mcts = True
+        inp.config.mcts_iterations = 4
+        possessor = inp.state.our_possessor()
+        assert possessor is not None
+        board = []
+        for action_type, value in descriptions:
+            if action_type == "pass":
+                intent = PlayerIntent(
+                    pid=possessor.id,
+                    tx=possessor.x,
+                    ty=possessor.y,
+                    speed=0.4,
+                    face_x=possessor.x + 20.0,
+                    face_y=possessor.y,
+                    action_type="pass",
+                    action_target=(possessor.x + 20.0, possessor.y),
+                    action_power=0.2,
+                    receiver_id="am",
+                    collection_point=(possessor.x + 18.0, possessor.y),
+                )
+            elif action_type == "shoot":
+                intent = PlayerIntent(
+                    pid=possessor.id,
+                    tx=possessor.x,
+                    ty=possessor.y,
+                    speed=0.4,
+                    face_x=60.0,
+                    face_y=17.0,
+                    action_type="shoot",
+                    action_target=(60.0, 17.0),
+                    action_power=0.8,
+                )
+            else:
+                intent = PlayerIntent(
+                    pid=possessor.id,
+                    tx=possessor.x + 5.0,
+                    ty=possessor.y + 1.0,
+                    speed=0.7,
+                    face_x=possessor.x + 5.0,
+                    face_y=possessor.y + 1.0,
+                )
+            board.append(ActionCandidate(value, intent, f"opaque_{action_type}_reason"))
+        return inp, board
+
+    def _decide_with_choice(self, descriptions, selected_index):
+        inp, board = self._input_and_board(descriptions)
+        controller = self.FixedBoardController(board)
+
+        def select_from_exact_board(
+            planner, search_inp, *, controller, team_plan, root_candidates
+        ):
+            self.assertIs(search_inp, inp)
+            self.assertIs(controller, controller_arg)
+            self.assertEqual(len(root_candidates), len(board))
+            self.assertTrue(all(actual is expected for actual, expected in zip(root_candidates, board)))
+            return root_candidates[selected_index]
+
+        controller_arg = controller
+        with patch(
+            "src.mcts.MCTSPlanner.search",
+            autospec=True,
+            side_effect=select_from_exact_board,
+        ) as search:
+            intents = controller.decide(inp)
+        return inp, board, controller, intents, search
+
+    def test_default_off_uses_top_ranked_candidate_without_search(self):
+        inp, board = self._input_and_board((("pass", 20.0), ("carry", 10.0)))
+        inp.config.enable_mcts = False
+        controller = self.FixedBoardController(board)
+
+        with patch("src.mcts.MCTSPlanner.search", autospec=True) as search:
+            intents = controller.decide(inp)
+
+        self.assertEqual(intents["st"], board[0].intent)
+        self.assertEqual(controller.commits, 1)
+        search.assert_not_called()
+        self.assertEqual(controller.last_mcts_diagnostics["skip_reason"], "mcts_disabled")
+
+    def test_active_selector_uses_exact_root_objects_and_can_choose_nonfirst(self):
+        inp, board, controller, intents, search = self._decide_with_choice(
+            (("pass", 20.0), ("carry", 10.0)), 1
+        )
+
+        self.assertIs(intents["st"], board[1].intent)
+        self.assertEqual(controller.commits, 1)
+        search.assert_called_once()
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertTrue(diagnostics["mcts_ran"])
+        self.assertEqual(diagnostics["production_candidate_index"], 0)
+        self.assertEqual(diagnostics["mcts_candidate_index"], 1)
+        self.assertFalse(diagnostics["agreement"])
+        possessor = inp.state.our_possessor()
+        assert possessor is not None
+        self.assertEqual(possessor.id, intents["st"].pid)
+
+    def test_active_pass_commits_receiver_metadata_once(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("carry", 20.0), ("pass", 10.0)), 1
+        )
+
+        self.assertEqual(intents["st"], board[1].intent)
+        self.assertEqual((intents["am"].tx, intents["am"].ty), (48.0, 20.0))
+        self.assertIsNone(controller._pending_pass_receiver)
+        self.assertIsNone(controller._pending_pass_collection)
+        self.assertEqual(controller.commits, 1)
+
+    def test_active_shot_commits_team_plan_once(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("carry", 20.0), ("shoot", 10.0)), 1
+        )
+
+        manager = controller._team_plan_manager
+        assert manager is not None
+        plan = manager.current_plan
+        assert plan is not None
+        self.assertEqual(intents["st"], board[1].intent)
+        self.assertTrue(plan.shot_committed)
+        self.assertEqual((plan.rebound_zone_x, plan.rebound_zone_y), (60.0, 17.0))
+        self.assertEqual(controller.commits, 1)
+
+    def test_active_carry_preserves_production_intent_semantics(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("pass", 20.0), ("carry", 10.0)), 1
+        )
+
+        actual = intents["st"]
+        expected = board[1].intent
+        self.assertEqual(
+            (actual.pid, actual.tx, actual.ty, actual.speed, actual.face_x, actual.face_y,
+             actual.action_type, actual.action_target, actual.action_power),
+            (expected.pid, expected.tx, expected.ty, expected.speed, expected.face_x,
+             expected.face_y, expected.action_type, expected.action_target, expected.action_power),
+        )
+        self.assertEqual(controller.commits, 1)
+
+    def test_invalid_or_missing_search_result_falls_back_to_ranked_first(self):
+        for unavailable in (True, False):
+            with self.subTest(unavailable=unavailable):
+                inp, board = self._input_and_board((("pass", 20.0), ("carry", 10.0)))
+                controller = self.FixedBoardController(board)
+                invalid = None if unavailable else ActionCandidate(
+                    board[1].value, board[1].intent, board[1].reason
+                )
+                with patch(
+                    "src.mcts.MCTSPlanner.search",
+                    autospec=True,
+                    return_value=invalid,
+                ):
+                    intents = controller.decide(inp)
+
+                self.assertIs(intents["st"], board[0].intent)
+                self.assertEqual(controller.commits, 1)
+                self.assertEqual(
+                    controller.last_mcts_diagnostics["fallback_reason"],
+                    "search_returned_no_candidate" if unavailable else "candidate_not_in_root_board",
+                )
+
+    def test_unsupported_search_state_falls_back_to_ranked_first(self):
+        inp, board = self._input_and_board((("pass", 20.0), ("carry", 10.0)))
+        inp.state = replace(
+            inp.state,
+            ball=replace(inp.state.ball, x=-1.0),
+        )
+        inp.world = WorldModel.build(inp.state)
+        controller = self.FixedBoardController(board)
+
+        intents = controller.decide(inp)
+
+        self.assertIs(intents["st"], board[0].intent)
+        self.assertEqual(controller.commits, 1)
+        self.assertEqual(
+            controller.last_mcts_diagnostics["fallback_reason"],
+            "search_returned_no_candidate",
+        )
+
+    def test_single_candidate_skips_search(self):
+        inp, board = self._input_and_board((("carry", 10.0),))
+        controller = self.FixedBoardController(board)
+        with patch("src.mcts.MCTSPlanner.search", autospec=True) as search:
+            intents = controller.decide(inp)
+
+        self.assertIs(intents["st"], board[0].intent)
+        search.assert_not_called()
+        self.assertEqual(controller.last_mcts_diagnostics["skip_reason"], "no_meaningful_choice")
+
+    def test_goalkeeper_possession_and_zero_budget_skip_search(self):
+        inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        inp.config.enable_mcts = True
+        inp.config.mcts_iterations = 4
+        inp.state = replace(
+            inp.state,
+            ball=replace(inp.state.ball, possessing_player="gk"),
+        )
+        inp.world = WorldModel.build(inp.state)
+        goalkeeper = inp.state.our_possessor()
+        assert goalkeeper is not None
+        board = [
+            ActionCandidate(
+                2.0,
+                PlayerIntent(goalkeeper.id, goalkeeper.x, goalkeeper.y, 0.0,
+                             30.0, 20.0, "none"),
+                "opaque_a",
+            ),
+            ActionCandidate(
+                1.0,
+                PlayerIntent(goalkeeper.id, goalkeeper.x, goalkeeper.y, 0.0,
+                             31.0, 20.0, "none"),
+                "opaque_b",
+            ),
+        ]
+        controller = self.FixedBoardController(board)
+        with patch("src.mcts.MCTSPlanner.search", autospec=True) as search:
+            controller.decide(inp)
+
+        search.assert_not_called()
+        self.assertEqual(
+            controller.last_mcts_diagnostics["skip_reason"],
+            "no_valid_outfield_possessor",
+        )
+
+        budget_input, budget_board = self._input_and_board((("pass", 20.0), ("carry", 10.0)))
+        budget_input.config.mcts_iterations = 0
+        budget_controller = self.FixedBoardController(budget_board)
+        with patch("src.mcts.MCTSPlanner.search", autospec=True) as search:
+            budget_controller.decide(budget_input)
+        search.assert_not_called()
+        self.assertEqual(
+            budget_controller.last_mcts_diagnostics["skip_reason"],
+            "non_positive_budget",
+        )
+
+    def test_real_active_selection_and_diagnostics_are_deterministic(self):
+        decisions = []
+        for _ in range(2):
+            inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+            inp.config.enable_mcts = True
+            inp.config.mcts_iterations = 4
+            controller = PolicyController()
+            decisions.append((controller.decide(inp)["st"], controller.last_mcts_diagnostics))
+
+        self.assertEqual(decisions[0], decisions[1])
+        self.assertTrue(decisions[0][1]["mcts_ran"])
+
+    def test_real_mcts_can_commit_a_nonfirst_candidate_from_its_live_root_board(self):
+        inp = make_inp(obs((58.349748, 1.705684), "us", our_st_x=58, them_x=10))
+        us = {
+            "gk": (2.5, 13.032385, -0.197539),
+            "cd": (24.524329, 9.753869, -0.231505),
+            "w": (18.685203, 9.722849, -0.198954),
+            "am": (13.327374, 15.845790, -0.319273),
+            "st": (58.121901, 2.039270, -0.948023),
+        }
+        them = {
+            "tgk": (58.5, 20.0, 0.0),
+            "cd": (45.278273, 14.721727, 0.0),
+            "am": (36.0, 28.0, 0.0),
+            "st": (41.714027, 18.285973, 0.0),
+        }
+        inp.state = replace(
+            inp.state,
+            sequence=30,
+            simulation_tick=30,
+            apply_at_tick=30,
+            time_remaining=293.9,
+            ball=replace(
+                inp.state.ball,
+                x=58.349748,
+                y=1.705684,
+                vx=-2.373563,
+                vy=2.373563,
+                possessing_team="us",
+                possessing_player="st",
+            ),
+            us=tuple(
+                replace(player, x=us[player.id][0], y=us[player.id][1], facing=us[player.id][2])
+                for player in inp.state.us
+            ),
+            them=tuple(
+                replace(player, x=them[player.id][0], y=them[player.id][1], facing=them[player.id][2])
+                for player in inp.state.them
+            ),
+        )
+        inp.world = WorldModel.build(inp.state)
+        inp.time_remaining = 293.9
+        inp.config.enable_mcts = True
+        inp.config.mcts_iterations = 24
+        class CountingController(PolicyController):
+            def __init__(self):
+                super().__init__()
+                self.commit_count = 0
+
+            def _commit_attack_candidate(self, inp, p, candidate, team_plan=None):
+                self.commit_count += 1
+                return super()._commit_attack_candidate(inp, p, candidate, team_plan)
+
+        controller = CountingController()
+        from src.mcts import MCTSPlanner
+
+        original_search = MCTSPlanner.search
+        captured = {}
+
+        def capture_root(planner, search_input, *, controller, team_plan, root_candidates):
+            selected = original_search(
+                planner,
+                search_input,
+                controller=controller,
+                team_plan=team_plan,
+                root_candidates=root_candidates,
+            )
+            captured["board"] = tuple(root_candidates)
+            captured["selected"] = selected
+            return selected
+
+        with patch(
+            "src.mcts.MCTSPlanner.search", autospec=True, side_effect=capture_root
+        ):
+            intents = controller.decide(inp)
+
+        board = captured["board"]
+        selected = captured["selected"]
+        self.assertEqual(controller.last_mcts_diagnostics["production_action_type"], "shoot")
+        self.assertEqual(controller.last_mcts_diagnostics["mcts_candidate_index"], 1)
+        self.assertFalse(controller.last_mcts_diagnostics["agreement"])
+        self.assertIs(selected, board[1])
+        self.assertIs(intents["st"], selected.intent)
+        self.assertEqual(controller.commit_count, 1)
+
+    def test_real_search_has_no_live_side_effects_before_commit(self):
+        inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=10))
+        inp.config.enable_mcts = True
+        inp.config.mcts_iterations = 3
+        controller = PolicyController()
+        controller._pending_pass_receiver = "previous_receiver"
+        controller._pending_pass_collection = (11.0, 12.0)
+        original_search = __import__("src.mcts", fromlist=["MCTSPlanner"]).MCTSPlanner.search
+        observed = []
+
+        def isolated_search(planner, search_inp, *, controller, team_plan, root_candidates):
+            state_before = copy.deepcopy(search_inp.state)
+            world_before = copy.deepcopy(search_inp.world)
+            opp_before = copy.deepcopy(search_inp.opp)
+            log_before = copy.deepcopy(controller.log)
+            plan_before = copy.deepcopy(team_plan)
+            pending_before = (
+                controller._pending_pass_receiver,
+                controller._pending_pass_collection,
+            )
+            candidates_before = copy.deepcopy(root_candidates)
+            selected = original_search(
+                planner,
+                search_inp,
+                controller=controller,
+                team_plan=team_plan,
+                root_candidates=root_candidates,
+            )
+            self.assertEqual(search_inp.state, state_before)
+            self.assertEqual(search_inp.world, world_before)
+            self.assertEqual(search_inp.opp, opp_before)
+            self.assertEqual(controller.log, log_before)
+            self.assertEqual(team_plan, plan_before)
+            self.assertEqual(
+                (controller._pending_pass_receiver, controller._pending_pass_collection),
+                pending_before,
+            )
+            self.assertEqual(root_candidates, candidates_before)
+            observed.append(tuple(root_candidates))
+            return selected
+
+        with patch("src.mcts.MCTSPlanner.search", autospec=True, side_effect=isolated_search):
+            controller.decide(inp)
+
+        self.assertTrue(observed)
+        self.assertTrue(all(len(board) > 1 for board in observed))
 
 if __name__ == "__main__":
     unittest.main()

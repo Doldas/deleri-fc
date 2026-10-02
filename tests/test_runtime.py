@@ -1,9 +1,11 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
+from src.config import RuntimeConfig
 from src.runtime import RuntimeManager, seed_int
 
 
@@ -40,6 +42,36 @@ def observation(game_id):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_active_mcts_configuration_is_opt_in_and_environment_configurable(self):
+        self.assertFalse(RuntimeManager().runtime_config.enable_mcts)
+
+        with patch.dict(
+            "os.environ",
+            {"DELERI_MCTS_ENABLED": "true", "DELERI_MCTS_ITERATIONS": "12"},
+        ):
+            manager = RuntimeManager()
+        self.assertTrue(manager.runtime_config.enable_mcts)
+        self.assertEqual(manager.runtime_config.mcts_iterations, 12)
+
+        with patch.dict(
+            "os.environ",
+            {"DELERI_MCTS_ENABLED": "1", "DELERI_MCTS_ITERATIONS": "999"},
+        ):
+            bounded = RuntimeManager()
+        self.assertEqual(bounded.runtime_config.mcts_iterations, 64)
+
+    def test_runtime_active_mcts_runs_inside_the_policy_decision(self):
+        manager = RuntimeManager(RuntimeConfig(enable_mcts=True, mcts_iterations=2))
+        manager.start_match({"gameId": "active-runtime", "randomSeed": "1"})
+
+        decision = manager.decide(observation("active-runtime"))
+        ctx = manager.get_or_create({"gameId": "active-runtime"})
+
+        self.assertTrue(decision["intents"])
+        self.assertTrue(ctx.policy.last_mcts_diagnostics["enabled"])
+        self.assertTrue(ctx.policy.last_mcts_diagnostics["mcts_ran"])
+        self.assertIsNone(ctx.policy.last_mcts_diagnostics["fallback_reason"])
+
     def test_seed_int_stable(self):
         self.assertEqual(seed_int("abc", "g1"), seed_int("abc", "g1"))
         self.assertNotEqual(seed_int("abc", "g1"), seed_int("abc", "g2"))

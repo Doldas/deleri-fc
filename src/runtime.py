@@ -23,14 +23,12 @@ from pathlib import Path
 
 from .config import RuntimeConfig, default_genome, make_genome
 from .evaluate import Metrics
-from .mcts import MCTSPlanner
 from .opponent import OpponentModel
 from .policy import (
     DEFAULT_MATCH_DURATION,
     PlayerIntent,
     PolicyController,
     PolicyInput,
-    is_late,
     match_context,
 )
 from .state import GameState, WorldModel
@@ -239,7 +237,6 @@ class MatchContext:
     counter_press_active: bool = False  # Counter-press active flag
     rng: random.Random = field(default_factory=lambda: random.Random())
     explanations: list[dict] = field(default_factory=list)
-    mcts_planner: MCTSPlanner | None = None
     match_duration: float = 60.0  # Match duration in seconds (default 60s)
     # True once match_duration came from the match configuration (or the first
     # observation) rather than from the default. Guards the fallback adoption
@@ -276,7 +273,7 @@ class RuntimeManager:
     def __init__(self, runtime_config: RuntimeConfig | None = None):
         self._lock = threading.Lock()
         self._matches: dict[str, MatchContext] = {}
-        self.runtime_config = runtime_config or RuntimeConfig()
+        self.runtime_config = runtime_config or RuntimeConfig.from_environment()
         self.configs = load_tactics()
         self.genome_base = default_genome()
         evolved = load_evolved_genome()
@@ -311,8 +308,6 @@ class RuntimeManager:
                 duration_known=duration_known,
             )
             ctx.rng = random.Random(seed ^ int(body.get("seriesId", "")[:8].encode("utf-8").hex() or "0", 16))
-            if config.enable_mcts:
-                ctx.mcts_planner = MCTSPlanner(config.genome, config.reward_weights, ctx.rng)
             self._matches[game_id] = ctx
 
     def end_match(self, body: dict) -> dict | None:
@@ -334,8 +329,6 @@ class RuntimeManager:
                     config=self.runtime_config,
                 )
                 ctx.rng = random.Random(ctx.seed % (2**31))
-                if self.runtime_config.enable_mcts:
-                    ctx.mcts_planner = MCTSPlanner(ctx.genome, self.runtime_config.reward_weights, ctx.rng)
                 self._matches[game_id] = ctx
             return ctx
 
@@ -395,9 +388,6 @@ class RuntimeManager:
         
         base_hash = _genome_hash(genome)
         adapted_hash = _genome_hash(adapted_genome)
-        # Policy will use adapted_genome; MCTS will be updated below
-        mcts_hash = "none"
-        
         # §32 context-sensitive press planning: chase harder when trailing late,
         # sit calmer when leading late. Duration must be threaded in, otherwise
         # the context falls back to "not late" and the plan is always calm.
@@ -436,7 +426,11 @@ class RuntimeManager:
             state=norm_state,
             world=world,
             # Use adapted genome (with archetype counters + context mods) for full policy
-            config=RuntimeConfig(genome=adapted_genome),
+            config=RuntimeConfig(
+                genome=adapted_genome,
+                enable_mcts=ctx.config.enable_mcts,
+                mcts_iterations=ctx.config.mcts_iterations,
+            ),
             tactical_state=tactical_state,
             press_plan=press_plan,
             roles=ctx.roles,
@@ -458,53 +452,6 @@ class RuntimeManager:
         if ctx.counter_press_active:
             ctx.counter_press_active = False
 
-# Optional limited MCTS override on high-value attacking states only.
-        # Use adapted genome for MCTS too.
-        mcts_note = None
-        if ctx.mcts_planner is not None and norm_state.has_control():
-            # Only trigger MCTS in high-value attacking situations:
-            # - Final third (ball_zone == "final")
-            # - Elite goalkeeper detected
-            # - Low block detected
-            # - Wall attack opportunity
-            # - Late game trailing (desperation)
-            # - Counter-press active
-            ctx.opp.update(norm_state)  # Refresh opponent model
-            # Duration-relative late test, via the single authority in policy.
-            # This used to be an inline `ctx.match_duration * 0.2 >= ...`, a
-            # third copy of the definition that could drift from the others.
-            late_trailing = is_late(
-                inp.tr, ctx.match_duration
-            ) and norm_state.score_us < norm_state.score_them
-            high_value = (
-                world.ball_zone == "final"
-                or ctx.opp.detect_archetype() == "elite_goalkeeper"
-                or ctx.opp.detect_archetype() == "low_block"
-                or world.ball_near_wall
-                or late_trailing
-                or ctx.counter_press_active
-            )
-            if high_value:
-                ctx.mcts_planner.genome = adapted_genome
-                team_plan_manager = ctx.policy._team_plan_manager
-                team_plan = (
-                    team_plan_manager.current_plan
-                    if team_plan_manager is not None
-                    else None
-                )
-                best = ctx.mcts_planner.choose(
-                    inp,
-                    intents,
-                    controller=ctx.policy,
-                    team_plan=team_plan,
-                )
-                if best is not None:
-                    intents = best
-                    # MCTS returns engine-coordinate intents (it operates on normalized state
-                    # but returns decisions for the canonical side). We need to denormalize again.
-                    intents = _denormalize_intents(intents, ctx.attack_sign)
-                    mcts_note = "mcts"
-
         wire = [player_intent.to_wire() for player_intent in intents.values()]
 
         # Deterministic ordering by player id keeps the payload stable.
@@ -524,7 +471,11 @@ class RuntimeManager:
                     "seq": decision["sequence"],
                     "state": str(tactical_state),
                     "decision": ctx.policy.log.possessions_decided[-1],
-                    "mcts": mcts_note,
+                    "mcts": (
+                        dict(ctx.policy.last_mcts_diagnostics)
+                        if ctx.config.enable_mcts
+                        else None
+                    ),
                 }
             )
             if len(ctx.explanations) > 64:
