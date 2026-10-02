@@ -110,6 +110,8 @@ class MCTSPlanner:
         inp: PolicyInput,
         controller: PolicyController | None = None,
         team_plan: TeamPlan | None = None,
+        *,
+        root_candidates: tuple[ActionCandidate, ...] | list[ActionCandidate] | None = None,
     ) -> ActionCandidate | None:
         """Search from ``inp`` and return one of its production root candidates.
 
@@ -130,7 +132,23 @@ class MCTSPlanner:
             return None
 
         manager = self._initial_team_plan_manager(inp, controller, team_plan)
-        candidates = self._production_candidates(inp, controller, manager.current_plan)
+        if root_candidates is None:
+            candidates = self._production_candidates(
+                inp, controller, manager.current_plan
+            )
+        else:
+            # Shadow evaluation can provide the already-ranked production board
+            # so both choices are guaranteed to come from the same candidate
+            # objects. Reject candidates that cannot belong to this root.
+            candidates = list(root_candidates)
+            if any(
+                candidate.intent.pid != possessor.id
+                or candidate.intent.action_type not in {"none", "pass", "shoot"}
+                or not math.isfinite(candidate.value)
+                for candidate in candidates
+            ):
+                self._reset_search(())
+                return None
         if not candidates:
             self._reset_search(())
             return None
