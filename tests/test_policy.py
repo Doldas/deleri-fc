@@ -855,17 +855,32 @@ class ActiveMCTSIntegrationTests(unittest.TestCase):
             board.append(ActionCandidate(value, intent, f"opaque_{action_type}_reason"))
         return inp, board
 
-    def _decide_with_choice(self, descriptions, selected_index):
+    def _decide_with_choice(self, descriptions, selected_index, *, root_means=None, visits=None):
         inp, board = self._input_and_board(descriptions)
         controller = self.FixedBoardController(board)
 
         def select_from_exact_board(
             planner, search_inp, *, controller, team_plan, root_candidates
         ):
+            from src.mcts import RootActionStats, SearchDiagnostics
+
             self.assertIs(search_inp, inp)
             self.assertIs(controller, controller_arg)
             self.assertEqual(len(root_candidates), len(board))
             self.assertTrue(all(actual is expected for actual, expected in zip(root_candidates, board)))
+            means = list(root_means or [0.0] * len(root_candidates))
+            if root_means is None and selected_index != 0:
+                means[selected_index] = 0.25
+            visit_counts = list(visits or [4] * len(root_candidates))
+            planner.stats = SearchDiagnostics(
+                iterations=sum(visit_counts),
+                root_actions=tuple(
+                    RootActionStats(candidate, count, means[index] * count)
+                    for index, (candidate, count) in enumerate(
+                        zip(root_candidates, visit_counts)
+                    )
+                ),
+            )
             return root_candidates[selected_index]
 
         controller_arg = controller
@@ -903,6 +918,9 @@ class ActiveMCTSIntegrationTests(unittest.TestCase):
         self.assertEqual(diagnostics["production_candidate_index"], 0)
         self.assertEqual(diagnostics["mcts_candidate_index"], 1)
         self.assertFalse(diagnostics["agreement"])
+        self.assertTrue(diagnostics["override_accepted"])
+        self.assertFalse(diagnostics["override_rejected"])
+        self.assertEqual(diagnostics["selected_candidate_index"], 1)
         possessor = inp.state.our_possessor()
         assert possessor is not None
         self.assertEqual(possessor.id, intents["st"].pid)
@@ -917,6 +935,113 @@ class ActiveMCTSIntegrationTests(unittest.TestCase):
         self.assertIsNone(controller._pending_pass_receiver)
         self.assertIsNone(controller._pending_pass_collection)
         self.assertEqual(controller.commits, 1)
+
+    def test_weak_search_disagreement_keeps_production_winner(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("pass", 20.0), ("carry", 10.0)),
+            1,
+            root_means=(0.0, 0.08),
+        )
+
+        self.assertIs(intents["st"], board[0].intent)
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertEqual(diagnostics["mcts_candidate_index"], 1)
+        self.assertEqual(diagnostics["selected_candidate_index"], 0)
+        self.assertTrue(diagnostics["proposed_disagreement"])
+        self.assertFalse(diagnostics["override_accepted"])
+        self.assertTrue(diagnostics["override_rejected"])
+        advantage = diagnostics["search_advantage"]
+        assert isinstance(advantage, float)
+        self.assertAlmostEqual(advantage, 0.08)
+        self.assertEqual(diagnostics["required_override_margin"], 0.10)
+        self.assertEqual(diagnostics["override_reason"], "below_required_search_advantage")
+
+    def test_strong_search_disagreement_overrides_production_winner(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("pass", 20.0), ("carry", 10.0)),
+            1,
+            root_means=(0.0, 0.15),
+        )
+
+        self.assertIs(intents["st"], board[1].intent)
+        self.assertTrue(controller.last_mcts_diagnostics["override_accepted"])
+        advantage = controller.last_mcts_diagnostics["search_advantage"]
+        assert isinstance(advantage, float)
+        self.assertAlmostEqual(advantage, 0.15)
+
+    def test_weak_shoot_to_carry_proposal_uses_larger_margin(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("shoot", 20.0), ("carry", 10.0)),
+            1,
+            root_means=(0.0, 0.15),
+        )
+
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertIs(intents["st"], board[0].intent)
+        self.assertEqual(diagnostics["mcts_action_type"], "none")
+        self.assertEqual(diagnostics["selected_action_type"], "shoot")
+        self.assertEqual(diagnostics["required_override_margin"], 0.20)
+        self.assertTrue(diagnostics["override_rejected"])
+
+    def test_strong_search_can_still_override_production_shot(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("shoot", 20.0), ("carry", 10.0)),
+            1,
+            root_means=(0.0, 0.25),
+        )
+
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertIs(intents["st"], board[1].intent)
+        self.assertEqual(diagnostics["required_override_margin"], 0.20)
+        self.assertTrue(diagnostics["override_accepted"])
+
+    def test_agreement_does_not_trigger_override_gate(self):
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("pass", 20.0), ("carry", 10.0)), 0
+        )
+
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertIs(intents["st"], board[0].intent)
+        self.assertTrue(diagnostics["agreement"])
+        self.assertFalse(diagnostics["proposed_disagreement"])
+        self.assertFalse(diagnostics["override_accepted"])
+        self.assertFalse(diagnostics["override_rejected"])
+        self.assertEqual(diagnostics["override_reason"], "mcts_agreed")
+
+    def test_alternative_without_root_statistics_is_rejected(self):
+        inp, board = self._input_and_board((("pass", 20.0), ("carry", 10.0)))
+        controller = self.FixedBoardController(board)
+
+        def select_without_stats(planner, search_inp, **kwargs):
+            return kwargs["root_candidates"][1]
+
+        with patch(
+            "src.mcts.MCTSPlanner.search",
+            autospec=True,
+            side_effect=select_without_stats,
+        ):
+            intents = controller.decide(inp)
+
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertIs(intents["st"], board[0].intent)
+        self.assertTrue(diagnostics["proposed_disagreement"])
+        self.assertFalse(diagnostics["override_accepted"])
+        self.assertTrue(diagnostics["override_rejected"])
+        self.assertIsNone(diagnostics["search_advantage"])
+        self.assertEqual(diagnostics["override_reason"], "insufficient_root_statistics")
+
+        _, board, controller, intents, _ = self._decide_with_choice(
+            (("pass", 20.0), ("carry", 10.0)),
+            1,
+            root_means=(0.0, 0.25),
+            visits=(0, 4),
+        )
+        self.assertIs(intents["st"], board[0].intent)
+        self.assertTrue(controller.last_mcts_diagnostics["override_rejected"])
+        self.assertEqual(
+            controller.last_mcts_diagnostics["override_reason"],
+            "insufficient_root_statistics",
+        )
 
     def test_active_shot_commits_team_plan_once(self):
         _, board, controller, intents, _ = self._decide_with_choice(
@@ -1055,7 +1180,7 @@ class ActiveMCTSIntegrationTests(unittest.TestCase):
         self.assertEqual(decisions[0], decisions[1])
         self.assertTrue(decisions[0][1]["mcts_ran"])
 
-    def test_real_mcts_can_commit_a_nonfirst_candidate_from_its_live_root_board(self):
+    def test_real_weak_shoot_downgrade_is_rejected_on_live_root_board(self):
         inp = make_inp(obs((58.349748, 1.705684), "us", our_st_x=58, them_x=10))
         us = {
             "gk": (2.5, 13.032385, -0.197539),
@@ -1132,11 +1257,15 @@ class ActiveMCTSIntegrationTests(unittest.TestCase):
 
         board = captured["board"]
         selected = captured["selected"]
-        self.assertEqual(controller.last_mcts_diagnostics["production_action_type"], "shoot")
-        self.assertEqual(controller.last_mcts_diagnostics["mcts_candidate_index"], 1)
-        self.assertFalse(controller.last_mcts_diagnostics["agreement"])
+        diagnostics = controller.last_mcts_diagnostics
+        self.assertEqual(diagnostics["production_action_type"], "shoot")
+        self.assertEqual(diagnostics["mcts_candidate_index"], 1)
+        self.assertEqual(diagnostics["selected_candidate_index"], 0)
+        self.assertFalse(diagnostics["agreement"])
+        self.assertTrue(diagnostics["override_rejected"])
+        self.assertEqual(diagnostics["required_override_margin"], 0.20)
         self.assertIs(selected, board[1])
-        self.assertIs(intents["st"], selected.intent)
+        self.assertIs(intents["st"], board[0].intent)
         self.assertEqual(controller.commit_count, 1)
 
     def test_real_search_has_no_live_side_effects_before_commit(self):

@@ -19,7 +19,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.config import DECISION_INTERVAL, RuntimeConfig, default_genome
+from src.config import (
+    DECISION_INTERVAL,
+    MCTS_MIN_OVERRIDE_ADVANTAGE,
+    MCTS_SHOOT_DOWNGRADE_ADVANTAGE,
+    RuntimeConfig,
+    default_genome,
+)
 from src.light import LIntent, LightEngine, make_state
 from src.policy import ActionCandidate, PolicyController, PolicyInput, PlayerIntent
 from src.shadow import (
@@ -54,6 +60,8 @@ def _policy_input(
     *,
     enable_mcts: bool = False,
     mcts_iterations: int = 8,
+    mcts_min_override_advantage: float = MCTS_MIN_OVERRIDE_ADVANTAGE,
+    mcts_shoot_downgrade_advantage: float = MCTS_SHOOT_DOWNGRADE_ADVANTAGE,
 ) -> PolicyInput:
     observation = plan_to_obs(state, game_id, step)
     game_state = GameState.from_observation(observation)
@@ -70,6 +78,8 @@ def _policy_input(
             genome=dict(genome),
             enable_mcts=enable_mcts,
             mcts_iterations=mcts_iterations,
+            mcts_min_override_advantage=mcts_min_override_advantage,
+            mcts_shoot_downgrade_advantage=mcts_shoot_downgrade_advantage,
         ),
         tactical_state=tactical,
         press_plan=PressPlan(),
@@ -363,9 +373,28 @@ def run_shadow_sample(
     }
 
 
+def summarize_override_decisions(diagnostics: list[dict]) -> dict:
+    """Aggregate raw MCTS disagreement proposals and final gate outcomes."""
+    proposed = sum(row.get("proposed_disagreement") is True for row in diagnostics)
+    accepted = sum(row.get("override_accepted") is True for row in diagnostics)
+    rejected = sum(row.get("override_rejected") is True for row in diagnostics)
+    rejection_reasons: Counter[str] = Counter(
+        str(row["override_reason"])
+        for row in diagnostics
+        if row.get("override_rejected") is True and row.get("override_reason")
+    )
+    return {
+        "proposed_disagreements": proposed,
+        "accepted_overrides": accepted,
+        "rejected_overrides": rejected,
+        "override_rejection_reasons": dict(sorted(rejection_reasons.items())),
+    }
+
+
 def _run_active_ab_match(
     *, seed: int, opponent: str, decisions: int, scenario: str,
-    active_mcts: bool, iterations: int,
+    active_mcts: bool, iterations: int, min_override_advantage: float,
+    shoot_downgrade_advantage: float,
 ) -> dict:
     """Run one seeded baseline or active-selector LightEngine scenario."""
     rng = random.Random(seed)
@@ -408,6 +437,8 @@ def _run_active_ab_match(
             default_genome(),
             enable_mcts=active_mcts,
             mcts_iterations=iterations,
+            mcts_min_override_advantage=min_override_advantage,
+            mcts_shoot_downgrade_advantage=shoot_downgrade_advantage,
         )
         intents = controller.decide(inp)
         diagnostic = dict(controller.last_mcts_diagnostics)
@@ -462,6 +493,7 @@ def _run_active_ab_match(
             turnovers += 1
 
     score_us, score_them = state.score_us, state.score_them
+    override_summary = summarize_override_decisions(decision_diagnostics)
     return {
         "score_us": score_us,
         "score_them": score_them,
@@ -477,6 +509,7 @@ def _run_active_ab_match(
         "mcts": {
             "eligible_decisions": eligible,
             "disagreements": disagreements,
+            **override_summary,
             "average_candidate_count": round(candidates_total / max(1, eligible), 3),
             "max_candidate_count": candidates_max,
             "action_type_counts": dict(sorted(mcts_actions.items())),
@@ -500,6 +533,8 @@ def run_active_ab_sample(
     decisions: int = 40,
     iterations: int = 8,
     scenarios: tuple[str, ...] = ("match_start", "final_third", "one_v_one_gk"),
+    min_override_advantage: float = MCTS_MIN_OVERRIDE_ADVANTAGE,
+    shoot_downgrade_advantage: float = MCTS_SHOOT_DOWNGRADE_ADVANTAGE,
 ) -> dict:
     """Compare paired ordinary and active-MCTS LightEngine runs."""
     if not 1 <= decisions <= 5000 or decisions * len(scenarios) > 5000:
@@ -520,10 +555,14 @@ def run_active_ab_sample(
         baseline = _run_active_ab_match(
             seed=match_seed, opponent=opponent, decisions=decisions,
             scenario=scenario, active_mcts=False, iterations=iterations,
+            min_override_advantage=min_override_advantage,
+            shoot_downgrade_advantage=shoot_downgrade_advantage,
         )
         active = _run_active_ab_match(
             seed=match_seed, opponent=opponent, decisions=decisions,
             scenario=scenario, active_mcts=True, iterations=iterations,
+            min_override_advantage=min_override_advantage,
+            shoot_downgrade_advantage=shoot_downgrade_advantage,
         )
         paired.append(
             {
@@ -558,6 +597,22 @@ def run_active_ab_sample(
             "mcts_decisions": {
                 "eligible": eligible_count,
                 "disagreements": sum(row["disagreements"] for row in mcts_rows),
+                "proposed_disagreements": sum(
+                    row["proposed_disagreements"] for row in mcts_rows
+                ),
+                "accepted_overrides": sum(
+                    row["accepted_overrides"] for row in mcts_rows
+                ),
+                "rejected_overrides": sum(
+                    row["rejected_overrides"] for row in mcts_rows
+                ),
+                "override_rejection_reasons": dict(
+                    sorted(
+                        sum_counters(
+                            row["override_rejection_reasons"] for row in mcts_rows
+                        ).items()
+                    )
+                ),
                 "average_candidate_count": round(
                     sum(
                         float(row["average_candidate_count"]) * int(row["eligible_decisions"])
@@ -618,6 +673,8 @@ def run_active_ab_sample(
         "scenarios": list(scenarios),
         "decisions_per_match": decisions,
         "mcts_iterations": iterations,
+        "min_override_advantage": min_override_advantage,
+        "shoot_downgrade_advantage": shoot_downgrade_advantage,
         "baseline": aggregate("baseline"),
         "active_mcts": aggregate("active_mcts"),
         "paired_runs": paired,
@@ -640,6 +697,16 @@ def main() -> None:
     parser.add_argument("--budgets", type=int, nargs="+", default=list(DEFAULT_BUDGETS))
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument(
+        "--min-override-advantage",
+        type=float,
+        default=MCTS_MIN_OVERRIDE_ADVANTAGE,
+    )
+    parser.add_argument(
+        "--shoot-downgrade-advantage",
+        type=float,
+        default=MCTS_SHOOT_DOWNGRADE_ADVANTAGE,
+    )
+    parser.add_argument(
         "--scenario",
         choices=("match_start", *sorted(SCENARIOS)),
         nargs="+",
@@ -658,6 +725,8 @@ def main() -> None:
             opponent=args.opponent,
             decisions=args.decisions,
             iterations=args.iterations,
+            min_override_advantage=args.min_override_advantage,
+            shoot_downgrade_advantage=args.shoot_downgrade_advantage,
             scenarios=(
                 tuple(args.scenario)
                 if args.scenario

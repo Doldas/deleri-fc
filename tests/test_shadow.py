@@ -17,7 +17,7 @@ from src.search_opponent import OPPONENT_RESPONSE_MODEL
 from src.state import GameState, WorldModel
 from src.tactics import PressPlan, TacticalState, assign_roles
 from src.teamplan import TeamPlan, TeamPlanManager
-from scripts.mcts_shadow import run_active_ab_sample
+from scripts.mcts_shadow import run_active_ab_sample, summarize_override_decisions
 
 SLOTS = [
     {"id": "defender", "role": "defender", "position": {"x": 14, "y": 20}},
@@ -339,6 +339,46 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertEqual(first["paired_runs"][0]["scenario"], "final_third")
         self.assertEqual(first["baseline"]["mcts_decisions"]["eligible"], 0)
         self.assertGreater(first["active_mcts"]["mcts_decisions"]["eligible"], 0)
+        for report in (first["active_mcts"], first["baseline"]):
+            counters = report["mcts_decisions"]
+            diagnostics = [
+                row
+                for match in first["paired_runs"]
+                for row in match["active_mcts"]["mcts"]["decision_diagnostics"]
+            ] if report is first["active_mcts"] else []
+            summary = summarize_override_decisions(diagnostics)
+            self.assertEqual(counters["proposed_disagreements"], summary["proposed_disagreements"])
+            self.assertEqual(counters["accepted_overrides"], summary["accepted_overrides"])
+            self.assertEqual(counters["rejected_overrides"], summary["rejected_overrides"])
+
+    def test_active_ab_override_counter_aggregation(self):
+        result = summarize_override_decisions(
+            [
+                {"proposed_disagreement": True, "override_accepted": True},
+                {
+                    "proposed_disagreement": True,
+                    "override_rejected": True,
+                    "override_reason": "below_required_search_advantage",
+                },
+                {
+                    "proposed_disagreement": True,
+                    "override_rejected": True,
+                    "override_reason": "insufficient_root_statistics",
+                },
+                {"proposed_disagreement": False},
+            ]
+        )
+
+        self.assertEqual(result["proposed_disagreements"], 3)
+        self.assertEqual(result["accepted_overrides"], 1)
+        self.assertEqual(result["rejected_overrides"], 2)
+        self.assertEqual(
+            result["override_rejection_reasons"],
+            {
+                "below_required_search_advantage": 1,
+                "insufficient_root_statistics": 1,
+            },
+        )
 
 
 if __name__ == "__main__":

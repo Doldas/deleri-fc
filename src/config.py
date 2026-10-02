@@ -7,6 +7,7 @@ the runtime policy share the same schema.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -51,6 +52,12 @@ DECISION_INTERVAL = 0.1
 ENGINE_TICKS_PER_SECOND = 60
 DECISION_HARD_MS = 100
 MAX_RUNTIME_MCTS_ITERATIONS = 64
+# Root values live on a compact state-value scale (typical non-goal gaps are
+# below 0.1); require a visible advantage before replacing production ranking.
+MCTS_MIN_OVERRIDE_ADVANTAGE = 0.10
+# A production shot is especially costly to discard on weak evidence. This
+# remains an advantage threshold, not an action ban.
+MCTS_SHOOT_DOWNGRADE_ADVANTAGE = 0.20
 
 
 def kick_speed(power: float) -> float:
@@ -209,11 +216,24 @@ class RuntimeConfig:
     log_explanations: bool = False
     force_seed: int | None = None  # set for reproducible tournament decisions
     recycle_count: int = 0  # consecutive backward passes to force forward play
+    mcts_min_override_advantage: float = MCTS_MIN_OVERRIDE_ADVANTAGE
+    mcts_shoot_downgrade_advantage: float = MCTS_SHOOT_DOWNGRADE_ADVANTAGE
 
     def __post_init__(self) -> None:
         self.mcts_iterations = max(
             0, min(MAX_RUNTIME_MCTS_ITERATIONS, int(self.mcts_iterations))
         )
+        for name, default in (
+            ("mcts_min_override_advantage", MCTS_MIN_OVERRIDE_ADVANTAGE),
+            ("mcts_shoot_downgrade_advantage", MCTS_SHOOT_DOWNGRADE_ADVANTAGE),
+        ):
+            try:
+                value = float(getattr(self, name))
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            if not math.isfinite(value) or value < 0.0:
+                value = default
+            setattr(self, name, value)
 
     @classmethod
     def from_environment(cls) -> RuntimeConfig:

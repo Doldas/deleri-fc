@@ -1527,6 +1527,12 @@ class PolicyController:
             "mcts_candidate_index": None,
             "mcts_action_type": None,
             "mcts_value": None,
+            "proposed_disagreement": False,
+            "override_accepted": False,
+            "override_rejected": False,
+            "search_advantage": None,
+            "required_override_margin": None,
+            "override_reason": "not_run",
             "selected_candidate_index": None,
             "selected_action_type": None,
             "selected_value": None,
@@ -2420,6 +2426,7 @@ class PolicyController:
 
         if not inp.config.enable_mcts:
             diagnostics["skip_reason"] = "mcts_disabled"
+            diagnostics["override_reason"] = "mcts_disabled"
             return production
 
         possessor = inp.state.our_possessor()
@@ -2445,9 +2452,11 @@ class PolicyController:
         diagnostics["iteration_budget"] = budget
         if skip_reason:
             diagnostics["skip_reason"] = skip_reason
+            diagnostics["override_reason"] = skip_reason
             return production
         if budget <= 0:
             diagnostics["skip_reason"] = "non_positive_budget"
+            diagnostics["override_reason"] = "non_positive_budget"
             return production
 
         diagnostics["eligible"] = True
@@ -2487,6 +2496,7 @@ class PolicyController:
                 else "candidate_not_in_root_board"
             )
             diagnostics["skip_reason"] = "search_unavailable"
+            diagnostics["override_reason"] = "search_unavailable"
             return production
 
         diagnostics.update(
@@ -2494,10 +2504,56 @@ class PolicyController:
                 "mcts_candidate_index": selected_index,
                 "mcts_action_type": selected.intent.action_type,
                 "mcts_value": selected.value,
+                "agreement": selected_index == 0,
+                "proposed_disagreement": selected_index != 0,
+            }
+        )
+        if selected_index == 0:
+            diagnostics["override_reason"] = "mcts_agreed"
+            return production
+
+        required_margin = inp.config.mcts_min_override_advantage
+        if (
+            production.intent.action_type == "shoot"
+            and selected.intent.action_type != "shoot"
+        ):
+            required_margin = max(
+                required_margin,
+                inp.config.mcts_shoot_downgrade_advantage,
+            )
+        diagnostics["required_override_margin"] = required_margin
+
+        root_stats = stats.root_actions
+        stats_are_usable = (
+            stats.iterations > 0
+            and len(root_stats) == len(candidates)
+            and all(stat.candidate is candidate for stat, candidate in zip(root_stats, candidates))
+            and root_stats[0].visits > 0
+            and root_stats[selected_index].visits > 0
+            and math.isfinite(root_stats[0].mean_value)
+            and math.isfinite(root_stats[selected_index].mean_value)
+        )
+        if not stats_are_usable:
+            diagnostics["override_rejected"] = True
+            diagnostics["override_reason"] = "insufficient_root_statistics"
+            return production
+
+        search_advantage = (
+            root_stats[selected_index].mean_value - root_stats[0].mean_value
+        )
+        diagnostics["search_advantage"] = search_advantage
+        if search_advantage < required_margin:
+            diagnostics["override_rejected"] = True
+            diagnostics["override_reason"] = "below_required_search_advantage"
+            return production
+
+        diagnostics.update(
+            {
+                "override_accepted": True,
+                "override_reason": "search_advantage_sufficient",
                 "selected_candidate_index": selected_index,
                 "selected_action_type": selected.intent.action_type,
                 "selected_value": selected.value,
-                "agreement": selected_index == 0,
             }
         )
         return selected
@@ -2529,6 +2585,7 @@ class PolicyController:
                 "candidate_count": 0,
                 "skip_reason": "empty_candidate_board",
                 "fallback_reason": "empty_candidate_board",
+                "override_reason": "empty_candidate_board",
             }
         )
         tx, ty, speed = self._dribble_target(inp, p)

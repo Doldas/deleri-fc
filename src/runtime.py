@@ -430,6 +430,8 @@ class RuntimeManager:
                 genome=adapted_genome,
                 enable_mcts=ctx.config.enable_mcts,
                 mcts_iterations=ctx.config.mcts_iterations,
+                mcts_min_override_advantage=ctx.config.mcts_min_override_advantage,
+                mcts_shoot_downgrade_advantage=ctx.config.mcts_shoot_downgrade_advantage,
             ),
             tactical_state=tactical_state,
             press_plan=press_plan,
