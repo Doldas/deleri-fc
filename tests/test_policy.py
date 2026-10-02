@@ -14,12 +14,14 @@ from src.policy import (
     loose_ball_meeting_point,
     CARRY_CLEAN_VALUE,
     CARRY_HOLD_VALUE,
+    PlayerIntent,
+    ActionCandidate,
 )
 from src.opponent import OpponentModel
 from src.state import GameState, WorldModel
 from src import geom
 from src.geom import PITCH_LENGTH, PITCH_WIDTH, GOAL_CENTER_Y, OPP_GOAL_X
-from src.physics import shot_beats_keeper
+from src.physics import shot_beats_keeper, MIN_PASS_TRAVEL
 
 SLOTS = [
     {"id": "defender", "role": "defender", "position": {"x": 14, "y": 20}},
@@ -542,6 +544,111 @@ class PossessionStyleTests(unittest.TestCase):
                 self.assertGreaterEqual(it.ty, -0.5)
                 self.assertLessEqual(it.ty, PITCH_WIDTH + 0.5)
 
+class AttackCandidatePipelineTests(unittest.TestCase):
+    def _intent(
+        self,
+        *,
+        action_type="none",
+        action_target=None,
+    ):
+        return PlayerIntent(
+            pid="st",
+            tx=30.0,
+            ty=20.0,
+            speed=0.4,
+            face_x=60.0,
+            face_y=20.0,
+            action_type=action_type,
+            action_target=action_target,
+        )
+
+    def test_filter_removes_only_physically_short_passes(self):
+        controller = PolicyController()
+
+        inp = make_inp(obs((30, 20), "us", our_st_x=30, them_x=45))
+        carrier = next(
+            p for p in inp.state.outfield_us()
+            if p.id == "st"
+        )
+
+        short_pass = ActionCandidate(
+            10.0,
+            self._intent(
+                action_type="pass",
+                action_target=(carrier.x + MIN_PASS_TRAVEL - 1.0, carrier.y),
+            ),
+            "short_pass",
+        )
+
+        legal_pass = ActionCandidate(
+            9.0,
+            self._intent(
+                action_type="pass",
+                action_target=(carrier.x + MIN_PASS_TRAVEL + 1.0, carrier.y),
+            ),
+            "legal_pass",
+        )
+
+        shot = ActionCandidate(
+            8.0,
+            self._intent(
+                action_type="shoot",
+                action_target=(OPP_GOAL_X, GOAL_CENTER_Y),
+            ),
+            "shot",
+        )
+
+        carry = ActionCandidate(
+            7.0,
+            self._intent(),
+            "carry",
+        )
+
+        result = controller._filter_attack_candidates(
+            carrier,
+            [short_pass, legal_pass, shot, carry],
+        )
+
+        self.assertEqual(
+            [candidate.reason for candidate in result],
+            ["legal_pass", "shot", "carry"],
+        )
+
+    def test_rank_orders_by_descending_ev_without_mutating_input(self):
+        controller = PolicyController()
+
+        low = ActionCandidate(2.0, self._intent(), "low")
+        high = ActionCandidate(9.0, self._intent(), "high")
+        middle = ActionCandidate(5.0, self._intent(), "middle")
+
+        candidates = [low, high, middle]
+        original = list(candidates)
+
+        ranked = controller._rank_attack_candidates(candidates)
+
+        self.assertEqual(
+            [candidate.value for candidate in ranked],
+            [9.0, 5.0, 2.0],
+        )
+
+        self.assertEqual(candidates, original)
+        self.assertIsNot(ranked, candidates)
+
+    def test_rank_preserves_generation_order_for_equal_ev(self):
+        controller = PolicyController()
+
+        first = ActionCandidate(5.0, self._intent(), "first")
+        second = ActionCandidate(5.0, self._intent(), "second")
+        lower = ActionCandidate(1.0, self._intent(), "lower")
+
+        ranked = controller._rank_attack_candidates(
+            [first, second, lower]
+        )
+
+        self.assertEqual(
+            [candidate.reason for candidate in ranked],
+            ["first", "second", "lower"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

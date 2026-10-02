@@ -38,8 +38,8 @@ from src.opponents.registry import (  # noqa: E402
 
 OPPONENTS_DIR = REPO / "opponents"
 BRAIN_SOURCE = ROOT / "src" / "opponents" / "engine_brain.py"
-MODELS_SOURCE = REPO / "null-pointers-fc" / "models.py"
-SERVER_SOURCE = REPO / "null-pointers-fc" / "server.py"
+MODELS_SOURCE = ROOT / "training" / "opponents" / "null-pointers-fc" / "models.py"
+SERVER_SOURCE = ROOT / "training" / "opponents" / "null-pointers-fc" / "server.py"
 
 # Kit colours per family, with the four bands of a family as shades of one hue so
 # they read as related. This exists because `server.py` was originally copied

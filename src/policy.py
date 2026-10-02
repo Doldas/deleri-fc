@@ -1279,6 +1279,15 @@ class PlayerIntent:
         return intent
 
 
+@dataclass(frozen=True)
+class ActionCandidate:
+    """One already-validated attacking option on the production EV scale."""
+
+    value: float
+    intent: PlayerIntent
+    reason: str
+
+
 def _fin(v: float) -> float:
     if not math.isfinite(v):
         return 0.0
@@ -1999,19 +2008,63 @@ class PolicyController:
                 break
         return value
 
-    def _evaluate_attack_actions(self, inp: PolicyInput, p: Player, team_plan=None) -> PlayerIntent:
-        """Evaluate all attack options and return the best one by expected value."""
+    def _filter_attack_candidates(
+            self,
+            p: Player,
+            candidates: list[ActionCandidate],
+    ) -> list[ActionCandidate]:
+        """Remove attacking candidates that are physically impossible to execute."""
+
+        reachable: list[ActionCandidate] = []
+
+        for candidate in candidates:
+            intent = candidate.intent
+
+            if intent.action_type == "pass" and intent.action_target is not None:
+                if not at_or_above(
+                        geom.distance(
+                            p.x,
+                            p.y,
+                            intent.action_target[0],
+                            intent.action_target[1],
+                        ),
+                        MIN_PASS_TRAVEL,
+                ):
+                    continue
+
+            reachable.append(candidate)
+
+        return reachable
+
+    def _rank_attack_candidates(
+            self,
+            candidates: list[ActionCandidate],
+    ) -> list[ActionCandidate]:
+        """Rank attacking candidates from highest to lowest production EV."""
+
+        return sorted(
+            candidates,
+            key=lambda candidate: candidate.value,
+            reverse=True,
+        )
+
+    def _build_attack_candidates(
+            self,
+            inp: PolicyInput,
+            p: Player,
+            team_plan=None,
+    ) -> list[ActionCandidate]:
         state = inp.state
         world = inp.world
         ball = state.ball
         role = inp.roles.get(p.id, ROLE_DEFENDER)
-        
+
         # Get opponent GK position once for all evaluations
         gk = state.goalkeeper_them()
         gkx = gk.x if gk else -1.0
         gky = gk.y if gk else 20.0
-        
-        candidates: list[tuple[float, PlayerIntent, str]] = []  # (value, intent, reason)
+
+        candidates: list[ActionCandidate] = []  # (value, intent, reason)
         # One calculator for every candidate below. Every value on this board is
         # a goal-equivalent expected value computed by this class, so shots,
         # passes, carries and special balls are all on one scale and can be
@@ -2025,7 +2078,7 @@ class PolicyController:
         # a through ball instead. That single mismatch is the direct cause of
         # the 1-shot-per-match season.
         evcalc = ExpectedValueCalculator(inp)
-        
+
     # ---- 1. SHOOT ----
         # Compute shot directly using pick_shot_target (bypasses _shot_choice GK HELL blocking)
         gk = state.goalkeeper_them()
@@ -2052,8 +2105,8 @@ class PolicyController:
                 )
                 # The value *is* the EV, so shots compete with passes and
                 # carries on the same scale instead of a made-up constant.
-                candidates.append((shot_ev, intent, "shoot"))
-        
+                candidates.append(ActionCandidate(shot_ev, intent, "shoot"))
+
         # ---- Shoot-on-sight in box: if we're in the box with any opening, shoot! ----
         # Low blocks leave small windows - don't wait for perfect lane.
         # NOTE: the old "shoot-on-sight in the box" trigger used to live here,
@@ -2089,7 +2142,7 @@ class PolicyController:
                         # target -- the deflection spot rather than the goal --
                         # which is what this intent carries.
                         intent = PlayerIntent(p.id, p.x, p.y, 0.4, wx, wy, "shoot", (wx, wy), power)
-                        candidates.append((wall_ev, intent, "wall_shot"))
+                        candidates.append(ActionCandidate(wall_ev, intent, "wall_shot"))
 
         # NOTE: the "test the keeper from range" branch used to live here. It
         # was gated on `_is_natural_striker`, i.e. on the player's shirt rather
@@ -2101,7 +2154,7 @@ class PolicyController:
         # covered ones below zero. Long-range shooting is now available to
         # whoever has the ball when -- and only when -- the geometry pays.
 
-        
+
         # NOTE: a "rebound setup" candidate used to live here -- shoot at the
         # keeper's body from up to 20 m, worth 45.0, tying the best genuine shot
         # in this planner. It was removed because it is the one shot a keeper is
@@ -2127,8 +2180,8 @@ class PolicyController:
                 # win this board outright whenever it fired.
                 second_ball_value = evcalc.ev_carry(p, mx, my)
                 intent = PlayerIntent(p.id, mx, my, 1.0, mx, my, "none")
-                candidates.append((second_ball_value, intent, "second_ball"))
-        
+                candidates.append(ActionCandidate(second_ball_value, intent, "second_ball"))
+
         # ---- 2. CROSS FROM WING ----
         if role in (ROLE_WIDE_LEFT, ROLE_WIDE_RIGHT) and p.x > 45.0:
             cross = self._cross_choice(inp, p)
@@ -2140,8 +2193,8 @@ class PolicyController:
                                       receiver_id=receiver_id, collection_point=(collect_x, collect_y))
                 # Apply TeamPlan alignment bonus at candidate creation time
                 cross_value = self._apply_team_plan_alignment(cross_value, intent, team_plan)
-                candidates.append((cross_value, intent, "cross"))
-        
+                candidates.append(ActionCandidate(cross_value, intent, "cross"))
+
         # ---- 3. CUTBACK FROM BYLINE ----
         cutback = self._cutback_choice(inp, p)
         if cutback is not None:
@@ -2151,7 +2204,7 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             cutback_value = self._apply_team_plan_alignment(cutback_value, intent, team_plan)
-            candidates.append((cutback_value, intent, "cutback"))
+            candidates.append(ActionCandidate(cutback_value, intent, "cutback"))
 
         # ---- 4. THROUGH BALL ----
         through = self._through_ball_choice(inp, p)
@@ -2161,8 +2214,8 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             through_value = self._apply_team_plan_alignment(through_value, intent, team_plan)
-            candidates.append((through_value, intent, "through_ball"))
-        
+            candidates.append(ActionCandidate(through_value, intent, "through_ball"))
+
         # ---- 5. WALL PASS ----
         wall = self._wall_pass_choice(inp, p)
         if wall is not None:
@@ -2171,8 +2224,8 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             wall_value = self._apply_team_plan_alignment(wall_value, intent, team_plan)
-            candidates.append((wall_value, intent, "wall_pass"))
-        
+            candidates.append(ActionCandidate(wall_value, intent, "wall_pass"))
+
         # ---- 6. SWITCH PLAY ----
         switch = self._switch_play_choice(inp, p)
         if switch is not None:
@@ -2181,8 +2234,8 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             switch_value = self._apply_team_plan_alignment(switch_value, intent, team_plan)
-            candidates.append((switch_value, intent, "switch_play"))
-        
+            candidates.append(ActionCandidate(switch_value, intent, "switch_play"))
+
         # ---- 7. PULL BACK ----
         pullback = self._pullback_choice(inp, p)
         if pullback is not None:
@@ -2191,8 +2244,8 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             pullback_value = self._apply_team_plan_alignment(pullback_value, intent, team_plan)
-            candidates.append((pullback_value, intent, "pullback"))
-        
+            candidates.append(ActionCandidate(pullback_value, intent, "pullback"))
+
         # ---- 8. ONE-TWO (High Press Escape) ----
         onetwo = self._onetwo_choice(inp, p)
         if onetwo is not None:
@@ -2201,8 +2254,8 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             onetwo_value = self._apply_team_plan_alignment(onetwo_value, intent, team_plan)
-            candidates.append((onetwo_value, intent, "high_press_onetwo"))
-        
+            candidates.append(ActionCandidate(onetwo_value, intent, "high_press_onetwo"))
+
         # ---- 9. THIRD MAN RUN ----
         third = self._third_man_choice(inp, p)
         if third is not None:
@@ -2211,8 +2264,8 @@ class PolicyController:
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=receiver_id, collection_point=(collect_x, collect_y))
             third_value = self._apply_team_plan_alignment(third_value, intent, team_plan)
-            candidates.append((third_value, intent, "high_press_third_man"))
-        
+            candidates.append(ActionCandidate(third_value, intent, "high_press_third_man"))
+
         # ---- 10. GK BYPASS (High Press) ----
         if inp.roles.get(p.id) == "goalkeeper":
             bypass = self._gk_bypass_choice(inp, p)
@@ -2222,8 +2275,8 @@ class PolicyController:
                 intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                       receiver_id=receiver_id, collection_point=(collect_x, collect_y))
                 bypass_value = self._apply_team_plan_alignment(bypass_value, intent, team_plan)
-                candidates.append((bypass_value, intent, "high_press_gk_bypass"))
-        
+                candidates.append(ActionCandidate(bypass_value, intent, "high_press_gk_bypass"))
+
         # ---- 13. WALL SHOT ----
         # `is_near_wall` is a pitch-boundary test (x <= m or x >= L - m or
         # y <= m or y >= W - m), so without a range bound this also fires for a
@@ -2247,8 +2300,8 @@ class PolicyController:
                             p, (wx, wy), power
                         ) * EV_WALL_SHOT_BONUS
                         intent = PlayerIntent(p.id, p.x, p.y, 0.4, wx, wy, "shoot", (wx, wy), power)
-                        candidates.append((wall_shot_value, intent, "wall_shot"))
-        
+                        candidates.append(ActionCandidate(wall_shot_value, intent, "wall_shot"))
+
         # ---- 14. CARRY (Dribble) ----
         # Priced on the goal-equivalent scale with everything else, so a carry
         # and a shot are directly comparable. `_carry_value` scored carries on
@@ -2259,8 +2312,8 @@ class PolicyController:
         tx, ty, speed = self._dribble_target(inp, p)
         carry_value = evcalc.ev_carry(p, tx, ty)
         carry_intent = PlayerIntent(p.id, tx, ty, speed, tx, ty)
-        candidates.append((carry_value, carry_intent, "carry_forward"))
-        
+        candidates.append(ActionCandidate(carry_value, carry_intent, "carry_forward"))
+
         # ---- 15. SAFE PASS (last resort) ----
         # Priced like every other candidate, on the same scale. This used to be
         # a flat 10.0, which is worse than useless: it was high enough to beat a
@@ -2277,8 +2330,9 @@ class PolicyController:
             )
             intent = PlayerIntent(p.id, p.x, p.y, 0.4, tx, ty, "pass", (tx, ty), power,
                                   receiver_id=best, collection_point=(collect_x, collect_y))
-            candidates.append((pass_value, intent, f"safe_pass_to_{best}"))
-        
+            candidates.append(
+                ActionCandidate(pass_value, intent, f"safe_pass_to_{best}")
+            )
         # ---- Select best candidate ----
         # Veto physically impossible passes.
         #
@@ -2311,54 +2365,53 @@ class PolicyController:
         # Dropping these candidates is the secure-control state: with no
         # physically reachable pass on the board, the carry keeps the ball
         # glued to the carrier instead of handing it to the press.
-        if candidates:
-            reachable = []
-            for value, intent, reason in candidates:
-                if intent.action_type == "pass" and intent.action_target is not None:
-                    if not at_or_above(
-                        geom.distance(p.x, p.y, intent.action_target[0],
-                                      intent.action_target[1]),
-                        MIN_PASS_TRAVEL,
-                    ):
-                        continue
-                reachable.append((value, intent, reason))
-            candidates = reachable
+        candidates = self._filter_attack_candidates(p, candidates)
+        candidates = self._rank_attack_candidates(candidates)
+
+        return candidates
+
+    def _evaluate_attack_actions(
+            self,
+            inp: PolicyInput,
+            p: Player,
+            team_plan=None,
+    ) -> PlayerIntent:
+        """Evaluate all attack options and return the best one by expected value."""
+        candidates = self._build_attack_candidates(inp, p, team_plan)
 
         if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_value, best_intent, reason = candidates[0]
-            
+            best = candidates[0]
+            best_value = best.value
+            best_intent = best.intent
+            reason = best.reason
+
             # TEAM PLAN INTEGRATION: Handle shot commitment and pending pass
             if team_plan is not None:
-                # Mark shot commitment for team coordination
                 if best_intent.action_type == "shoot":
                     team_plan.shot_committed = True
                     team_plan.shot_expected = False
-                    # Store shot target for rebound followup
                     if best_intent.action_target is not None:
                         team_plan.rebound_zone_x = best_intent.action_target[0]
                         team_plan.rebound_zone_y = best_intent.action_target[1]
-                        # Far post opposite to shot target
                         if best_intent.action_target[1] > GOAL_CENTER_Y:
                             team_plan.far_post_target_y = GOAL_LOW_Y
                         else:
                             team_plan.far_post_target_y = GOAL_HIGH_Y
-                
-                # If the chosen action is a pass, set pending receiver for coordinated off-ball movement
+
                 if best_intent.action_type == "pass" and best_intent.receiver_id is not None:
                     self._pending_pass_receiver = best_intent.receiver_id
                     self._pending_pass_collection = best_intent.collection_point
-            
+
             log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": best_intent.action_type, "reason": reason, "value": best_value}
             self.log.record(log_entry)
             return self._veto_own_goal(inp, p, best_intent)
-        
+
         # Fallback
         tx, ty, speed = self._dribble_target(inp, p)
         log_entry = {"state": str(inp.tactical_state), "player": p.id, "action": "dribble", "reason": "fallback_carry"}
         self.log.record(log_entry)
         return PlayerIntent(p.id, tx, ty, speed, tx, ty)
-    
+
     def _cross_choice(self, inp: PolicyInput, p: Player) -> tuple[float, float, float, str, float, float] | None:
         """Cross from wing to striker in box.
         
