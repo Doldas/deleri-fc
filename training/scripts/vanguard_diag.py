@@ -33,7 +33,7 @@ GOAL_HW = 3.0
 # The engine assigns literal "team-a"/"team-b" ids by *side*, not by identity:
 # in a replay where we are the away side, `teams[0]` is the opponent. Only the
 # top-level `teamId` is stable, so our side is resolved per replay by name.
-US_NAME_HINT = "My Team"
+US_NAME_HINT = "Deleri FC"
 
 
 def _mx(x: float, mirror_us: bool) -> float:

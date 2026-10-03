@@ -128,11 +128,11 @@ class KeeperReachTests(unittest.TestCase):
         # away and he cannot cover it. This is the shot worth taking.
         self.assertTrue(shot_beats_keeper(42.0, 8.0, 58.0, 12.0, 22.4, 18.0))
 
-    def test_point_blank_shot_needs_the_actual_post_not_the_inset(self):
-        # 6 m out, aiming at the post itself (3.0 m of angle) leaves 1.1 m after
-        # his shift: a dive, so it is worth taking. The 0.6 m inset that
-        # `pick_shot_target` uses leaves only 0.5 m, which is a standing catch.
-        self.assertTrue(shot_beats_keeper(54.0, 20.0, 58.0, 20.0, GOAL_HIGH_Y, 6.0))
+    def test_point_blank_dive_band_is_still_a_save(self):
+        # 6 m out, aiming at the post itself leaves 1.1 m after the keeper's
+        # shift. Engine rules define that as a dive save; the inset is a
+        # standing catch. Neither is a goal.
+        self.assertFalse(shot_beats_keeper(54.0, 20.0, 58.0, 20.0, GOAL_HIGH_Y, 6.0))
         self.assertFalse(shot_beats_keeper(54.0, 20.0, 58.0, 20.0, 22.4, 6.0))
 
     def test_keeper_dragged_out_of_his_area_is_a_free_goal(self):
@@ -158,7 +158,9 @@ class ShotDisciplineTests(unittest.TestCase):
         self.assertNotEqual(intents["cd"].action_type, "shoot")
 
     def test_striker_still_shoots_inside_the_box(self):
-        intents = PolicyController().decide(make_inp(obs((52, 20), "us", our_st_x=52, them_x=10)))
+        observation = obs((52, 20), "us", our_st_x=52, them_x=10)
+        observation["them"][0]["position"] = {"x": 45, "y": 20}
+        intents = PolicyController().decide(make_inp(observation))
         self.assertEqual(intents["st"].action_type, "shoot")
 
 

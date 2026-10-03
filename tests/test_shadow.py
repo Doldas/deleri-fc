@@ -329,14 +329,14 @@ class ShadowEvaluationTests(unittest.TestCase):
             "opponent": "possession",
             "decisions": 2,
             "iterations": 1,
-            "scenarios": ("final_third",),
+            "scenarios": ("one_v_one_gk",),
         }
         first = run_active_ab_sample(**kwargs)
         second = run_active_ab_sample(**kwargs)
 
         self.assertEqual(first, second)
         self.assertEqual(first["seeds"], [5])
-        self.assertEqual(first["paired_runs"][0]["scenario"], "final_third")
+        self.assertEqual(first["paired_runs"][0]["scenario"], "one_v_one_gk")
         self.assertEqual(first["baseline"]["mcts_decisions"]["eligible"], 0)
         self.assertGreater(first["active_mcts"]["mcts_decisions"]["eligible"], 0)
         for report in (first["active_mcts"], first["baseline"]):

@@ -117,7 +117,19 @@ class ReceiverIdentityTests(unittest.TestCase):
     def _assert_identity(self, reason_key):
         spec = PASS_SCENARIOS[reason_key]
         controller = PolicyController()
-        inp = make_inp(build(spec))
+        observation = build(spec)
+        if reason_key == "cutback":
+            # Block the keeper-pull dribble lane and the direct striker lane so
+            # this fixture still isolates the cutback receiver identity after
+            # the final-third keeper-displacement carry was added.
+            for index, (x, y) in enumerate(((50.2, 29.0), (50.2, 34.0))):
+                observation["them"].append({
+                    "id": f"cutback_blocker_{index}", "role": "outfield",
+                    "position": {"x": x, "y": y},
+                    "velocity": {"x": 0.0, "y": 0.0},
+                    "facingRadians": 0.0, "canAct": True,
+                })
+        inp = make_inp(observation)
         intents = controller.decide(inp)
         carrier_intent, reason = selected_pass(controller, intents)
 

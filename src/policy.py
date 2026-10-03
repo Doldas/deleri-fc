@@ -232,36 +232,26 @@ def _shot_p_goal(inp: PolicyInput, p: Player) -> float:
 def _shot_worth_taking(inp: PolicyInput, p: Player) -> bool:
     """Should this player shoot right now?
 
-    Two bars, both geometric, and neither of them looks at nominal position:
-
-    * Inside the box the test is on *reaching the goal at all*: is the effort
-      on frame and not into a body? At that range an attempt is worth taking
-      even against a keeper who is set, because it is the closest the ball
-      will ever get and holding it there invites a tackle. Note this is
-      deliberately not `P(goal)` -- against a set keeper from the middle the
-      goal probability is ~1%, and refusing to shoot there is what produced
-      the original 35-shots-0-goals season.
-    * Outside the box the bar is a full expected value, and it is high enough
-      that the shot has to be a real chance. This is the lever that matters
-      against a strong keeper: from 18 m up the centre it is a standing catch
-      every time, because he has 0.7 s of flight to cover the far post. The
-      only way to make it a goal is to drag him wide first and then hit the far
-      corner, and `ev_shot` rewards exactly that and nothing else.
+    The keeper must be beaten geometrically at every range. The engine's 0.8 m
+    standing-catch band and 0.8..1.65 m dive band both retain possession, so an
+    on-frame shot inside the box is not automatically a useful shot. Carry
+    closer or move wide until the keeper has actually lost the angle.
 
     The old version of this function branched on `role`, so a centre-back who
     had carried the ball upfield was judged on his shirt rather than on the
     geometry, and a striker in the same position got a different answer for
     the identical picture. Both are now the same calculation.
     """
-    ev = ExpectedValueCalculator(inp)
     (tx, ty), power = _shot_geometry_target(inp, p)
     dist_goal = OPP_GOAL_X - p.x
-    if dist_goal <= SHOT_IN_BOX_DIST:
-        # p_shot_on_target is already marginal (saved + goal, excludes blocked).
-        # The old code multiplied by (1 - P(blocked)) a second time.
-        reaches = ev.p_shot_on_target(p, (tx, ty), power)
-        return reaches >= EV_SHOT_REACHES_GOAL_BAR
-    return ev.ev_shot(p, (tx, ty), power) > EV_SHOT_WORTH
+    keeper = inp.state.goalkeeper_them()
+    if keeper is not None and not keeper.can_act and dist_goal <= 6.0:
+        return True
+    return shot_beats_keeper(
+        p.x, p.y, keeper.x if keeper is not None else -1.0,
+        keeper.y if keeper is not None else GOAL_CENTER_Y,
+        ty, dist_goal, power,
+    )
 
 
 
@@ -767,6 +757,11 @@ class ExpectedValueCalculator:
         gk = self.state.goalkeeper_them()
         if gk is None or gk.x < 0.0:
             return 0.0  # unknown keeper: never assume a free goal
+        # A close slap can put the keeper on the ground and force a drop. A
+        # keeper with no action eligibility cannot reposition for a point-blank
+        # finish; keep the ordinary movement/flight model for distant shots.
+        if not gk.can_act and OPP_GOAL_X - p.x <= 6.0:
+            return SHOT_GOAL_CLEAN
         if gk.x < GK_AREA_START:
             return SHOT_GOAL_GK_OUT  # cannot handle from outside his own fifth
         speed0 = self._kick_speed(power)
@@ -3304,6 +3299,26 @@ class PolicyController:
 
         step = 9.0
 
+        # Drag a set keeper laterally before trying the final shot. The keeper
+        # tracks the ball, so a central carry only ever presents the same
+        # covered angle. From an off-centre lane, carry diagonally toward that
+        # flank while gaining ground; once the keeper has shifted and the ball
+        # reaches the byline channel, normal cross/shot candidates take over.
+        keeper = state.goalkeeper_them()
+        if (
+            40.0 <= bx <= 53.0
+            and abs(by - GOAL_CENTER_Y) >= 2.0
+            and keeper is not None
+            and keeper.x >= GK_DEFENSIVE_FIFTH_LIMIT - 2.0
+            and abs(keeper.y - GOAL_CENTER_Y) <= 7.0
+        ):
+            flank_sign = -1.0 if by < GOAL_CENTER_Y else 1.0
+            tx = geom.clamp(bx + 4.5, 42.0, 55.0)
+            ty = geom.clamp(by + flank_sign * 7.0, 2.5, PITCH_WIDTH - 2.5)
+            lane_pressure = self._segment_contest(state, bx, by, tx, ty)
+            if lane_pressure < 0.85:
+                return tx, ty, 1.0
+
         # In the final third, line up the open side of the goal.
         if bx > 36.0:
             return (
@@ -3542,6 +3557,19 @@ class PolicyController:
             self._pending_pass_receiver = None
             self._pending_pass_collection = None
             return PlayerIntent(p.id, tx, ty, 1.0, tx, ty, "none")
+
+        # Keeper displacement: while a teammate carries the ball in the final
+        # third, send just the striker to the keeper's near side. A clean slap
+        # grounds the keeper for 1.2 s; the ball carrier gets a point-blank
+        # window instead of firing through a set keeper. Pending passes and
+        # committed shots above retain their higher coordination priority.
+        if role == ROLE_STRIKER and possessor.id != p.id and ball.x > 44.0:
+            keeper = state.goalkeeper_them()
+            if keeper is not None and keeper.can_act:
+                gap = geom.distance(p.x, p.y, keeper.x, keeper.y)
+                if gap <= 12.0:
+                    tx = geom.clamp(keeper.x - 0.65, 42.0, OPP_GOAL_X - 1.5)
+                    return PlayerIntent(p.id, tx, keeper.y, 1.0, keeper.x, keeper.y)
         
         # SHOT FOLLOWUP: If carrier is shooting or has shot, attackers move to rebound zones
         # This MUST come before the general TeamPlan target check so shot coordination takes priority
@@ -3824,6 +3852,26 @@ class PolicyController:
         ball = state.ball
         plan: PressPlan = inp.press_plan
         r = plan.role_for(p.id)
+
+        # A keeper holding the ball at the back is temporarily the most
+        # vulnerable carrier: the engine auto-distributes after 1.25 s, and a
+        # clean slap drops the ball for an immediate attack. Send only the
+        # striker, and only when he can reach the keeper before that deadline;
+        # everyone else retains the normal press/cover/rest-defence assignment.
+        their_gk = state.goalkeeper_them()
+        if (
+            role == ROLE_STRIKER
+            and their_gk is not None
+            and ball.possessing_team == "them"
+            and ball.possessing_player == their_gk.id
+            and their_gk.can_act
+            # In canonical attack coordinates the opponent's defensive fifth
+            # is x >= 48; use 48 rather than a home-only raw-coordinate edge.
+            and their_gk.x >= 48.0
+            and geom.distance(p.x, p.y, their_gk.x, their_gk.y) <= 8.0
+        ):
+            tx = geom.clamp(their_gk.x - 0.65, 1.5, OPP_GOAL_X - 1.5)
+            return PlayerIntent(p.id, tx, their_gk.y, 1.0, their_gk.x, their_gk.y)
 
         # PROACTIVE WALL LANE BLOCKING: When opponent near wall, position to block
         # both the pass to wall AND the rebound
@@ -4328,15 +4376,86 @@ class PolicyController:
     # ------------------------------------------------------------------ #
     def _enforce_press_actions(self, inp: PolicyInput, intents: dict[str, PlayerIntent]) -> None:
         state = inp.state
+        if state.ball.possessing_team == "us":
+            # During a final-third carry, let the designated runner displace
+            # the keeper without sending multiple players off their jobs.
+            keeper = state.goalkeeper_them()
+            possessor = state.our_possessor()
+            if keeper is None or possessor is None or not keeper.can_act:
+                return
+            candidates = [
+                player for player in state.outfield_us()
+                if player.id != possessor.id
+                and inp.roles.get(player.id) == ROLE_STRIKER
+                and player.can_act
+            ]
+            if not candidates:
+                return
+            runner = min(candidates, key=lambda player: geom.distance(player.x, player.y, keeper.x, keeper.y))
+            intent = intents.get(runner.id)
+            if intent is None:
+                return
+            d = geom.distance(runner.x, runner.y, keeper.x, keeper.y)
+            nearest_other = min(
+                (geom.distance(runner.x, runner.y, q.x, q.y)
+                 for q in state.them if q.id != keeper.id),
+                default=go_20(),
+            )
+            facing_ok = geom.facing_diff(
+                runner.facing, keeper.x, keeper.y, runner.x, runner.y
+            ) <= math.radians(SLAP_FACING_DEG)
+            if (
+                d <= SLAP_CLEAN and d <= nearest_other and facing_ok
+                and config_uses_slap(inp)
+            ):
+                intent.action_type = "slap"
+                intent.action_target = None
+                intent.action_power = None
+            return
         if state.ball.possessing_team != "them":
             return
         possessor = state.their_possessor()
         if possessor is None or not possessor.can_act:
             return
-        if inp.their_possession_protected():
-            return
         ball = state.ball
         gk_them = state.goalkeeper_them()
+
+        # Do not tackle an opponent goalkeeper, but do allow the one designated
+        # striker to use a clean slap. Slaps are not tackles and the engine drops
+        # a carrier's ball on a clean knockdown.
+        if gk_them is not None and possessor.id == gk_them.id:
+            eligible = [
+                p for p in state.outfield_us()
+                if p.can_act and inp.roles.get(p.id) == ROLE_STRIKER
+            ]
+            if not eligible:
+                return
+            striker = min(eligible, key=lambda p: geom.distance(p.x, p.y, gk_them.x, gk_them.y))
+            intent = intents.get(striker.id)
+            if intent is None:
+                return
+            d = geom.distance(striker.x, striker.y, gk_them.x, gk_them.y)
+            nearest_other = min(
+                (geom.distance(striker.x, striker.y, q.x, q.y)
+                 for q in state.outfield_them()),
+                default=go_20(),
+            )
+            facing_ok = geom.facing_diff(
+                striker.facing, gk_them.x, gk_them.y, striker.x, striker.y
+            ) <= math.radians(SLAP_FACING_DEG)
+            if (
+                d <= SLAP_CLEAN
+                and d <= nearest_other
+                and facing_ok
+                and config_uses_slap(inp)
+            ):
+                intent.action_type = "slap"
+                intent.action_target = None
+                intent.action_power = None
+            return
+
+        if inp.their_possession_protected():
+            return
         for pid, intent in intents.items():
             player = next((q for q in state.us if q.id == pid), None)
             if player is None or not player.can_act:
@@ -4345,9 +4464,6 @@ class PolicyController:
                 continue
             d = geom.distance(player.x, player.y, ball.x, ball.y)
             if d > TACKLE_MAX:
-                continue
-            # Never try to yank the ball from their goalkeeper.
-            if gk_them is not None and possessor.id == gk_them.id:
                 continue
             facing_ok = geom.facing_diff(player.facing, ball.x, ball.y, player.x, player.y) <= math.radians(SLAP_FACING_DEG)
             if d <= SLAP_CLEAN and facing_ok and config_uses_slap(inp):

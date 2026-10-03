@@ -34,7 +34,7 @@ def _local_team_side(data: dict) -> tuple[str, str]:
     teams = data["snapshots"][0]["teams"]
     ids = [t["id"] for t in teams]
     for t in teams:
-        if t.get("name") == "My Team FC":
+        if t.get("name") == "Deleri FC":
             return t["id"], next(i for i in ids if i != t["id"])
     return ids[0], ids[1]
 

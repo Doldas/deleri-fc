@@ -454,8 +454,8 @@ def shot_beats_keeper(
         shift   = MAX_RUN_SPEED * flight          (how far he can get across)
         left    = |gky - target_y| - shift        (gap he still cannot reach)
 
-    * `left <= GK_DIVE_LATERAL_MIN` -> standing catch, the shot is wasted.
-    * `left >= GK_LATERAL_REACH`    -> out of dive range, it is a goal.
+    * `left <= GK_LATERAL_REACH` -> standing catch or dive; both are saves.
+    * `left > GK_LATERAL_REACH`  -> outside the keeper's reach, it is a goal.
 
     This reproduces the measured behaviour against Vanguard FC (elite), where
     35 shots from a mean 15.1 m produced zero goals: our shooters sat on the
@@ -473,13 +473,9 @@ def shot_beats_keeper(
     flight = max(dist_goal, 0.0) / max(speed0, 1.0)
     shift = MAX_RUN_SPEED * flight
     left = abs(gky - target_y) - shift
-    if left <= GK_DIVE_LATERAL_MIN:
-        return False
-    if left >= GK_LATERAL_REACH:
-        return True
-    # In between: a dive is a stretch. Commit when the flight is short, i.e.
-    # the shot was taken from close range and he is already going to ground.
-    return dist_goal <= 9.0
+    # Engine rules are exact here: the 0.8..1.65 m band is a dive save, not a
+    # probabilistic chance. A keeper who needs up to 1.65 m retains possession.
+    return left > GK_LATERAL_REACH
 
 
 def shot_open_angle(bx: float, by: float, opponents: list[tuple[float, float]]) -> float:

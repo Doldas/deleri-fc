@@ -29,6 +29,7 @@ from src.policy import (
     SHOT_GOAL_STANDING_CATCH,
     ExpectedValueCalculator,
 )
+from src.physics import shot_beats_keeper
 from tests.test_ev_model import place_opponents
 from tests.test_policy import make_inp, obs
 
@@ -246,42 +247,40 @@ class MarginalReachBarTests(unittest.TestCase):
     time.
     """
 
-    def test_reach_bar_equals_marginal_on_target(self):
+    def test_shot_gate_matches_authoritative_keeper_reach(self):
         import src.policy as policy_mod
 
         for opponents in (((10.0, 20.0),), ((54.0, 19.0),), ((53.0, 17.0), (55.0, 22.0))):
-            ev, p = evcalc(opponents=opponents)
-            (tx, ty), power = policy_mod._shot_geometry_target(
-                make_inp(place_opponents(
-                    obs((52.0, 20.0), "us", our_st_x=52.0, them_x=10), list(opponents)
-                )), p
-            )
+            inp = make_inp(place_opponents(
+                obs((52.0, 20.0), "us", our_st_x=52.0, them_x=10), list(opponents)
+            ))
+            ev = ExpectedValueCalculator(inp)
+            p = inp.state.our_possessor()
+            assert p is not None
+            (tx, ty), power = policy_mod._shot_geometry_target(inp, p)
             marginal = ev.p_shot_on_target(p, (tx, ty), power)
             double_counted = (
                 1.0 - ev.p_shot_blocked(p, (tx, ty), power)
             ) * marginal
             if ev.p_shot_blocked(p, (tx, ty), power) > 0.01:
                 self.assertNotAlmostEqual(marginal, double_counted, places=4)
-            self.assertAlmostEqual(
-                policy_mod._shot_worth_taking(
-                    make_inp(place_opponents(
-                        obs((52.0, 20.0), "us", our_st_x=52.0, them_x=10), list(opponents)
-                    )),
-                    make_inp(place_opponents(
-                        obs((52.0, 20.0), "us", our_st_x=52.0, them_x=10), list(opponents)
-                    )).state.our_possessor(),
-                ),
-                marginal >= policy_mod.EV_SHOT_REACHES_GOAL_BAR,
-                places=9,
+            keeper = inp.state.goalkeeper_them()
+            self.assertIsNotNone(keeper)
+            p = inp.state.our_possessor()
+            self.assertIsNotNone(p)
+            assert keeper is not None and p is not None
+            expected = shot_beats_keeper(
+                p.x, p.y, keeper.x, keeper.y, ty, OPP_GOAL_X - p.x, power
             )
+            self.assertEqual(policy_mod._shot_worth_taking(inp, p), expected)
 
     def test_blocking_does_not_double_discount_the_reach_test(self):
         """With one blocker the reach test must equal the marginal value."""
-        ev, p = evcalc(opponents=((54.0, 19.0),))
         inp = make_inp(place_opponents(
             obs((52.0, 20.0), "us", our_st_x=52.0, them_x=10), [(54.0, 19.0)]
         ))
         p2 = inp.state.our_possessor()
+        assert p2 is not None
         ev2 = ExpectedValueCalculator(inp)
         import src.policy as policy_mod
         (tx, ty), power = policy_mod._shot_geometry_target(inp, p2)
@@ -289,8 +288,10 @@ class MarginalReachBarTests(unittest.TestCase):
         self.assertGreater(ev2.p_shot_blocked(p2, (tx, ty), power), 0.1, "fixture lost its blocker")
         # The documented quantity is the marginal one, not the double product.
         self.assertGreater(marginal, 0.2)
-        self.assertAlmostEqual(
-            policy_mod._shot_worth_taking(inp, p2),
-            marginal >= policy_mod.EV_SHOT_REACHES_GOAL_BAR,
-            places=9,
+        keeper = inp.state.goalkeeper_them()
+        self.assertIsNotNone(keeper)
+        assert keeper is not None
+        expected = shot_beats_keeper(
+            p2.x, p2.y, keeper.x, keeper.y, ty, OPP_GOAL_X - p2.x, power
         )
+        self.assertEqual(policy_mod._shot_worth_taking(inp, p2), expected)

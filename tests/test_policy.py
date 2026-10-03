@@ -36,7 +36,7 @@ SLOTS = [
 ]
 
 
-def obs(ball_pos, possess, our_st_x=40, them_x=14):
+def obs(ball_pos, possess, our_st_x=40.0, them_x=14.0):
     return {
         "protocolVersion": "1.0",
         "gameId": "p-test",
@@ -94,7 +94,59 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(it.pid, pid)
 
     def test_possessor_near_open_goal_shoots(self):
-        inp = make_inp(obs((52, 20), "us", our_st_x=52, them_x=10))
+        observation = obs((52, 20), "us", our_st_x=52, them_x=10)
+        observation["them"][0]["position"] = {"x": 45, "y": 20}
+        inp = make_inp(observation)
+        intents = PolicyController().decide(inp)
+        self.assertEqual(intents["st"].action_type, "shoot")
+        self.assertIsNotNone(intents["st"].action_target)
+
+    def test_striker_closes_on_opponent_keeper_with_ball(self):
+        observation = obs((58.65, 20), "them", our_st_x=52.0, them_x=10)
+        observation["ball"]["possessedBy"] = "tgk"
+        inp = make_inp(observation, TacticalState.DEFENSIVE_TRANSITION)
+        intents = PolicyController().decide(inp)
+        self.assertGreater(intents["st"].tx, 56.0)
+        self.assertEqual(intents["st"].action_type, "none")
+        # The closest designated striker presses; the goalkeeper and rest
+        # defenders remain on their assigned cover positions.
+        self.assertLess(intents["cd"].tx, 30.0)
+
+    def test_striker_press_uses_normalized_goal_for_away_side(self):
+        observation = obs((49.65, 20), "them", our_st_x=44.0, them_x=10)
+        observation["ball"]["possessedBy"] = "tgk"
+        observation["them"][0]["position"] = {"x": 49.0, "y": 20.0}
+        inp = make_inp(observation, TacticalState.DEFENSIVE_TRANSITION)
+        intents = PolicyController().decide(inp)
+        self.assertGreater(intents["st"].tx, 47.0)
+        self.assertAlmostEqual(intents["st"].ty, 20.0)
+
+    def test_striker_slaps_keeper_to_force_a_loose_ball(self):
+        observation = obs((58.65, 20), "them", our_st_x=57.4, them_x=10)
+        observation["ball"]["possessedBy"] = "tgk"
+        inp = make_inp(observation, TacticalState.DEFENSIVE_TRANSITION)
+        intents = PolicyController().decide(inp)
+        self.assertEqual(intents["st"].action_type, "slap")
+        self.assertIsNone(intents["st"].action_target)
+        self.assertEqual(intents["cd"].action_type, "none")
+
+    def test_striker_displaces_keeper_while_winger_carries_in_final_third(self):
+        observation = obs((45.65, 4), "us", our_st_x=57.4, them_x=10)
+        observation["ball"]["possessedBy"] = "w"
+        observation["us"][3]["position"] = {"x": 45.0, "y": 4.0}
+        inp = make_inp(observation)
+        inp.roles = {
+            "gk": "GOALKEEPER", "cd": "DEFENDER", "am": "WIDE_RIGHT",
+            "w": "WIDE_LEFT", "st": "STRIKER",
+        }
+        intents = PolicyController().decide(inp)
+        self.assertEqual(intents["st"].action_type, "slap")
+        self.assertIsNone(intents["st"].action_target)
+
+    def test_shooting_ev_exploits_incapacitated_keeper_at_close_range(self):
+        observation = obs((56, 20), "us", our_st_x=56, them_x=10)
+        observation["them"][0]["canAct"] = False
+        inp = make_inp(observation)
         intents = PolicyController().decide(inp)
         self.assertEqual(intents["st"].action_type, "shoot")
         self.assertIsNotNone(intents["st"].action_target)
@@ -225,7 +277,7 @@ class PolicyTests(unittest.TestCase):
             ],
         }
 
-    def test_shoot_on_sight_applies_in_the_box_not_near_the_boundary(self):
+    def test_set_keeper_blocks_a_central_box_shot_even_with_an_open_angle(self):
         """"Shoot on sight in the box" was gated on is_near_wall(margin=4.0).
 
         wall.is_near_wall is a pitch-boundary test -- x <= m or x >= L - m or
@@ -249,9 +301,8 @@ class PolicyTests(unittest.TestCase):
 
         inp = make_inp(self._box_carrier_obs(52.0, 20.0))
         intents = PolicyController().decide(inp)
-        self.assertEqual(intents["am"].action_type, "shoot",
-                         "a non-striker 8 m out in the box with an open goal "
-                         "must get the shoot-on-sight shot")
+        self.assertNotEqual(intents["am"].action_type, "shoot",
+                            "do not waste the attack on a set keeper's central catch")
 
     def test_unreachable_pass_is_vetoed_so_the_ball_is_not_launched(self):
         """A pass aimed inside MIN_PASS_TRAVEL can never be collected.
@@ -335,7 +386,9 @@ class PolicyTests(unittest.TestCase):
         """
         by_position = {}
         for cx, cy in ((52.0, 20.0), (50.0, 4.0)):
-            inp = make_inp(self._box_carrier_obs(cx, cy))
+            observation = self._box_carrier_obs(cx, cy)
+            observation["them"][0]["position"] = {"x": 45, "y": 20}
+            inp = make_inp(observation)
             by_position[(cx, cy)] = PolicyController().decide(inp)["am"].action_type
             self.assertEqual(by_position[(cx, cy)], "shoot")
         self.assertEqual(by_position[(52.0, 20.0)], by_position[(50.0, 4.0)])
@@ -521,6 +574,21 @@ class PossessionStyleTests(unittest.TestCase):
         self.assertLessEqual(geom.distance(carrier.x, carrier.y, tx, ty), 16.0)
         self.assertGreater(tx, carrier.x)
 
+    def test_final_third_carry_pulls_centered_keeper_toward_a_flank(self):
+        controller = PolicyController()
+        targets = []
+        for y in (6.0, 34.0):
+            observation = obs((48.65, y), "us", our_st_x=48, them_x=45)
+            observation["us"][-1]["position"] = {"x": 48.0, "y": y}
+            inp = make_inp(observation)
+            carrier = next(p for p in inp.state.outfield_us() if p.id == "st")
+            targets.append(controller._dribble_target(inp, carrier))
+        self.assertGreater(targets[0][0], 48.0)
+        self.assertLess(targets[0][1], 6.0)
+        self.assertGreater(targets[1][1], 34.0)
+        self.assertAlmostEqual(targets[0][0], targets[1][0])
+        self.assertAlmostEqual(targets[0][1] + targets[1][1], 40.0)
+
     def test_loose_ball_chaser_aims_at_the_meeting_point(self):
         observation = obs((30, 20), None)
         observation["ball"]["velocity"] = {"x": 12.0, "y": 0.0}
@@ -688,7 +756,9 @@ class AttackCandidatePipelineTests(unittest.TestCase):
 
     def test_generation_does_not_commit_shots_or_pending_passes(self):
         controller = PolicyController()
-        shot_input = make_inp(obs((52, 20), "us", our_st_x=52, them_x=10))
+        shot_observation = obs((52, 20), "us", our_st_x=52, them_x=10)
+        shot_observation["them"][0]["position"] = {"x": 45.0, "y": 20.0}
+        shot_input = make_inp(shot_observation)
         shot_carrier = shot_input.state.our_possessor()
         assert shot_carrier is not None
         plan = TeamPlan(

@@ -1,1 +1,44 @@
-{"genome": {"press_intensity": 0.55, "press_trigger_threshold": 0.32, "width": 0.79, "depth": 0.5, "verticality": 0.55, "risk": 0.45, "counterpress_intensity": 0.5, "compactness": 0.72, "passing_risk": 0.33, "shooting_threshold": 0.5, "wall_usage": 0.45, "wall_pass_threshold": 0.52, "wall_shot_threshold": 0.54, "transition_speed": 0.44, "support_distance": 12.0, "defensive_line": 20.9}}
+{
+ "codeVersion": "1.1.0",
+ "engineVersion": "1.0",
+ "generatedAtUtc": "2026-10-03T22:11:17.164375+00:00",
+ "genome": {
+  "compactness": 0.9,
+  "counterpress_intensity": 0.65,
+  "defensive_line": 13.694109,
+  "depth": 0.25,
+  "passing_risk": 0.691764,
+  "press_intensity": 0.7,
+  "press_trigger_threshold": 0.328815,
+  "risk": 0.828074,
+  "shooting_threshold": 0.402277,
+  "support_distance": 6.642098,
+  "transition_speed": 0.993921,
+  "verticality": 1.0,
+  "wall_pass_threshold": 1.0,
+  "wall_shot_threshold": 0.54,
+  "wall_usage": 0.5,
+  "width": 0.2
+ },
+ "genomeHash": "61b1ac967021",
+ "rewardWeights": {
+  "bad_shot": -0.004,
+  "broken_shape": -0.004,
+  "chance_creation": 0.002,
+  "counterpress_recovery": 0.01,
+  "dangerous_turnover": -0.006,
+  "defensive_compactness": 0.0006,
+  "failed_press": -0.003,
+  "goal": 1.0,
+  "goal_conceded": -1.0,
+  "passing_quality": 0.0005,
+  "possession_quality": 0.0006,
+  "shot_quality": 0.0008,
+  "space_created": 0.0004,
+  "successful_press": 0.004,
+  "territorial_progression": 0.0012,
+  "unnecessary_risk": -0.002,
+  "wall_progression": 0.001
+ },
+ "schemaVersion": "1.0"
+}

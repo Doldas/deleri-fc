@@ -293,11 +293,12 @@ class CandidateScaleTests(unittest.TestCase):
         p = carrier(inp)
         self.assertLessEqual(ev.p_carry_success(p, 58.0, 20.0), 0.05)
 
-    def test_shooting_beats_passing_away_from_an_open_goal(self):
-        """8 m out with the keeper set: shoot rather than roll it sideways."""
+    def test_shot_waits_until_a_set_keeper_is_geometrically_beaten(self):
+        """Being in the box is insufficient when a set keeper can catch it."""
         inp = in_box(keeper=(58.0, 20.0), opponents=((10.0, 20.0), (4.0, 16.0), (18.0, 24.0)))
         intent = PolicyController().decide(inp)["st"]
-        self.assertEqual(intent.action_type, "shoot")
+        self.assertNotEqual(intent.action_type, "shoot")
+        self.assertGreater(intent.tx, carrier(inp).x)
 
     def test_no_candidate_emits_an_illegal_action_type(self):
         """The engine only accepts none/pass/shoot/clear/tackle/slap.

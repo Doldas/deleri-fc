@@ -230,14 +230,15 @@ class TestGKPropagation(unittest.TestCase):
         """Test A: GK at (60, 20) - central position."""
         intents = self._decide_with_gk(60.0, 20.0)
 
-        # Striker should have a clear shooting option
+        # A central set keeper makes the shot a standing catch, so the striker
+        # should keep carrying until he creates a better angle.
         st_intent = intents["st"]
         print(f"Test A - GK at (60, 20):")
         print(f"  ST action: {st_intent.action_type}")
         print(f"  ST target: {st_intent.action_target}")
         print(f"  ST power: {st_intent.action_power}")
 
-        self.assertEqual(st_intent.action_type, "shoot", "Striker should shoot with central GK")
+        self.assertNotEqual(st_intent.action_type, "shoot", "do not shoot into a set central keeper")
 
         # Store for comparison
         self.result_a = {
@@ -256,19 +257,8 @@ class TestGKPropagation(unittest.TestCase):
         print(f"  ST target: {st_intent.action_target}")
         print(f"  ST power: {st_intent.action_power}")
 
-        # The shot target should change to favor the open side
-        if hasattr(self, 'result_a') and self.result_a["st_action"] == "shoot" and intents["st"].action_type == "shoot":
-            target_a = self.result_a["st_target"]
-            target_b = intents["st"].action_target
-
-            if target_a and target_b:
-                print(f"  Target A: {target_a}")
-                print(f"  Target B: {target_b}")
-                # Target should shift toward open side (lower y since GK moved to y=24)
-                self.assertNotEqual(target_a, target_b, "Shot target should change with GK lateral displacement")
-
-                # The value should differ even if action is the same
-                print(f"  Shot target shifted: YES")
+        self.assertEqual(st_intent.action_type, "shoot", "the keeper's lateral shift opens the far angle")
+        self.assertIsNotNone(st_intent.action_target)
 
     def test_test_c_advanced_gk(self):
         """Test C: GK at (52, 20) - advanced from goal line."""

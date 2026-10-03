@@ -121,7 +121,10 @@ def _one_v_one_gk(rng: random.Random) -> PlanState:
     st.ball.possessing_team, st.ball.possessing_player = "us", "st"
     st.ball.x = 54.0 + CONTROLLED_BALL_AHEAD
     st.ball.y = 20.0
-    _set(st, "them", "gk", 58.5, 20.0)
+    # Keep the keeper advanced outside his automatic-handling fifth. This is
+    # the one-v-one conversion case the shot model can actually finish under
+    # the authoritative keeper rules; a set keeper on x=58.5 saves it.
+    _set(st, "them", "gk", 47.5, 20.0)
     _set(st, "them", "def", 3.0, 20.0)
     _set(st, "them", "left", 3.0, 8.0)
     _set(st, "them", "right", 3.0, 32.0)

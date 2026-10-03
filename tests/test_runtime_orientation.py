@@ -283,6 +283,7 @@ class RuntimeOrientationTests(unittest.TestCase):
                 self.assertEqual((reason_a, reason_b), (name, name))
 
         shot = policy_obs((52, 20), "us", our_st_x=52, them_x=10)
+        shot["them"][0]["position"] = {"x": 45.0, "y": 20.0}
         shot["gameId"] = "runtime-action-shot"
         shot["sequence"] = shot["simulationTick"] = shot["applyAtTick"] = 1
         shot_mirror = mirror_observation(shot)
@@ -443,6 +444,7 @@ class RuntimeOrientationTests(unittest.TestCase):
 
         from tests.test_policy import obs as policy_obs
         shot = policy_obs((52, 20), "us", our_st_x=52, them_x=10)
+        shot["them"][0]["position"] = {"x": 45.0, "y": 20.0}
         shot["gameId"] = gid
         shot["sequence"] = shot["simulationTick"] = shot["applyAtTick"] = 4
         shot_mirror = mirror_observation(shot)
